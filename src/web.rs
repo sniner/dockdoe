@@ -110,14 +110,36 @@ async fn stack_action(
         })
         .unwrap_or_default();
 
-    let mut failed = 0usize;
+    // First pass: attempt the action on every member.
+    let mut failed: Vec<&String> = Vec::new();
     for id in &ids {
         if let Err(err) = state.docker.apply(id, action).await {
             tracing::warn!(%id, ?action, %err, "stack member action failed");
-            failed += 1;
+            failed.push(id);
         }
     }
-    tracing::info!(stack = %name, ?action, total = ids.len(), failed, "applied stack action");
+
+    // Compose stacks have start-order dependencies (e.g. an app sharing a
+    // network sidecar's namespace can't start until the sidecar runs). We don't
+    // parse depends_on, so for start/restart we simply retry the failures once:
+    // the dependency has come up during the first pass.
+    if !failed.is_empty() && matches!(action, Action::Start | Action::Restart) {
+        let retry = std::mem::take(&mut failed);
+        for id in retry {
+            if let Err(err) = state.docker.apply(id, action).await {
+                tracing::warn!(%id, ?action, %err, "stack member action failed on retry");
+                failed.push(id);
+            }
+        }
+    }
+
+    tracing::info!(
+        stack = %name,
+        ?action,
+        total = ids.len(),
+        failed = failed.len(),
+        "applied stack action"
+    );
     stack_action_buttons(&name).into_response()
 }
 
