@@ -213,34 +213,75 @@ impl DockerHandle {
             .collect()
     }
 
-    /// Start members in dependency order, waiting on `service_healthy` /
-    /// `service_completed_successfully` conditions before starting a dependent.
+    /// Start a whole stack: dependency order does the work, a retry loop is the
+    /// safety net.
+    ///
+    /// Each pass starts every not-yet-running member in topological order,
+    /// waiting on any modeled `service_healthy` / `service_completed_successfully`
+    /// conditions first. In the normal case everything starts and the loop runs
+    /// exactly once. If something still won't start — a dependency we couldn't
+    /// model (e.g. a namespace partner outside this stack), or a transient
+    /// failure — we retry until everything is running or [`STACK_START_TIMEOUT`]
+    /// elapses, so we fall back to brute force only when the principled path
+    /// didn't suffice.
     async fn start_in_order(&self, members: &[Member]) -> StackOutcome {
+        let total = members.len();
+        let ordered = topo_order(members);
         let id_by_service: HashMap<&str, &str> = members
             .iter()
             .map(|m| (m.service.as_str(), m.id.as_str()))
             .collect();
-        let mut failed = 0;
-        for m in topo_order(members) {
-            for dep in &m.deps {
-                let Some(&dep_id) = id_by_service.get(dep.service.as_str()) else {
+        let deadline = Instant::now() + STACK_START_TIMEOUT;
+
+        loop {
+            let mut failed = 0;
+            let mut progressed = false;
+            for m in &ordered {
+                // `start_container` returns once the container is running, so a
+                // member that's already running needs no action.
+                if self.is_running(&m.id).await {
                     continue;
-                };
-                match dep.condition {
-                    DepCondition::Healthy => self.wait_healthy(dep_id).await,
-                    DepCondition::CompletedSuccessfully => self.wait_completed(dep_id).await,
-                    DepCondition::Started => {}
+                }
+                for dep in &m.deps {
+                    if let Some(&dep_id) = id_by_service.get(dep.service.as_str()) {
+                        match dep.condition {
+                            DepCondition::Healthy => self.wait_healthy(dep_id).await,
+                            DepCondition::CompletedSuccessfully => {
+                                self.wait_completed(dep_id).await;
+                            }
+                            DepCondition::Started => {}
+                        }
+                    }
+                }
+                match self.apply(&m.id, Action::Start).await {
+                    Ok(()) => progressed = true,
+                    Err(err) => {
+                        debug!(id = %m.id, service = %m.service, %err, "start attempt failed; will retry");
+                        failed += 1;
+                    }
                 }
             }
-            if let Err(err) = self.apply(&m.id, Action::Start).await {
-                warn!(id = %m.id, service = %m.service, %err, "starting stack member failed");
-                failed += 1;
+
+            if failed == 0 {
+                return StackOutcome { total, failed: 0 };
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    stack_unstarted = failed,
+                    "timed out starting all stack members"
+                );
+                return StackOutcome { total, failed };
+            }
+            // Nothing progressed this round (likely waiting on something outside
+            // the stack) — back off before retrying so we don't spin.
+            if !progressed {
+                tokio::time::sleep(DEP_POLL).await;
             }
         }
-        StackOutcome {
-            total: members.len(),
-            failed,
-        }
+    }
+
+    async fn is_running(&self, id: &str) -> bool {
+        self.run_state(id).await.is_some_and(|(running, _)| running)
     }
 
     /// Stop members in reverse dependency order.
@@ -334,6 +375,9 @@ impl DockerHandle {
 const DEP_WAIT: Duration = Duration::from_secs(120);
 /// How often to poll a dependency's state while waiting.
 const DEP_POLL: Duration = Duration::from_secs(1);
+/// Overall budget for getting every member of a stack running before giving up.
+#[allow(clippy::duration_suboptimal_units)]
+const STACK_START_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The outcome of a stack-wide action.
 #[derive(Debug, Clone, Copy)]
