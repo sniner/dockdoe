@@ -248,3 +248,34 @@ h2 a.stack-link:hover { color: var(--accent); }
   margin: 0 0 0.5rem;
   font-size: 0.9rem;
 }
+.panel h3 .count { color: var(--muted); font-weight: 400; font-size: 0.75rem; }
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.refresh {
+  cursor: pointer;
+  background: var(--panel-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+}
+.refresh:hover { background: var(--border); }
+.refresh.htmx-request { opacity: 0.5; pointer-events: none; }
+.logs {
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  background: #0e1014;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #c9d1d9;
+}
+.muted { color: var(--muted); }

@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
             get(events_container_metrics),
         )
         .route("/events/stack/{name}/metrics", get(events_stack_metrics))
+        .route("/api/container/{id}/logs", get(container_logs))
         .route(
             "/api/container/{id}/{action}",
             axum::routing::post(container_action),
@@ -126,6 +127,46 @@ async fn stack_action(
 /// The current snapshot, cloned out of the shared lock.
 fn current_snapshot(state: &AppState) -> Option<Dashboard> {
     state.shared.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Number of log lines to tail for the logs panel.
+const LOG_TAIL_LINES: u32 = 200;
+
+/// Return the tail of a container's logs as an HTML fragment for the logs panel.
+async fn container_logs(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Markup {
+    match state.docker.logs_tail(&id, LOG_TAIL_LINES).await {
+        Ok(text) if text.trim().is_empty() => html! { span.muted { "(no logs)" } },
+        Ok(text) => html! { (strip_ansi(&text)) },
+        Err(err) => {
+            tracing::warn!(%id, %err, "fetching logs failed");
+            html! { span.muted { "Could not read logs: " (err) } }
+        }
+    }
+}
+
+/// Strip ANSI/VT escape sequences (CSI `ESC [ … final-byte`) so logs render
+/// cleanly in a `<pre>` instead of showing raw escape codes.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip the introducer and everything up to the final byte (@-~).
+            if chars.next() == Some('[') {
+                for seq in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&seq) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Serve an embedded static asset.
@@ -438,8 +479,15 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
         }
         (charts_section(&format!("{} · CPU", c.name), &format!("{} · Memory", c.name)))
         section.panel {
-            h3 { "Logs" }
-            p.empty { "Logs will appear here." }
+            div.panel-head {
+                h3 { "Logs " span.count { "(last " (LOG_TAIL_LINES) " lines)" } }
+                button.refresh type="button"
+                    hx-get=(format!("/api/container/{}/logs", c.id))
+                    hx-target="#logs" hx-swap="innerHTML" { "↻ Refresh" }
+            }
+            pre.logs id="logs"
+                hx-get=(format!("/api/container/{}/logs", c.id))
+                hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
         }
     }
 }
@@ -777,6 +825,18 @@ mod tests {
         assert_eq!(fmt_bytes(1024), "1.0 KiB");
         assert_eq!(fmt_bytes(1_572_864), "1.5 MiB");
         assert_eq!(fmt_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    #[test]
+    fn strip_ansi_removes_escape_sequences() {
+        // Colour codes around text are removed, text kept.
+        assert_eq!(strip_ansi("\u{1b}[31mred\u{1b}[0m text"), "red text");
+        // Multi-line plain text is untouched.
+        assert_eq!(strip_ansi("line1\nline2\n"), "line1\nline2\n");
+        // Cursor/clear sequences are removed too.
+        assert_eq!(strip_ansi("a\u{1b}[2Kb"), "ab");
+        // A bare ESC without CSI doesn't eat following text.
+        assert_eq!(strip_ansi("ok"), "ok");
     }
 
     #[test]

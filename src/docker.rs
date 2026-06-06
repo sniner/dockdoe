@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::models::{ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum};
-use bollard::query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder};
+use bollard::query_parameters::{
+    ListContainersOptionsBuilder, LogsOptionsBuilder, StatsOptionsBuilder,
+};
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use tracing::debug;
@@ -65,6 +67,24 @@ impl DockerHandle {
             Action::Restart => self.docker.restart_container(id, None).await,
         }
         .with_context(|| format!("{action:?} container {id}"))
+    }
+
+    /// Tail the last `lines` log lines (stdout + stderr) of a container.
+    /// bollard de-multiplexes the Docker log stream, so each chunk's `Display`
+    /// is just the message text.
+    pub async fn logs_tail(&self, id: &str, lines: u32) -> Result<String> {
+        let options = LogsOptionsBuilder::new()
+            .stdout(true)
+            .stderr(true)
+            .tail(&lines.to_string())
+            .build();
+        let mut stream = self.docker.logs(id, Some(options));
+        let mut out = String::new();
+        while let Some(chunk) = stream.next().await {
+            let log = chunk.with_context(|| format!("reading logs of {id}"))?;
+            out.push_str(&log.to_string());
+        }
+        Ok(out)
     }
 }
 
