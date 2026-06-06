@@ -43,13 +43,24 @@
           value: function (u, v) { return v == null ? "--" : fmt(v); } },
       ],
       axes: [
-        Object.assign({}, axisStyle, { size: 30 }),
+        Object.assign({}, axisStyle, { size: 30, values: timeFmt }),
         Object.assign({}, axisStyle, {
+          size: 52, // room for labels like "378M"; the default 40 clipped them
           values: function (u, vals) { return vals.map(fmt); },
         }),
       ],
     };
   }
+
+  // uPlot's default time axis shows only the second component (":ss") when all
+  // ticks fall in the same minute, hiding the hour/minute. Always show HH:MM.
+  var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
+  var timeFmt = function (u, splits) {
+    return splits.map(function (s) {
+      var d = new Date(s * 1000);
+      return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    });
+  };
 
   var cpuFmt = function (v) { return v.toFixed(0) + "%"; };
   var memFmt = function (v) {
