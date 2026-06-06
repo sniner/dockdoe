@@ -20,6 +20,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -28,37 +29,57 @@ use crate::docker::{DockerClient, DockerHandle};
 use crate::host::HostSampler;
 use crate::store::Store;
 
-/// Default address the web UI binds to.
-const DEFAULT_BIND: &str = "127.0.0.1:8080";
-/// Default seconds between metric samples.
-const DEFAULT_INTERVAL_SECS: u64 = 3;
-/// Default path of the SQLite database.
-const DEFAULT_DB_PATH: &str = "dockdoe.sqlite";
-/// Default raw-sample retention ("point A"): one hour.
-const DEFAULT_RAW_RETENTION_SECS: u64 = 3600;
-/// Default trend bucket width: one minute.
-const DEFAULT_TREND_BUCKET_SECS: u64 = 60;
-/// Default trend retention: 30 days.
-const DEFAULT_TREND_RETENTION_SECS: u64 = 30 * 24 * 3600;
+/// DockDoe — a single-binary Docker host monitor with an embedded web UI.
+///
+/// Every option can also be set via its `DOCKDOE_*` environment variable; the
+/// command-line flag wins when both are given.
+#[derive(Parser)]
+#[command(name = "dockdoe", version, about, long_about = None)]
+struct Cli {
+    /// Address the web UI binds to. Use 0.0.0.0:8080 to expose it on the network.
+    #[arg(long, env = "DOCKDOE_BIND", default_value = "127.0.0.1:8080")]
+    bind: String,
+
+    /// Path to the SQLite database file.
+    #[arg(long, env = "DOCKDOE_DB_PATH", default_value = "dockdoe.sqlite")]
+    db_path: PathBuf,
+
+    /// Seconds between metric samples.
+    #[arg(long, env = "DOCKDOE_INTERVAL_SECS", default_value_t = 3)]
+    interval_secs: u64,
+
+    /// How long raw samples are kept, in seconds ("point A").
+    #[arg(long, env = "DOCKDOE_RAW_RETENTION_SECS", default_value_t = 3600)]
+    raw_retention_secs: u64,
+
+    /// Trend rollup window (min/max/median per bucket), in seconds.
+    #[arg(long, env = "DOCKDOE_TREND_BUCKET_SECS", default_value_t = 60)]
+    trend_bucket_secs: u64,
+
+    /// How long trend rollups are kept, in seconds (default 30 days).
+    #[arg(long, env = "DOCKDOE_TREND_RETENTION_SECS", default_value_t = 30 * 24 * 3600)]
+    trend_retention_secs: u64,
+
+    /// Tracing filter, e.g. "info" or "dockdoe=debug".
+    #[arg(long, env = "DOCKDOE_LOG", default_value = "info")]
+    log: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    let cli = Cli::parse();
+    init_tracing(&cli.log);
 
-    let bind = std::env::var("DOCKDOE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    let db_path = PathBuf::from(
-        std::env::var("DOCKDOE_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
-    );
     let config = Config {
-        interval: env_secs("DOCKDOE_INTERVAL_SECS", DEFAULT_INTERVAL_SECS),
-        raw_retention: env_secs("DOCKDOE_RAW_RETENTION_SECS", DEFAULT_RAW_RETENTION_SECS),
-        trend_bucket_secs: env_u64("DOCKDOE_TREND_BUCKET_SECS", DEFAULT_TREND_BUCKET_SECS),
-        trend_retention: env_secs("DOCKDOE_TREND_RETENTION_SECS", DEFAULT_TREND_RETENTION_SECS),
+        interval: Duration::from_secs(cli.interval_secs),
+        raw_retention: Duration::from_secs(cli.raw_retention_secs),
+        trend_bucket_secs: cli.trend_bucket_secs,
+        trend_retention: Duration::from_secs(cli.trend_retention_secs),
     };
 
-    let store =
-        Store::open(&db_path).with_context(|| format!("opening store at {}", db_path.display()))?;
-    info!(db = %db_path.display(), "store ready");
+    let store = Store::open(&cli.db_path)
+        .with_context(|| format!("opening store at {}", cli.db_path.display()))?;
+    info!(db = %cli.db_path.display(), "store ready");
 
     let docker = DockerClient::connect()?;
     let docker_handle = DockerHandle::connect()?;
@@ -86,10 +107,10 @@ async fn main() -> Result<()> {
         docker: docker_handle,
         seed_window,
     });
-    let listener = tokio::net::TcpListener::bind(&bind)
+    let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await
-        .with_context(|| format!("binding to {bind}"))?;
-    info!(%bind, "DockDoe listening");
+        .with_context(|| format!("binding to {}", cli.bind))?;
+    info!(bind = %cli.bind, "DockDoe listening");
 
     axum::serve(listener, app)
         .await
@@ -97,23 +118,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_env("DOCKDOE_LOG")
+fn init_tracing(filter: &str) {
+    let filter = EnvFilter::try_new(filter)
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap_or_default();
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-/// Read a `u64` from an env var, falling back to `default` if unset or
-/// unparseable.
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
-/// Read a duration in seconds from an env var.
-fn env_secs(key: &str, default_secs: u64) -> Duration {
-    Duration::from_secs(env_u64(key, default_secs))
 }

@@ -19,6 +19,9 @@ restart containers right from the UI.
 ```sh
 cargo run
 # then open http://127.0.0.1:8080
+
+# expose it on the network (reachable from other hosts):
+dockdoe --bind 0.0.0.0:8080
 ```
 
 Requires access to the Docker socket (`/var/run/docker.sock`, or `DOCKER_HOST`).
@@ -27,15 +30,18 @@ a container, mount the host `/proc` for those to reflect the real host.
 
 ## Configuration
 
-| Env var                       | Default            | Meaning                                         |
-| ----------------------------- | ------------------ | ----------------------------------------------- |
-| `DOCKDOE_BIND`                | `127.0.0.1:8080`   | Web UI bind address                             |
-| `DOCKDOE_INTERVAL_SECS`       | `3`                | Seconds between metric samples                  |
-| `DOCKDOE_DB_PATH`             | `dockdoe.sqlite`   | SQLite database file                            |
-| `DOCKDOE_RAW_RETENTION_SECS`  | `3600`             | How long raw samples are kept ("point A")       |
-| `DOCKDOE_TREND_BUCKET_SECS`   | `60`               | Trend rollup window (min/max/median per bucket) |
-| `DOCKDOE_TREND_RETENTION_SECS`| `2592000` (30 d)   | How long trend rollups are kept                 |
-| `DOCKDOE_LOG`                 | `info`             | Tracing filter (e.g. `debug`)                   |
+Run `dockdoe --help` for the full list. Every option is a command-line flag and
+also reads from an environment variable; the flag wins when both are set.
+
+| Flag                      | Env var                        | Default          | Meaning                                         |
+| ------------------------- | ------------------------------ | ---------------- | ----------------------------------------------- |
+| `--bind`                  | `DOCKDOE_BIND`                 | `127.0.0.1:8080` | Web UI bind address (`0.0.0.0:8080` to expose)  |
+| `--interval-secs`         | `DOCKDOE_INTERVAL_SECS`        | `3`              | Seconds between metric samples                  |
+| `--db-path`               | `DOCKDOE_DB_PATH`              | `dockdoe.sqlite` | SQLite database file                            |
+| `--raw-retention-secs`    | `DOCKDOE_RAW_RETENTION_SECS`   | `3600`           | How long raw samples are kept ("point A")       |
+| `--trend-bucket-secs`     | `DOCKDOE_TREND_BUCKET_SECS`    | `60`             | Trend rollup window (min/max/median per bucket) |
+| `--trend-retention-secs`  | `DOCKDOE_TREND_RETENTION_SECS` | `2592000` (30 d) | How long trend rollups are kept                 |
+| `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
 
 ## Data model
 
