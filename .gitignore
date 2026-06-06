@@ -2,3 +2,7 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# screenshots dropped into the repo
+Bildschirmfoto*.png
+*.screenshot.png

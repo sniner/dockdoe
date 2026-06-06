@@ -90,23 +90,31 @@
   }
 
   // --- Single live connection ------------------------------------------------
+  //
+  // The connection is closed whenever the page is hidden or navigated away
+  // from, and reopened when it becomes visible again. This matters because a
+  // browser allows only ~6 connections per host over HTTP/1.1, and a long-lived
+  // EventSource holds one. Without closing on hide, pages kept alive in the
+  // back/forward cache or in background tabs each keep a connection open — after
+  // a handful of navigations the pool is exhausted and the next page load
+  // stalls forever. Closing on hide keeps exactly one live connection at a time.
 
-  var es = new EventSource(liveUrl);
+  var es = null;
 
-  es.addEventListener("header", function (e) {
+  function onHeader(e) {
     var el = document.getElementById("host-header");
     if (el) el.innerHTML = e.data;
-  });
+  }
 
-  es.addEventListener("containers", function (e) {
+  function onContainers(e) {
     var el = document.getElementById("containers");
     if (!el) return;
     el.innerHTML = e.data;
     // Re-bind htmx attributes (action buttons) in the swapped-in markup.
     if (window.htmx) window.htmx.process(el);
-  });
+  }
 
-  es.addEventListener("metrics", function (e) {
+  function onMetrics(e) {
     if (!cpuChart) return;
     var p;
     try {
@@ -117,5 +125,30 @@
     var t = Math.floor(p.ts_ms / 1000);
     push(cpuChart, t, p.cpu_percent);
     push(memChart, t, p.mem_used != null ? p.mem_used / 1048576 : null);
+  }
+
+  function connect() {
+    if (es) return;
+    es = new EventSource(liveUrl);
+    es.addEventListener("header", onHeader);
+    es.addEventListener("containers", onContainers);
+    es.addEventListener("metrics", onMetrics);
+  }
+
+  function disconnect() {
+    if (!es) return;
+    es.close();
+    es = null;
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) disconnect();
+    else connect();
   });
+  // Fires when navigating away (including into the bfcache): release the slot.
+  window.addEventListener("pagehide", disconnect);
+  // Fires when the page is shown, including restoration from the bfcache.
+  window.addEventListener("pageshow", connect);
+
+  if (!document.hidden) connect();
 })();
