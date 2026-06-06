@@ -15,6 +15,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Persists the metrics database across restarts/upgrades.
       - dockdoe-data:/data
+      # To show stacks' compose.yml in the UI, DockDoe reads the file from the
+      # absolute host path Docker records (com.docker.compose.project.config_
+      # files). Mount the directory that holds your compose projects at the
+      # SAME path inside the container (read-only) so that path resolves.
+      # Example, if your stacks live under /opt/stacks:
+      # - /opt/stacks:/opt/stacks:ro
     # Host CPU/load/memory in the header already reflect the real host: the
     # /proc files DockDoe reads are not namespaced. No /proc mount needed.
 

@@ -54,6 +54,13 @@ docker run -d --name dockdoe \
 Mounting the Docker socket grants full control of the daemon (effectively root
 on the host), which DockDoe needs for the start/stop/restart actions.
 
+To show a stack's `compose.yml` in the UI, DockDoe reads the file from the
+absolute path the daemon records (the `com.docker.compose.project.config_files`
+label, fetched over the socket). That path is a **host** path, so mount the
+directory holding your compose projects at the **same** path inside the
+container (read-only), e.g. `-v /opt/stacks:/opt/stacks:ro`. Without it the
+compose tab just reports that the file can't be read; everything else works.
+
 ## Configuration
 
 Run `dockdoe --help` for the full list. Every option is a command-line flag and
