@@ -1,11 +1,11 @@
 //! Web layer: axum router, embedded assets, SSE streaming, and HTML rendering.
 //!
-//! The dashboard is rendered server-side with maud and kept live without a full
-//! reload: HTMX's SSE extension swaps the maud-rendered header and container
-//! fragments as new samples arrive (`/events`), while uPlot host charts are fed
-//! JSON from a second stream (`/events/metrics`) and seeded from the store on
-//! first load. Rendering stays in one place (these functions) — the SSE handlers
-//! reuse the very same fragments.
+//! Pages are rendered server-side with maud and kept live without a full reload
+//! over a *single* SSE connection per page (`live.js`). That one stream carries
+//! three named events — `header` and `containers` HTML fragments (re-using the
+//! same render functions) and a `metrics` JSON point for the uPlot charts.
+//! Charts are seeded from the store on first load. One connection per page
+//! keeps us comfortably under the browser's per-host HTTP/1.1 connection limit.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -52,13 +52,9 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/container/{id}", get(container_detail))
         .route("/stack/{name}", get(stack_detail))
-        .route("/events", get(events_html))
-        .route("/events/metrics", get(events_metrics))
-        .route(
-            "/events/container/{id}/metrics",
-            get(events_container_metrics),
-        )
-        .route("/events/stack/{name}/metrics", get(events_stack_metrics))
+        .route("/events", get(events_dashboard))
+        .route("/events/container/{id}", get(events_container))
+        .route("/events/stack/{name}", get(events_stack))
         .route("/api/container/{id}/logs", get(container_logs))
         .route("/api/stack/{name}/compose", get(stack_compose))
         .route(
@@ -266,7 +262,7 @@ async fn container_detail(
             snapshot.as_ref(),
             html! { p.empty { "Container not found." } },
             &[],
-            "/events/metrics",
+            "/events",
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     };
@@ -280,12 +276,12 @@ async fn container_detail(
         .and_then(Result::ok)
         .unwrap_or_default();
 
-    let metrics_url = format!("/events/container/{id}/metrics");
+    let live_url = format!("/events/container/{id}");
     shell(
         snapshot.as_ref(),
         container_detail_main(&container),
         &seed,
-        &metrics_url,
+        &live_url,
     )
     .into_response()
 }
@@ -312,105 +308,111 @@ async fn stack_detail(
             snapshot.as_ref(),
             html! { p.empty { "Stack not found." } },
             &[],
-            "/events/metrics",
+            "/events",
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     }
 
     // Stack charts stream live aggregates; no historical seed (raw samples
     // aren't keyed by stack), so they fill in over the view window.
-    let metrics_url = format!("/events/stack/{name}/metrics");
+    let live_url = format!("/events/stack/{name}");
     shell(
         snapshot.as_ref(),
         stack_detail_main(&name, &members),
         &[],
-        &metrics_url,
+        &live_url,
     )
     .into_response()
 }
 
-/// SSE stream of HTML fragments for HTMX: a `header` and a `containers` event
-/// per snapshot. The current snapshot is sent immediately so a freshly loaded
-/// page doesn't wait a full interval for its first live update.
-async fn events_html(
+/// Single live stream for the dashboard: `header` + `containers` HTML fragments
+/// and a host `metrics` point per snapshot. One SSE connection per page keeps us
+/// well under the browser's per-host connection limit.
+async fn events_dashboard(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = dashboard_stream(&state).flat_map(|dash| {
-        let header = Event::default()
-            .event("header")
-            .data(host_header_inner(&dash.host, dash.generated_at_unix_ms).into_string());
-        let containers = Event::default()
-            .event("containers")
-            .data(container_section(&dash.containers).into_string());
-        futures_util::stream::iter([Ok(header), Ok(containers)])
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// SSE stream of host metric points (JSON) for the uPlot charts.
-async fn events_metrics(
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = dashboard_stream(&state).map(|dash| {
         let point = MetricPoint {
             ts_ms: dash.generated_at_unix_ms,
             cpu_percent: f64::from(dash.host.cpu_percent),
             mem_used: Some(dash.host.mem_used),
         };
-        Ok(point_event(&point))
+        futures_util::stream::iter([
+            Ok(header_event(&dash)),
+            Ok(containers_event(&dash)),
+            Ok(metrics_event(&point)),
+        ])
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Per-container metric stream for a container detail page's charts.
-async fn events_container_metrics(
+/// Single live stream for a container detail page: `header` plus the
+/// container's `metrics` point.
+async fn events_container(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = dashboard_stream(&state).filter_map(move |dash| {
-        let id = id.clone();
-        async move {
-            let c = dash.containers.iter().find(|c| c.id == id)?;
-            Some(Ok(point_event(&MetricPoint {
+    let stream = dashboard_stream(&state).flat_map(move |dash| {
+        let mut events = vec![Ok(header_event(&dash))];
+        if let Some(c) = dash.containers.iter().find(|c| c.id == id) {
+            events.push(Ok(metrics_event(&MetricPoint {
                 ts_ms: dash.generated_at_unix_ms,
                 cpu_percent: c.cpu_percent.unwrap_or(0.0),
                 mem_used: c.mem_used,
-            })))
+            })));
         }
+        futures_util::stream::iter(events)
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Aggregated metric stream for a stack detail page's charts: CPU and memory
-/// summed across the stack's containers each cycle.
-async fn events_stack_metrics(
+/// Single live stream for a stack detail page: `header` plus an aggregate
+/// `metrics` point (CPU and memory summed across the stack's containers).
+async fn events_stack(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = dashboard_stream(&state).map(move |dash| {
-        let members = dash
-            .containers
-            .iter()
-            .filter(|c| c.stack.as_deref() == Some(name.as_str()));
+    let stream = dashboard_stream(&state).flat_map(move |dash| {
         let mut cpu = 0.0;
         let mut mem = 0u64;
-        for c in members {
+        for c in dash
+            .containers
+            .iter()
+            .filter(|c| c.stack.as_deref() == Some(name.as_str()))
+        {
             cpu += c.cpu_percent.unwrap_or(0.0);
             mem += c.mem_used.unwrap_or(0);
         }
-        Ok(point_event(&MetricPoint {
-            ts_ms: dash.generated_at_unix_ms,
-            cpu_percent: cpu,
-            mem_used: Some(mem),
-        }))
+        futures_util::stream::iter([
+            Ok(header_event(&dash)),
+            Ok(metrics_event(&MetricPoint {
+                ts_ms: dash.generated_at_unix_ms,
+                cpu_percent: cpu,
+                mem_used: Some(mem),
+            })),
+        ])
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Serialise a metric point as an SSE data event.
-fn point_event(point: &MetricPoint) -> Event {
+/// The `header` event: the host header's inner HTML.
+fn header_event(dash: &Dashboard) -> Event {
+    Event::default()
+        .event("header")
+        .data(host_header_inner(&dash.host, dash.generated_at_unix_ms).into_string())
+}
+
+/// The `containers` event: the container table's HTML.
+fn containers_event(dash: &Dashboard) -> Event {
+    Event::default()
+        .event("containers")
+        .data(container_section(&dash.containers).into_string())
+}
+
+/// The `metrics` event: a metric point as JSON.
+fn metrics_event(point: &MetricPoint) -> Event {
     let data = serde_json::to_string(point).unwrap_or_else(|_| "{}".to_string());
-    Event::default().data(data)
+    Event::default().event("metrics").data(data)
 }
 
 /// A stream of snapshots: the current one first (if any), then the live feed.
@@ -439,7 +441,7 @@ fn shell(
     snapshot: Option<&Dashboard>,
     main_content: Markup,
     seed: &[MetricPoint],
-    metrics_url: &str,
+    live_url: &str,
 ) -> Markup {
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     html! {
@@ -452,21 +454,20 @@ fn shell(
                 link rel="stylesheet" href="/assets/vendor/uPlot.min.css";
                 link rel="stylesheet" href="/assets/dockdoe.css";
             }
-            body hx-ext="sse" sse-connect="/events" {
-                header.host id="host-header" sse-swap="header" {
+            body {
+                header.host id="host-header" {
                     @match snapshot {
                         Some(d) => (host_header_inner(&d.host, d.generated_at_unix_ms)),
                         None => a.brand href="/" { "Dock" span { "Doe" } },
                     }
                 }
                 main { (main_content) }
-                script id="seed-data" type="application/json" data-metrics-url=(metrics_url) {
+                script id="seed-data" type="application/json" data-live-url=(live_url) {
                     (maud::PreEscaped(seed_json))
                 }
                 script src="/assets/vendor/htmx.min.js" {}
-                script src="/assets/vendor/sse.js" {}
                 script src="/assets/vendor/uPlot.iife.min.js" {}
-                script src="/assets/charts.js" {}
+                script src="/assets/live.js" {}
             }
         }
     }
@@ -476,18 +477,18 @@ fn shell(
 fn dashboard_page(snapshot: Option<&Dashboard>, seed: &[MetricPoint]) -> Markup {
     let main = html! {
         (charts_section("Host CPU", "Host Memory"))
-        div id="containers" sse-swap="containers" {
+        div id="containers" {
             @match snapshot {
                 Some(d) => (container_section(&d.containers)),
                 None => p.empty { "Collecting first metrics sample…" },
             }
         }
     };
-    shell(snapshot, main, seed, "/events/metrics")
+    shell(snapshot, main, seed, "/events")
 }
 
-/// Markup for a pair of live charts (CPU + memory). Data comes from `charts.js`,
-/// which reads the seed and metrics URL off the page.
+/// Markup for a pair of live charts (CPU + memory). Data comes from `live.js`,
+/// which reads the seed and live URL off the page.
 fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
     html! {
         section.charts {
