@@ -1,11 +1,13 @@
 //! Web layer: axum router, embedded assets, SSE streaming, and HTML rendering.
 //!
 //! Pages are rendered server-side with maud and kept live without a full reload
-//! over a *single* SSE connection per page (`live.js`). That one stream carries
-//! three named events — `header` and `containers` HTML fragments (re-using the
-//! same render functions) and a `metrics` JSON point for the uPlot charts.
-//! Charts are seeded from the store on first load. One connection per page
-//! keeps us comfortably under the browser's per-host HTTP/1.1 connection limit.
+//! over a *single* SSE connection per page (`live.js`). That one stream polls
+//! the shared snapshot — the same source a plain page render reads, so the live
+//! view can't drift from a reload — and emits named events the client swaps in:
+//! `header` (host header), `containers` (dashboard / stack member table),
+//! `detail` (a container page's state + facts), and `metrics` (a JSON point for
+//! the uPlot charts, seeded from the store on first load). One connection per
+//! page keeps us under the browser's per-host HTTP/1.1 connection limit.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -20,20 +22,21 @@ use axum::routing::get;
 use futures_util::{Stream, StreamExt};
 use maud::{DOCTYPE, Markup, html};
 use rust_embed::RustEmbed;
-use tokio_stream::wrappers::BroadcastStream;
 
-use crate::collector::{SharedDashboard, SnapshotTx};
+use crate::collector::SharedDashboard;
 use crate::docker::{Action, DockerHandle};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, HostMetrics};
 use crate::store::{MetricPoint, Store};
 
+/// How often the live SSE streams poll the latest snapshot.
+const SNAPSHOT_POLL: Duration = Duration::from_secs(1);
+
 /// Shared state for the web layer.
 #[derive(Clone)]
 pub struct AppState {
-    /// Latest snapshot for the initial server-side render.
+    /// The latest snapshot — single source of truth for both the initial render
+    /// and the live SSE streams.
     pub shared: SharedDashboard,
-    /// Live feed subscribed to by the SSE endpoints.
-    pub snapshots: SnapshotTx,
     /// Store, for seeding charts with recent history.
     pub store: Store,
     /// Docker handle for lifecycle actions and logs.
@@ -357,6 +360,7 @@ async fn events_container(
     let stream = dashboard_stream(&state).flat_map(move |dash| {
         let mut events = vec![Ok(header_event(&dash))];
         if let Some(c) = dash.containers.iter().find(|c| c.id == id) {
+            events.push(Ok(detail_event(c)));
             events.push(Ok(metrics_event(&MetricPoint {
                 ts_ms: dash.generated_at_unix_ms,
                 cpu_percent: c.cpu_percent.unwrap_or(0.0),
@@ -375,18 +379,23 @@ async fn events_stack(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = dashboard_stream(&state).flat_map(move |dash| {
-        let mut cpu = 0.0;
-        let mut mem = 0u64;
-        for c in dash
+        let members: Vec<&ContainerMetrics> = dash
             .containers
             .iter()
             .filter(|c| c.stack.as_deref() == Some(name.as_str()))
-        {
+            .collect();
+        let mut cpu = 0.0;
+        let mut mem = 0u64;
+        for c in &members {
             cpu += c.cpu_percent.unwrap_or(0.0);
             mem += c.mem_used.unwrap_or(0);
         }
+        let members_event = Event::default()
+            .event("containers")
+            .data(stack_members_table(&members).into_string());
         futures_util::stream::iter([
             Ok(header_event(&dash)),
+            Ok(members_event),
             Ok(metrics_event(&MetricPoint {
                 ts_ms: dash.generated_at_unix_ms,
                 cpu_percent: cpu,
@@ -395,6 +404,13 @@ async fn events_stack(
         ])
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// The `detail` event: a container detail page's live region (state + facts).
+fn detail_event(c: &ContainerMetrics) -> Event {
+    Event::default()
+        .event("detail")
+        .data(container_detail_live(c).into_string())
 }
 
 /// The `header` event: the host header's inner HTML.
@@ -417,20 +433,29 @@ fn metrics_event(point: &MetricPoint) -> Event {
     Event::default().event("metrics").data(data)
 }
 
-/// A stream of snapshots: the current one first (if any), then the live feed.
-/// Broadcast lag errors are dropped — a missed intermediate frame is harmless
-/// for a live view.
+/// A stream of the latest snapshot: yields the current snapshot immediately,
+/// then the newest one whenever it changes (deduped by timestamp). It polls the
+/// shared snapshot — the same source the page render reads — so the live view
+/// can never drift from a plain reload.
 fn dashboard_stream(state: &AppState) -> impl Stream<Item = std::sync::Arc<Dashboard>> + use<> {
     use std::sync::Arc;
-    let current = state
-        .shared
-        .read()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .map(Arc::new);
-    let live =
-        BroadcastStream::new(state.snapshots.subscribe()).filter_map(|res| async move { res.ok() });
-    futures_util::stream::iter(current).chain(live)
+    let shared = Arc::clone(&state.shared);
+    let ticker = tokio::time::interval(SNAPSHOT_POLL);
+    futures_util::stream::unfold(
+        (shared, 0u64, ticker),
+        |(shared, last, mut ticker)| async move {
+            loop {
+                ticker.tick().await;
+                let snapshot = shared.read().ok().and_then(|guard| guard.clone());
+                if let Some(dash) = snapshot
+                    && dash.generated_at_unix_ms != last
+                {
+                    let ts = dash.generated_at_unix_ms;
+                    return Some((Arc::new(dash), (shared, ts, ticker)));
+                }
+            }
+        },
+    )
 }
 
 /// Full HTML shell shared by every page: the live host header, the page's main
@@ -513,23 +538,15 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
             div.detail-title {
                 a.back href="/" { "← Dashboard" }
                 h1 { (c.name) }
-                span.badge.(state_class(c.state)) { (state_label(c.state)) }
-                (health_marker(c.health))
                 @if let Some(stack) = &c.stack {
                     a.stack-pill href=(format!("/stack/{stack}")) { (stack) }
                 }
             }
             (action_buttons(&c.id))
         }
-        section.facts {
-            (fact("Image", short_image(&c.image)))
-            (fact("Container ID", &c.id.chars().take(12).collect::<String>()))
-            (fact("Status", &c.status))
-            (fact(
-                "Memory limit",
-                &c.mem_limit.map_or_else(|| "—".to_string(), fmt_bytes),
-            ))
-        }
+        // Live region: swapped wholesale by the `detail` SSE event so state and
+        // facts track reality. The charts below are left untouched.
+        div id="detail-live" { (container_detail_live(c)) }
         (charts_section(&format!("{} · CPU", c.name), &format!("{} · Memory", c.name)))
         section.panel {
             div.panel-head {
@@ -541,6 +558,49 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
             pre.logs id="logs"
                 hx-get=(format!("/api/container/{}/logs", c.id))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
+        }
+    }
+}
+
+/// A stack's member containers as a table (live region on the stack page).
+fn stack_members_table(members: &[&ContainerMetrics]) -> Markup {
+    html! {
+        section.stack {
+            table {
+                thead {
+                    tr {
+                        th { "Container" }
+                        th { "Image" }
+                        th { "State" }
+                        th.num { "CPU" }
+                        th.num { "Memory" }
+                        th.actions-col { "Actions" }
+                    }
+                }
+                tbody {
+                    @for c in members { (container_row(c)) }
+                }
+            }
+        }
+    }
+}
+
+/// The live-updating part of a container detail page: state badge, health, and
+/// the facts grid. Re-rendered and pushed via the `detail` SSE event.
+fn container_detail_live(c: &ContainerMetrics) -> Markup {
+    html! {
+        div.status-line {
+            span.badge.(state_class(c.state)) { (state_label(c.state)) }
+            (health_marker(c.health))
+        }
+        section.facts {
+            (fact("Image", short_image(&c.image)))
+            (fact("Container ID", &c.id.chars().take(12).collect::<String>()))
+            (fact("Status", &c.status))
+            (fact(
+                "Memory limit",
+                &c.mem_limit.map_or_else(|| "—".to_string(), fmt_bytes),
+            ))
         }
     }
 }
@@ -561,23 +621,9 @@ fn stack_detail_main(name: &str, members: &[ContainerMetrics]) -> Markup {
             &format!("{name} · CPU (sum)"),
             &format!("{name} · Memory (sum)"),
         ))
-        section.stack {
-            table {
-                thead {
-                    tr {
-                        th { "Container" }
-                        th { "Image" }
-                        th { "State" }
-                        th.num { "CPU" }
-                        th.num { "Memory" }
-                        th.actions-col { "Actions" }
-                    }
-                }
-                tbody {
-                    @for c in members { (container_row(c)) }
-                }
-            }
-        }
+        // Live region: the `containers` SSE event swaps the member table so its
+        // states/metrics track reality.
+        div id="containers" { (stack_members_table(&members.iter().collect::<Vec<_>>())) }
         section.panel {
             div.panel-head {
                 h3 { "compose.yml" }

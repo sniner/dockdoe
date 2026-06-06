@@ -8,7 +8,6 @@
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::docker::DockerClient;
@@ -17,14 +16,10 @@ use crate::model::Dashboard;
 use crate::store::Store;
 use crate::trend::Bucketer;
 
-/// The latest dashboard snapshot, shared between collector and web handlers.
-/// `None` until the first successful collection.
+/// The latest dashboard snapshot — the single source of truth shared between
+/// the collector (writer) and the web handlers (readers, including the live SSE
+/// streams, which poll it). `None` until the first successful collection.
 pub type SharedDashboard = Arc<RwLock<Option<Dashboard>>>;
-
-/// Live feed of new snapshots for SSE subscribers. Lagging receivers drop the
-/// oldest buffered snapshot — for a live view, missing an intermediate frame is
-/// harmless.
-pub type SnapshotTx = broadcast::Sender<Arc<Dashboard>>;
 
 /// Tunables for the collection loop.
 pub struct Config {
@@ -45,7 +40,6 @@ pub async fn run(
     store: Store,
     config: Config,
     shared: SharedDashboard,
-    snapshots: SnapshotTx,
 ) {
     info!(
         interval = ?config.interval,
@@ -85,16 +79,14 @@ pub async fn run(
             host: host_metrics,
             containers,
         };
-        // One clone for the snapshot readers see; share the rest via Arc.
+        // Publish the latest snapshot; the web layer (page render and live SSE)
+        // reads it from here.
         publish(&shared, dashboard.clone());
-        let dashboard = Arc::new(dashboard);
-        // Fan out to SSE subscribers. An Err just means nobody is listening.
-        let _ = snapshots.send(Arc::clone(&dashboard));
 
         persist(
             &store,
             ts_ms,
-            dashboard,
+            Arc::new(dashboard),
             flushed,
             ts_ms.saturating_sub(raw_retention_ms),
             ts_ms.saturating_sub(trend_retention_ms),

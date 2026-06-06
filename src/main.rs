@@ -85,7 +85,6 @@ async fn main() -> Result<()> {
     let docker_handle = DockerHandle::connect()?;
     let host = HostSampler::new();
     let shared = Arc::new(RwLock::new(None));
-    let (snapshots, _) = tokio::sync::broadcast::channel(16);
 
     // The chart seed window matches raw retention — that's how much history we
     // can show before the live stream takes over.
@@ -97,12 +96,10 @@ async fn main() -> Result<()> {
         store.clone(),
         config,
         Arc::clone(&shared),
-        snapshots.clone(),
     ));
 
     let app = web::router(web::AppState {
         shared,
-        snapshots,
         store,
         docker: docker_handle,
         seed_window,

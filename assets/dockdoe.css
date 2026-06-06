@@ -208,6 +208,13 @@ h2 a.stack-link:hover { color: var(--accent); }
   border: 1px solid var(--border);
 }
 
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
+}
+
 .facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

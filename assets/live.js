@@ -114,6 +114,12 @@
     if (window.htmx) window.htmx.process(el);
   }
 
+  // The live region of a container detail page (state badge + facts).
+  function onDetail(e) {
+    var el = document.getElementById("detail-live");
+    if (el) el.innerHTML = e.data;
+  }
+
   function onMetrics(e) {
     if (!cpuChart) return;
     var p;
@@ -132,6 +138,7 @@
     es = new EventSource(liveUrl);
     es.addEventListener("header", onHeader);
     es.addEventListener("containers", onContainers);
+    es.addEventListener("detail", onDetail);
     es.addEventListener("metrics", onMetrics);
   }
 
