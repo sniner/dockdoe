@@ -59,9 +59,10 @@ pub struct ContainerTrend {
     pub samples: u32,
 }
 
-/// One raw host sample, as needed to seed the live charts on first page load.
+/// One raw metric point (CPU%, memory) at a timestamp, used to seed the live
+/// charts on first page load. Shared by host and per-container series.
 #[derive(Debug, Clone, Serialize)]
-pub struct HostPoint {
+pub struct MetricPoint {
     pub ts_ms: u64,
     pub cpu_percent: f64,
     pub mem_used: Option<u64>,
@@ -274,8 +275,8 @@ impl Store {
     }
 
     /// Raw host samples collected at or after `since_ms`, oldest first. Used to
-    /// seed the live charts when a page first loads.
-    pub fn recent_host_samples(&self, since_ms: u64) -> Result<Vec<HostPoint>> {
+    /// seed the host charts when a page first loads.
+    pub fn recent_host_samples(&self, since_ms: u64) -> Result<Vec<MetricPoint>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
@@ -284,16 +285,28 @@ impl Store {
             )
             .context("prepare recent host query")?;
         let rows = stmt
-            .query_map([to_db(since_ms)], |r| {
-                Ok(HostPoint {
-                    ts_ms: from_db(r.get::<_, i64>(0)?),
-                    cpu_percent: r.get(1)?,
-                    mem_used: r.get::<_, Option<i64>>(2)?.map(from_db),
-                })
-            })
+            .query_map([to_db(since_ms)], row_to_point)
             .context("query recent host samples")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("collect recent host samples")?;
+        Ok(rows)
+    }
+
+    /// Raw samples for one container at or after `since_ms`, oldest first. Used
+    /// to seed a container detail page's charts.
+    pub fn recent_container_samples(&self, id: &str, since_ms: u64) -> Result<Vec<MetricPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT ts_ms, cpu_percent, mem_used
+                 FROM container_sample WHERE id = ?1 AND ts_ms >= ?2 ORDER BY ts_ms ASC",
+            )
+            .context("prepare recent container query")?;
+        let rows = stmt
+            .query_map(rusqlite::params![id, to_db(since_ms)], row_to_point)
+            .context("query recent container samples")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect recent container samples")?;
         Ok(rows)
     }
 
@@ -317,6 +330,15 @@ fn to_db(v: u64) -> i64 {
 
 fn from_db(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
+}
+
+/// Map a `(ts_ms, cpu_percent, mem_used)` row to a [`MetricPoint`].
+fn row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
+    Ok(MetricPoint {
+        ts_ms: from_db(r.get::<_, i64>(0)?),
+        cpu_percent: r.get(1)?,
+        mem_used: r.get::<_, Option<i64>>(2)?.map(from_db),
+    })
 }
 
 const MIGRATIONS: &str = "

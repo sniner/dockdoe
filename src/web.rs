@@ -25,7 +25,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::collector::{SharedDashboard, SnapshotTx};
 use crate::docker::{Action, DockerHandle};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, HostMetrics};
-use crate::store::{HostPoint, Store};
+use crate::store::{MetricPoint, Store};
 
 /// Shared state for the web layer.
 #[derive(Clone)]
@@ -50,11 +50,22 @@ struct Assets;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/container/{id}", get(container_detail))
+        .route("/stack/{name}", get(stack_detail))
         .route("/events", get(events_html))
         .route("/events/metrics", get(events_metrics))
         .route(
+            "/events/container/{id}/metrics",
+            get(events_container_metrics),
+        )
+        .route("/events/stack/{name}/metrics", get(events_stack_metrics))
+        .route(
             "/api/container/{id}/{action}",
             axum::routing::post(container_action),
+        )
+        .route(
+            "/api/stack/{name}/{action}",
+            axum::routing::post(stack_action),
         )
         .route("/assets/{*path}", get(asset))
         .with_state(state)
@@ -80,6 +91,41 @@ async fn container_action(
             (StatusCode::BAD_GATEWAY, format!("action failed: {err}")).into_response()
         }
     }
+}
+
+/// Apply an action to every container in a stack, then echo the stack's action
+/// buttons back for HTMX to swap.
+async fn stack_action(
+    State(state): State<AppState>,
+    axum::extract::Path((name, action)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(action) = Action::parse(&action) else {
+        return (StatusCode::BAD_REQUEST, "unknown action").into_response();
+    };
+    let ids: Vec<String> = current_snapshot(&state)
+        .map(|d| {
+            d.containers
+                .iter()
+                .filter(|c| c.stack.as_deref() == Some(name.as_str()))
+                .map(|c| c.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut failed = 0usize;
+    for id in &ids {
+        if let Err(err) = state.docker.apply(id, action).await {
+            tracing::warn!(%id, ?action, %err, "stack member action failed");
+            failed += 1;
+        }
+    }
+    tracing::info!(stack = %name, ?action, total = ids.len(), failed, "applied stack action");
+    stack_action_buttons(&name).into_response()
+}
+
+/// The current snapshot, cloned out of the shared lock.
+fn current_snapshot(state: &AppState) -> Option<Dashboard> {
+    state.shared.read().ok().and_then(|guard| guard.clone())
 }
 
 /// Serve an embedded static asset.
@@ -112,7 +158,84 @@ async fn dashboard(State(state): State<AppState>) -> Markup {
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
-    page(snapshot.as_ref(), &seed)
+    dashboard_page(snapshot.as_ref(), &seed)
+}
+
+/// Detail page for a single container.
+async fn container_detail(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let snapshot = current_snapshot(&state);
+    let Some(container) = snapshot
+        .as_ref()
+        .and_then(|d| d.containers.iter().find(|c| c.id == id).cloned())
+    else {
+        let body = shell(
+            snapshot.as_ref(),
+            html! { p.empty { "Container not found." } },
+            &[],
+            "/events/metrics",
+        );
+        return (StatusCode::NOT_FOUND, body).into_response();
+    };
+
+    let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
+    let store = state.store.clone();
+    let seed_id = id.clone();
+    let seed = tokio::task::spawn_blocking(move || store.recent_container_samples(&seed_id, since))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+
+    let metrics_url = format!("/events/container/{id}/metrics");
+    shell(
+        snapshot.as_ref(),
+        container_detail_main(&container),
+        &seed,
+        &metrics_url,
+    )
+    .into_response()
+}
+
+/// Detail page for a compose stack.
+async fn stack_detail(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let snapshot = current_snapshot(&state);
+    let members: Vec<ContainerMetrics> = snapshot
+        .as_ref()
+        .map(|d| {
+            d.containers
+                .iter()
+                .filter(|c| c.stack.as_deref() == Some(name.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if members.is_empty() {
+        let body = shell(
+            snapshot.as_ref(),
+            html! { p.empty { "Stack not found." } },
+            &[],
+            "/events/metrics",
+        );
+        return (StatusCode::NOT_FOUND, body).into_response();
+    }
+
+    // Stack charts stream live aggregates; no historical seed (raw samples
+    // aren't keyed by stack), so they fill in over the view window.
+    let metrics_url = format!("/events/stack/{name}/metrics");
+    shell(
+        snapshot.as_ref(),
+        stack_detail_main(&name, &members),
+        &[],
+        &metrics_url,
+    )
+    .into_response()
 }
 
 /// SSE stream of HTML fragments for HTMX: a `header` and a `containers` event
@@ -138,15 +261,65 @@ async fn events_metrics(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = dashboard_stream(&state).map(|dash| {
-        let point = HostPoint {
+        let point = MetricPoint {
             ts_ms: dash.generated_at_unix_ms,
             cpu_percent: f64::from(dash.host.cpu_percent),
             mem_used: Some(dash.host.mem_used),
         };
-        let data = serde_json::to_string(&point).unwrap_or_else(|_| "{}".to_string());
-        Ok(Event::default().data(data))
+        Ok(point_event(&point))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Per-container metric stream for a container detail page's charts.
+async fn events_container_metrics(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = dashboard_stream(&state).filter_map(move |dash| {
+        let id = id.clone();
+        async move {
+            let c = dash.containers.iter().find(|c| c.id == id)?;
+            Some(Ok(point_event(&MetricPoint {
+                ts_ms: dash.generated_at_unix_ms,
+                cpu_percent: c.cpu_percent.unwrap_or(0.0),
+                mem_used: c.mem_used,
+            })))
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Aggregated metric stream for a stack detail page's charts: CPU and memory
+/// summed across the stack's containers each cycle.
+async fn events_stack_metrics(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = dashboard_stream(&state).map(move |dash| {
+        let members = dash
+            .containers
+            .iter()
+            .filter(|c| c.stack.as_deref() == Some(name.as_str()));
+        let mut cpu = 0.0;
+        let mut mem = 0u64;
+        for c in members {
+            cpu += c.cpu_percent.unwrap_or(0.0);
+            mem += c.mem_used.unwrap_or(0);
+        }
+        Ok(point_event(&MetricPoint {
+            ts_ms: dash.generated_at_unix_ms,
+            cpu_percent: cpu,
+            mem_used: Some(mem),
+        }))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Serialise a metric point as an SSE data event.
+fn point_event(point: &MetricPoint) -> Event {
+    let data = serde_json::to_string(point).unwrap_or_else(|_| "{}".to_string());
+    Event::default().data(data)
 }
 
 /// A stream of snapshots: the current one first (if any), then the live feed.
@@ -165,7 +338,18 @@ fn dashboard_stream(state: &AppState) -> impl Stream<Item = std::sync::Arc<Dashb
     futures_util::stream::iter(current).chain(live)
 }
 
-fn page(snapshot: Option<&Dashboard>, seed: &[HostPoint]) -> Markup {
+/// Full HTML shell shared by every page: the live host header, the page's main
+/// content, and the chart machinery. `metrics_url` is the SSE endpoint the
+/// charts subscribe to; `seed` pre-fills them with history.
+// `main_content` is moved in by builder convention — callers hand off a
+// freshly-built fragment they no longer need.
+#[allow(clippy::needless_pass_by_value)]
+fn shell(
+    snapshot: Option<&Dashboard>,
+    main_content: Markup,
+    seed: &[MetricPoint],
+    metrics_url: &str,
+) -> Markup {
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     html! {
         (DOCTYPE)
@@ -181,19 +365,13 @@ fn page(snapshot: Option<&Dashboard>, seed: &[HostPoint]) -> Markup {
                 header.host id="host-header" sse-swap="header" {
                     @match snapshot {
                         Some(d) => (host_header_inner(&d.host, d.generated_at_unix_ms)),
-                        None => span.brand { "Dock" span { "Doe" } },
+                        None => a.brand href="/" { "Dock" span { "Doe" } },
                     }
                 }
-                main {
-                    (charts_section())
-                    div id="containers" sse-swap="containers" {
-                        @match snapshot {
-                            Some(d) => (container_section(&d.containers)),
-                            None => p.empty { "Collecting first metrics sample…" },
-                        }
-                    }
+                main { (main_content) }
+                script id="seed-data" type="application/json" data-metrics-url=(metrics_url) {
+                    (maud::PreEscaped(seed_json))
                 }
-                script id="seed-data" type="application/json" { (maud::PreEscaped(seed_json)) }
                 script src="/assets/vendor/htmx.min.js" {}
                 script src="/assets/vendor/sse.js" {}
                 script src="/assets/vendor/uPlot.iife.min.js" {}
@@ -203,18 +381,137 @@ fn page(snapshot: Option<&Dashboard>, seed: &[HostPoint]) -> Markup {
     }
 }
 
-/// Static markup for the live host charts. Data is supplied by `charts.js`.
-fn charts_section() -> Markup {
+/// The dashboard body: host charts plus the live container table.
+fn dashboard_page(snapshot: Option<&Dashboard>, seed: &[MetricPoint]) -> Markup {
+    let main = html! {
+        (charts_section("Host CPU", "Host Memory"))
+        div id="containers" sse-swap="containers" {
+            @match snapshot {
+                Some(d) => (container_section(&d.containers)),
+                None => p.empty { "Collecting first metrics sample…" },
+            }
+        }
+    };
+    shell(snapshot, main, seed, "/events/metrics")
+}
+
+/// Markup for a pair of live charts (CPU + memory). Data comes from `charts.js`,
+/// which reads the seed and metrics URL off the page.
+fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
     html! {
         section.charts {
             div.chart-card {
-                span.chart-title { "Host CPU" }
+                span.chart-title { (cpu_title) }
                 div id="chart-cpu" {}
             }
             div.chart-card {
-                span.chart-title { "Host Memory" }
+                span.chart-title { (mem_title) }
                 div id="chart-mem" {}
             }
+        }
+    }
+}
+
+/// Body of a single-container detail page.
+fn container_detail_main(c: &ContainerMetrics) -> Markup {
+    html! {
+        section.detail-head {
+            div.detail-title {
+                a.back href="/" { "← Dashboard" }
+                h1 { (c.name) }
+                span.badge.(state_class(c.state)) { (state_label(c.state)) }
+                (health_marker(c.health))
+                @if let Some(stack) = &c.stack {
+                    a.stack-pill href=(format!("/stack/{stack}")) { (stack) }
+                }
+            }
+            (action_buttons(&c.id))
+        }
+        section.facts {
+            (fact("Image", short_image(&c.image)))
+            (fact("Container ID", &c.id.chars().take(12).collect::<String>()))
+            (fact("Status", &c.status))
+            (fact(
+                "Memory limit",
+                &c.mem_limit.map_or_else(|| "—".to_string(), fmt_bytes),
+            ))
+        }
+        (charts_section(&format!("{} · CPU", c.name), &format!("{} · Memory", c.name)))
+        section.panel {
+            h3 { "Logs" }
+            p.empty { "Logs will appear here." }
+        }
+    }
+}
+
+/// Body of a stack detail page: aggregate charts, stack actions, and the
+/// stack's containers.
+fn stack_detail_main(name: &str, members: &[ContainerMetrics]) -> Markup {
+    html! {
+        section.detail-head {
+            div.detail-title {
+                a.back href="/" { "← Dashboard" }
+                h1 { (name) }
+                span.count { "(" (members.len()) ")" }
+            }
+            (stack_action_buttons(name))
+        }
+        (charts_section(
+            &format!("{name} · CPU (sum)"),
+            &format!("{name} · Memory (sum)"),
+        ))
+        section.stack {
+            table {
+                thead {
+                    tr {
+                        th { "Container" }
+                        th { "Image" }
+                        th { "State" }
+                        th.num { "CPU" }
+                        th.num { "Memory" }
+                        th.actions-col { "Actions" }
+                    }
+                }
+                tbody {
+                    @for c in members { (container_row(c)) }
+                }
+            }
+        }
+        section.panel {
+            h3 { "compose.yml" }
+            p.empty { "The compose file will appear here." }
+        }
+    }
+}
+
+/// Start/stop/restart-all buttons for a whole stack.
+fn stack_action_buttons(name: &str) -> Markup {
+    html! {
+        span.actions {
+            button.act.start type="button"
+                hx-post=(format!("/api/stack/{name}/start"))
+                hx-target="closest .actions" hx-swap="outerHTML"
+                title="Start all" { "▶" }
+            button.act.restart type="button"
+                hx-post=(format!("/api/stack/{name}/restart"))
+                hx-target="closest .actions" hx-swap="outerHTML"
+                hx-confirm=(format!("Restart all containers in {name}?"))
+                title="Restart all" { "⟳" }
+            button.act.stop type="button"
+                hx-post=(format!("/api/stack/{name}/stop"))
+                hx-target="closest .actions" hx-swap="outerHTML"
+                hx-confirm=(format!("Stop all containers in {name}?"))
+                title="Stop all" { "■" }
+        }
+    }
+}
+
+/// A labelled fact for the detail meta grid.
+fn fact(label: &str, value: &str) -> Markup {
+    html! {
+        div.fact {
+            span.fact-label { (label) }
+            span.fact-value { (value) }
         }
     }
 }
@@ -222,7 +519,7 @@ fn charts_section() -> Markup {
 /// The inner content of the host header (everything HTMX swaps on each update).
 fn host_header_inner(host: &HostMetrics, generated_at_unix_ms: u64) -> Markup {
     html! {
-        span.brand { "Dock" span { "Doe" } }
+        a.brand href="/" { "Dock" span { "Doe" } }
         (metric("CPU", &format!("{:.1}%", host.cpu_percent)))
         (metric(
             "Load 1/5/15",
@@ -278,7 +575,13 @@ fn container_section(containers: &[ContainerMetrics]) -> Markup {
                 StackKey::Standalone => "Standalone",
             };
             section.stack {
-                h2 { (title) " " span.count { "(" (members.len()) ")" } }
+                h2 {
+                    @match key {
+                        StackKey::Named(name) => a.stack-link href=(format!("/stack/{name}")) { (title) },
+                        StackKey::Standalone => span { (title) },
+                    }
+                    " " span.count { "(" (members.len()) ")" }
+                }
                 table {
                     thead {
                         tr {
@@ -302,7 +605,7 @@ fn container_section(containers: &[ContainerMetrics]) -> Markup {
 fn container_row(c: &ContainerMetrics) -> Markup {
     html! {
         tr {
-            td.name { (c.name) }
+            td.name { a href=(format!("/container/{}", c.id)) { (c.name) } }
             td.image { (short_image(&c.image)) }
             td {
                 span.badge.(state_class(c.state)) { (state_label(c.state)) }

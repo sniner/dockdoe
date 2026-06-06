@@ -16,6 +16,10 @@
     }
   }
 
+  var seedEl = document.getElementById("seed-data");
+  var metricsUrl =
+    (seedEl && seedEl.getAttribute("data-metrics-url")) || "/events/metrics";
+
   var seed = readSeed();
   var ts = seed.map(function (p) { return Math.floor(p.ts_ms / 1000); });
   var cpu = seed.map(function (p) { return p.cpu_percent; });
@@ -73,7 +77,7 @@
     chart.setData(d);
   }
 
-  var es = new EventSource("/events/metrics");
+  var es = new EventSource(metricsUrl);
   es.onmessage = function (e) {
     var p;
     try {
