@@ -63,16 +63,27 @@ async fn main() -> Result<()> {
     let docker = DockerClient::connect()?;
     let host = HostSampler::new();
     let shared = Arc::new(RwLock::new(None));
+    let (snapshots, _) = tokio::sync::broadcast::channel(16);
+
+    // The chart seed window matches raw retention — that's how much history we
+    // can show before the live stream takes over.
+    let seed_window = config.raw_retention;
 
     tokio::spawn(collector::run(
         docker,
         host,
-        store,
+        store.clone(),
         config,
         Arc::clone(&shared),
+        snapshots.clone(),
     ));
 
-    let app = web::router(shared);
+    let app = web::router(web::AppState {
+        shared,
+        snapshots,
+        store,
+        seed_window,
+    });
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("binding to {bind}"))?;

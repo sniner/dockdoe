@@ -59,6 +59,14 @@ pub struct ContainerTrend {
     pub samples: u32,
 }
 
+/// One raw host sample, as needed to seed the live charts on first page load.
+#[derive(Debug, Clone, Serialize)]
+pub struct HostPoint {
+    pub ts_ms: u64,
+    pub cpu_percent: f64,
+    pub mem_used: Option<u64>,
+}
+
 /// A min/max/median rollup over one time bucket for the host.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostTrend {
@@ -259,6 +267,30 @@ impl Store {
         Ok(host + containers)
     }
 
+    /// Raw host samples collected at or after `since_ms`, oldest first. Used to
+    /// seed the live charts when a page first loads.
+    pub fn recent_host_samples(&self, since_ms: u64) -> Result<Vec<HostPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT ts_ms, cpu_percent, mem_used
+                 FROM host_sample WHERE ts_ms >= ?1 ORDER BY ts_ms ASC",
+            )
+            .context("prepare recent host query")?;
+        let rows = stmt
+            .query_map([since_ms], |r| {
+                Ok(HostPoint {
+                    ts_ms: r.get(0)?,
+                    cpu_percent: r.get(1)?,
+                    mem_used: r.get(2)?,
+                })
+            })
+            .context("query recent host samples")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect recent host samples")?;
+        Ok(rows)
+    }
+
     /// Count rows in a table — test/diagnostic helper.
     #[cfg(test)]
     pub fn count(&self, table: &str) -> Result<u64> {
@@ -406,6 +438,26 @@ mod tests {
             .unwrap();
         assert_eq!(store.count("container_trend").unwrap(), 1);
         assert_eq!(store.count("host_trend").unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_host_samples_filters_and_orders() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_samples(5_000, &host_sample(20.0), &[])
+            .unwrap();
+        store
+            .insert_samples(1_000, &host_sample(10.0), &[])
+            .unwrap();
+        store
+            .insert_samples(9_000, &host_sample(30.0), &[])
+            .unwrap();
+
+        let points = store.recent_host_samples(5_000).unwrap();
+        assert_eq!(points.len(), 2);
+        // Oldest first, only ts >= 5000.
+        assert_eq!(points[0].ts_ms, 5_000);
+        assert_eq!(points[1].ts_ms, 9_000);
     }
 
     #[test]

@@ -1,32 +1,56 @@
-//! Web layer: axum router, embedded assets, and HTML rendering.
+//! Web layer: axum router, embedded assets, SSE streaming, and HTML rendering.
 //!
-//! Milestone 1 renders a static dashboard snapshot. The render functions take
-//! the shared model and produce HTML; later milestones add SSE streaming and
-//! HTMX partials on top of the same model.
+//! The dashboard is rendered server-side with maud and kept live without a full
+//! reload: HTMX's SSE extension swaps the maud-rendered header and container
+//! fragments as new samples arrive (`/events`), while uPlot host charts are fed
+//! JSON from a second stream (`/events/metrics`) and seeded from the store on
+//! first load. Rendering stays in one place (these functions) — the SSE handlers
+//! reuse the very same fragments.
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use futures_util::{Stream, StreamExt};
 use maud::{DOCTYPE, Markup, html};
 use rust_embed::RustEmbed;
+use tokio_stream::wrappers::BroadcastStream;
 
-use crate::collector::SharedDashboard;
+use crate::collector::{SharedDashboard, SnapshotTx};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, HostMetrics};
+use crate::store::{HostPoint, Store};
+
+/// Shared state for the web layer.
+#[derive(Clone)]
+pub struct AppState {
+    /// Latest snapshot for the initial server-side render.
+    pub shared: SharedDashboard,
+    /// Live feed subscribed to by the SSE endpoints.
+    pub snapshots: SnapshotTx,
+    /// Store, for seeding charts with recent history.
+    pub store: Store,
+    /// How far back to seed charts on first load.
+    pub seed_window: Duration,
+}
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
 struct Assets;
 
 /// Build the application router.
-pub fn router(shared: SharedDashboard) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/events", get(events_html))
+        .route("/events/metrics", get(events_metrics))
         .route("/assets/{*path}", get(asset))
-        .with_state(shared)
+        .with_state(state)
 }
 
 /// Serve an embedded static asset.
@@ -49,13 +73,71 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-/// Render the dashboard from the latest snapshot.
-async fn dashboard(State(shared): State<SharedDashboard>) -> Markup {
-    let snapshot = shared.read().ok().and_then(|guard| guard.clone());
-    page(snapshot.as_ref())
+/// Render the dashboard from the latest snapshot, seeding charts from history.
+async fn dashboard(State(state): State<AppState>) -> Markup {
+    let snapshot = state.shared.read().ok().and_then(|guard| guard.clone());
+    let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
+    let store = state.store.clone();
+    let seed = tokio::task::spawn_blocking(move || store.recent_host_samples(since))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    page(snapshot.as_ref(), &seed)
 }
 
-fn page(snapshot: Option<&Dashboard>) -> Markup {
+/// SSE stream of HTML fragments for HTMX: a `header` and a `containers` event
+/// per snapshot. The current snapshot is sent immediately so a freshly loaded
+/// page doesn't wait a full interval for its first live update.
+async fn events_html(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = dashboard_stream(&state).flat_map(|dash| {
+        let header = Event::default()
+            .event("header")
+            .data(host_header_inner(&dash.host, dash.generated_at_unix_ms).into_string());
+        let containers = Event::default()
+            .event("containers")
+            .data(container_section(&dash.containers).into_string());
+        futures_util::stream::iter([Ok(header), Ok(containers)])
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// SSE stream of host metric points (JSON) for the uPlot charts.
+async fn events_metrics(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = dashboard_stream(&state).map(|dash| {
+        let point = HostPoint {
+            ts_ms: dash.generated_at_unix_ms,
+            cpu_percent: f64::from(dash.host.cpu_percent),
+            mem_used: Some(dash.host.mem_used),
+        };
+        let data = serde_json::to_string(&point).unwrap_or_else(|_| "{}".to_string());
+        Ok(Event::default().data(data))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// A stream of snapshots: the current one first (if any), then the live feed.
+/// Broadcast lag errors are dropped — a missed intermediate frame is harmless
+/// for a live view.
+fn dashboard_stream(state: &AppState) -> impl Stream<Item = std::sync::Arc<Dashboard>> + use<> {
+    use std::sync::Arc;
+    let current = state
+        .shared
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(Arc::new);
+    let live =
+        BroadcastStream::new(state.snapshots.subscribe()).filter_map(|res| async move { res.ok() });
+    futures_util::stream::iter(current).chain(live)
+}
+
+fn page(snapshot: Option<&Dashboard>, seed: &[HostPoint]) -> Markup {
+    let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -63,44 +145,70 @@ fn page(snapshot: Option<&Dashboard>) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "DockDoe" }
+                link rel="stylesheet" href="/assets/vendor/uPlot.min.css";
                 link rel="stylesheet" href="/assets/dockdoe.css";
             }
-            body {
-                @match snapshot {
-                    Some(dashboard) => {
-                        (host_header(&dashboard.host, dashboard.generated_at_unix_ms))
-                        main { (container_section(&dashboard.containers)) }
-                    }
-                    None => {
-                        header.host { span.brand { "Dock" span { "Doe" } } }
-                        main { p.empty { "Collecting first metrics sample…" } }
+            body hx-ext="sse" sse-connect="/events" {
+                header.host id="host-header" sse-swap="header" {
+                    @match snapshot {
+                        Some(d) => (host_header_inner(&d.host, d.generated_at_unix_ms)),
+                        None => span.brand { "Dock" span { "Doe" } },
                     }
                 }
+                main {
+                    (charts_section())
+                    div id="containers" sse-swap="containers" {
+                        @match snapshot {
+                            Some(d) => (container_section(&d.containers)),
+                            None => p.empty { "Collecting first metrics sample…" },
+                        }
+                    }
+                }
+                script id="seed-data" type="application/json" { (maud::PreEscaped(seed_json)) }
+                script src="/assets/vendor/htmx.min.js" {}
+                script src="/assets/vendor/sse.js" {}
+                script src="/assets/vendor/uPlot.iife.min.js" {}
+                script src="/assets/charts.js" {}
             }
         }
     }
 }
 
-fn host_header(host: &HostMetrics, generated_at_unix_ms: u64) -> Markup {
+/// Static markup for the live host charts. Data is supplied by `charts.js`.
+fn charts_section() -> Markup {
     html! {
-        header.host {
-            span.brand { "Dock" span { "Doe" } }
-            (metric("CPU", &format!("{:.1}%", host.cpu_percent)))
-            (metric(
-                "Load 1/5/15",
-                &format!(
-                    "{:.2} {:.2} {:.2}",
-                    host.load_avg.one, host.load_avg.five, host.load_avg.fifteen
-                ),
-            ))
-            (metric(
-                "Memory",
-                &format!("{} / {}", fmt_bytes(host.mem_used), fmt_bytes(host.mem_total)),
-            ))
-            (metric("CPUs", &host.cpu_count.to_string()))
-            span.spacer {}
-            span.generated { "updated " (fmt_age(generated_at_unix_ms)) }
+        section.charts {
+            div.chart-card {
+                span.chart-title { "Host CPU" }
+                div id="chart-cpu" {}
+            }
+            div.chart-card {
+                span.chart-title { "Host Memory" }
+                div id="chart-mem" {}
+            }
         }
+    }
+}
+
+/// The inner content of the host header (everything HTMX swaps on each update).
+fn host_header_inner(host: &HostMetrics, generated_at_unix_ms: u64) -> Markup {
+    html! {
+        span.brand { "Dock" span { "Doe" } }
+        (metric("CPU", &format!("{:.1}%", host.cpu_percent)))
+        (metric(
+            "Load 1/5/15",
+            &format!(
+                "{:.2} {:.2} {:.2}",
+                host.load_avg.one, host.load_avg.five, host.load_avg.fifteen
+            ),
+        ))
+        (metric(
+            "Memory",
+            &format!("{} / {}", fmt_bytes(host.mem_used), fmt_bytes(host.mem_total)),
+        ))
+        (metric("CPUs", &host.cpu_count.to_string()))
+        span.spacer {}
+        span.generated { "updated " (fmt_age(generated_at_unix_ms)) }
     }
 }
 
@@ -282,18 +390,24 @@ fn fmt_bytes(bytes: u64) -> String {
 
 /// Render how long ago a Unix-ms timestamp was, relative to now.
 fn fmt_age(unix_ms: u64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let secs = now.saturating_sub(unix_ms) / 1000;
+    let secs = now_unix_ms().saturating_sub(unix_ms) / 1000;
     match secs {
         0 => "just now".to_string(),
         1 => "1s ago".to_string(),
         s if s < 60 => format!("{s}s ago"),
         s => format!("{}m ago", s / 60),
     }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

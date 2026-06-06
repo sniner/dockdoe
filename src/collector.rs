@@ -8,6 +8,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::docker::DockerClient;
@@ -19,6 +20,11 @@ use crate::trend::Bucketer;
 /// The latest dashboard snapshot, shared between collector and web handlers.
 /// `None` until the first successful collection.
 pub type SharedDashboard = Arc<RwLock<Option<Dashboard>>>;
+
+/// Live feed of new snapshots for SSE subscribers. Lagging receivers drop the
+/// oldest buffered snapshot — for a live view, missing an intermediate frame is
+/// harmless.
+pub type SnapshotTx = broadcast::Sender<Arc<Dashboard>>;
 
 /// Tunables for the collection loop.
 pub struct Config {
@@ -39,6 +45,7 @@ pub async fn run(
     store: Store,
     config: Config,
     shared: SharedDashboard,
+    snapshots: SnapshotTx,
 ) {
     info!(
         interval = ?config.interval,
@@ -78,7 +85,11 @@ pub async fn run(
             host: host_metrics,
             containers,
         };
+        // One clone for the snapshot readers see; share the rest via Arc.
         publish(&shared, dashboard.clone());
+        let dashboard = Arc::new(dashboard);
+        // Fan out to SSE subscribers. An Err just means nobody is listening.
+        let _ = snapshots.send(Arc::clone(&dashboard));
 
         persist(
             &store,
@@ -105,7 +116,7 @@ fn publish(shared: &SharedDashboard, dashboard: Dashboard) {
 async fn persist(
     store: &Store,
     ts_ms: u64,
-    dashboard: Dashboard,
+    dashboard: Arc<Dashboard>,
     flushed: crate::trend::Flushed,
     raw_cutoff_ms: u64,
     trend_cutoff_ms: u64,
