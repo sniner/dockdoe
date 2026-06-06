@@ -1,0 +1,22 @@
+# Example deployment pulling the prebuilt image from GHCR.
+#   docker compose up -d   →   open http://127.0.0.1:8080
+services:
+  dockdoe:
+    image: ghcr.io/sniner/dockdoe:latest
+    container_name: dockdoe
+    restart: unless-stopped
+    ports:
+      # Host-only by default; change to "8080:8080" to expose on the network.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # The Docker socket: required for monitoring AND for the start/stop/
+      # restart actions. This grants full control of the Docker daemon
+      # (effectively root on the host) — only run images you trust.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persists the metrics database across restarts/upgrades.
+      - dockdoe-data:/data
+    # Host CPU/load/memory in the header already reflect the real host: the
+    # /proc files DockDoe reads are not namespaced. No /proc mount needed.
+
+volumes:
+  dockdoe-data:

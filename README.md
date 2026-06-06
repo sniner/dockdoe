@@ -1,5 +1,11 @@
 # DockDoe
 
+> [!WARNING]
+> **Very early version (0.1.0).** DockDoe is brand new and under active
+> development. Expect rough edges, bugs, and breaking changes between releases.
+> It is not yet battle-tested — use it at your own risk, and don't rely on it as
+> your only monitoring just yet. Feedback and bug reports are very welcome.
+
 A single-binary Docker host monitor with an embedded web UI. Shows the vital
 metrics of your containers — state, CPU, memory — grouped by compose stack,
 with htop-style host stats on top. The dashboard updates live (no full reload):
@@ -9,10 +15,6 @@ seeded from history.
 Drill into a container (live CPU/memory charts, facts, logs) or a whole stack
 (aggregate charts, the compose.yml, start/stop/restart-all), and start, stop or
 restart containers right from the UI.
-
-> Status: **milestone 3** — actions, and stack/container detail pages with logs
-> and compose.yml, on top of the live streaming dashboard and SQLite-backed
-> trend history.
 
 ## Run
 
@@ -25,8 +27,32 @@ dockdoe --bind 0.0.0.0:8080
 ```
 
 Requires access to the Docker socket (`/var/run/docker.sock`, or `DOCKER_HOST`).
-Host CPU/load/memory are read from the host `/proc`; when running DockDoe inside
-a container, mount the host `/proc` for those to reflect the real host.
+Host CPU/load/memory are read from `/proc`. Those files (`/proc/meminfo`,
+`/proc/stat`, `/proc/loadavg`) are not namespaced, so a container sees the real
+host values out of the box — no `/proc` mount or `pid: host` needed.
+
+### With Docker
+
+A prebuilt image is published to GHCR (`ghcr.io/sniner/dockdoe`). The simplest
+way to run it is the example [`compose.yml`](compose.yml):
+
+```sh
+docker compose up -d
+# then open http://127.0.0.1:8080
+```
+
+Or directly:
+
+```sh
+docker run -d --name dockdoe \
+  -p 127.0.0.1:8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v dockdoe-data:/data \
+  ghcr.io/sniner/dockdoe:latest
+```
+
+Mounting the Docker socket grants full control of the daemon (effectively root
+on the host), which DockDoe needs for the start/stop/restart actions.
 
 ## Configuration
 
