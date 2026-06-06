@@ -12,6 +12,7 @@ axum = "0.8.9"
 bollard = "0.21.0"
 futures-util = "0.3.32"
 maud = { version = "0.27.0", features = ["axum"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 rust-embed = "8.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
