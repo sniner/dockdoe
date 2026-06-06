@@ -100,46 +100,26 @@ async fn stack_action(
     let Some(action) = Action::parse(&action) else {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
-    let ids: Vec<String> = current_snapshot(&state)
-        .map(|d| {
-            d.containers
-                .iter()
-                .filter(|c| c.stack.as_deref() == Some(name.as_str()))
-                .map(|c| c.id.clone())
-                .collect()
-        })
-        .unwrap_or_default();
 
-    // First pass: attempt the action on every member.
-    let mut failed: Vec<&String> = Vec::new();
-    for id in &ids {
-        if let Err(err) = state.docker.apply(id, action).await {
-            tracing::warn!(%id, ?action, %err, "stack member action failed");
-            failed.push(id);
+    // Orchestrate dependency-aware: the docker layer reads the compose
+    // depends_on labels and starts/stops members in the right order.
+    match state.docker.stack_action(&name, action).await {
+        Ok(outcome) => {
+            tracing::info!(
+                stack = %name, ?action,
+                total = outcome.total, failed = outcome.failed,
+                "applied stack action"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(stack = %name, ?action, %err, "stack action failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("stack action failed: {err}"),
+            )
+                .into_response();
         }
     }
-
-    // Compose stacks have start-order dependencies (e.g. an app sharing a
-    // network sidecar's namespace can't start until the sidecar runs). We don't
-    // parse depends_on, so for start/restart we simply retry the failures once:
-    // the dependency has come up during the first pass.
-    if !failed.is_empty() && matches!(action, Action::Start | Action::Restart) {
-        let retry = std::mem::take(&mut failed);
-        for id in retry {
-            if let Err(err) = state.docker.apply(id, action).await {
-                tracing::warn!(%id, ?action, %err, "stack member action failed on retry");
-                failed.push(id);
-            }
-        }
-    }
-
-    tracing::info!(
-        stack = %name,
-        ?action,
-        total = ids.len(),
-        failed = failed.len(),
-        "applied stack action"
-    );
     stack_action_buttons(&name).into_response()
 }
 

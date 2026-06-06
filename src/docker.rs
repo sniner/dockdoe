@@ -7,17 +7,21 @@
 //! own last collection cycle and diff against that — so the delta spans exactly
 //! one collection interval.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bollard::Docker;
-use bollard::models::{ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum};
+use bollard::models::{
+    ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum,
+};
 use bollard::query_parameters::{
-    ListContainersOptionsBuilder, LogsOptionsBuilder, StatsOptionsBuilder,
+    InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
+    StatsOptionsBuilder,
 };
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::model::{ContainerMetrics, ContainerState, HealthState};
 
@@ -115,6 +119,263 @@ impl DockerHandle {
         }
         Ok(out)
     }
+
+    /// Apply an action to a whole compose stack, honouring the dependency order
+    /// recorded in the `com.docker.compose.depends_on` labels.
+    ///
+    /// Start: dependencies first (topological order); a `service_healthy`
+    /// dependency is waited on until its healthcheck reports healthy. Stop:
+    /// reverse order. Restart: stop then start.
+    pub async fn stack_action(&self, project: &str, action: Action) -> Result<StackOutcome> {
+        let members = self.stack_members(project).await?;
+        let outcome = match action {
+            Action::Start => self.start_in_order(&members).await,
+            Action::Stop => self.stop_in_order(&members).await,
+            Action::Restart => {
+                let stop = self.stop_in_order(&members).await;
+                let start = self.start_in_order(&members).await;
+                // End state is "started", so report the start failures.
+                StackOutcome {
+                    failed: start.failed,
+                    ..stop
+                }
+            }
+        };
+        Ok(outcome)
+    }
+
+    /// The containers belonging to a compose project, with their service name
+    /// and parsed dependency edges.
+    async fn stack_members(&self, project: &str) -> Result<Vec<Member>> {
+        let options = ListContainersOptionsBuilder::new().all(true).build();
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("listing containers")?;
+        let mut members = Vec::new();
+        for c in containers {
+            let Some(labels) = c.labels else { continue };
+            if labels.get("com.docker.compose.project").map(String::as_str) != Some(project) {
+                continue;
+            }
+            let Some(id) = c.id else { continue };
+            let service = labels
+                .get("com.docker.compose.service")
+                .cloned()
+                .unwrap_or_default();
+            let deps = labels
+                .get("com.docker.compose.depends_on")
+                .map(|s| parse_depends_on(s))
+                .unwrap_or_default();
+            members.push(Member { id, service, deps });
+        }
+        Ok(members)
+    }
+
+    /// Start members in dependency order, waiting on `service_healthy` /
+    /// `service_completed_successfully` conditions before starting a dependent.
+    async fn start_in_order(&self, members: &[Member]) -> StackOutcome {
+        let id_by_service: HashMap<&str, &str> = members
+            .iter()
+            .map(|m| (m.service.as_str(), m.id.as_str()))
+            .collect();
+        let mut failed = 0;
+        for m in topo_order(members) {
+            for dep in &m.deps {
+                let Some(&dep_id) = id_by_service.get(dep.service.as_str()) else {
+                    continue;
+                };
+                match dep.condition {
+                    DepCondition::Healthy => self.wait_healthy(dep_id).await,
+                    DepCondition::CompletedSuccessfully => self.wait_completed(dep_id).await,
+                    DepCondition::Started => {}
+                }
+            }
+            if let Err(err) = self.apply(&m.id, Action::Start).await {
+                warn!(id = %m.id, service = %m.service, %err, "starting stack member failed");
+                failed += 1;
+            }
+        }
+        StackOutcome {
+            total: members.len(),
+            failed,
+        }
+    }
+
+    /// Stop members in reverse dependency order.
+    async fn stop_in_order(&self, members: &[Member]) -> StackOutcome {
+        let mut ordered = topo_order(members);
+        ordered.reverse();
+        let mut failed = 0;
+        for m in ordered {
+            if let Err(err) = self.apply(&m.id, Action::Stop).await {
+                warn!(id = %m.id, service = %m.service, %err, "stopping stack member failed");
+                failed += 1;
+            }
+        }
+        StackOutcome {
+            total: members.len(),
+            failed,
+        }
+    }
+
+    /// Poll a container's health until it reports healthy, or give up after
+    /// [`DEP_WAIT`]. A container without a healthcheck can't be waited on, so we
+    /// proceed immediately.
+    async fn wait_healthy(&self, id: &str) {
+        let start = Instant::now();
+        loop {
+            match self.health_status(id).await {
+                Some(HealthStatusEnum::HEALTHY) => return,
+                None | Some(HealthStatusEnum::NONE | HealthStatusEnum::EMPTY) => {
+                    debug!(%id, "dependency has no healthcheck; not waiting");
+                    return;
+                }
+                _ => {} // STARTING / UNHEALTHY → keep waiting
+            }
+            if start.elapsed() >= DEP_WAIT {
+                warn!(%id, "timed out waiting for dependency to become healthy");
+                return;
+            }
+            tokio::time::sleep(DEP_POLL).await;
+        }
+    }
+
+    /// Poll until a container has exited, or give up after [`DEP_WAIT`].
+    async fn wait_completed(&self, id: &str) {
+        let start = Instant::now();
+        loop {
+            match self.run_state(id).await {
+                Some((false, exit)) => {
+                    if exit != 0 {
+                        warn!(%id, exit, "dependency exited non-zero");
+                    }
+                    return;
+                }
+                None => return,
+                Some((true, _)) => {} // still running → keep waiting
+            }
+            if start.elapsed() >= DEP_WAIT {
+                warn!(%id, "timed out waiting for dependency to complete");
+                return;
+            }
+            tokio::time::sleep(DEP_POLL).await;
+        }
+    }
+
+    async fn health_status(&self, id: &str) -> Option<HealthStatusEnum> {
+        let options = InspectContainerOptionsBuilder::new().build();
+        let info = self
+            .docker
+            .inspect_container(id, Some(options))
+            .await
+            .ok()?;
+        info.state?.health?.status
+    }
+
+    /// `(running, exit_code)` for a container, or `None` if it can't be read.
+    async fn run_state(&self, id: &str) -> Option<(bool, i64)> {
+        let options = InspectContainerOptionsBuilder::new().build();
+        let info = self
+            .docker
+            .inspect_container(id, Some(options))
+            .await
+            .ok()?;
+        let state = info.state?;
+        Some((state.running.unwrap_or(false), state.exit_code.unwrap_or(0)))
+    }
+}
+
+/// How long to wait for a dependency's condition before giving up and starting
+/// the dependent anyway. Seconds read clearer here than the stable-Rust
+/// alternatives, and there is no `Duration::from_mins` on stable.
+#[allow(clippy::duration_suboptimal_units)]
+const DEP_WAIT: Duration = Duration::from_secs(120);
+/// How often to poll a dependency's state while waiting.
+const DEP_POLL: Duration = Duration::from_secs(1);
+
+/// The outcome of a stack-wide action.
+#[derive(Debug, Clone, Copy)]
+pub struct StackOutcome {
+    pub total: usize,
+    pub failed: usize,
+}
+
+/// A compose stack member and its dependency edges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Member {
+    id: String,
+    service: String,
+    deps: Vec<Dep>,
+}
+
+/// One `depends_on` edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Dep {
+    service: String,
+    condition: DepCondition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepCondition {
+    Started,
+    Healthy,
+    CompletedSuccessfully,
+}
+
+/// Parse a `com.docker.compose.depends_on` label, e.g.
+/// `db:service_healthy:false,cache:service_started:false`.
+fn parse_depends_on(label: &str) -> Vec<Dep> {
+    label
+        .split(',')
+        .filter_map(|entry| {
+            let mut parts = entry.trim().splitn(3, ':');
+            let service = parts.next()?.trim();
+            if service.is_empty() {
+                return None;
+            }
+            let condition = match parts.next() {
+                Some("service_healthy") => DepCondition::Healthy,
+                Some("service_completed_successfully") => DepCondition::CompletedSuccessfully,
+                _ => DepCondition::Started,
+            };
+            Some(Dep {
+                service: service.to_string(),
+                condition,
+            })
+        })
+        .collect()
+}
+
+/// Order members so every container comes after the in-stack dependencies it
+/// declares (Kahn's algorithm). On a cycle or a missing dependency the
+/// remaining members are appended in their original order as a best effort.
+fn topo_order(members: &[Member]) -> Vec<&Member> {
+    let in_stack: HashSet<&str> = members.iter().map(|m| m.service.as_str()).collect();
+    let mut placed: HashSet<&str> = HashSet::new();
+    let mut result: Vec<&Member> = Vec::with_capacity(members.len());
+    let mut remaining: Vec<&Member> = members.iter().collect();
+
+    while !remaining.is_empty() {
+        let (ready, not_ready): (Vec<&Member>, Vec<&Member>) =
+            remaining.into_iter().partition(|m| {
+                m.deps.iter().all(|d| {
+                    !in_stack.contains(d.service.as_str()) || placed.contains(d.service.as_str())
+                })
+            });
+        if ready.is_empty() {
+            warn!("stack dependency cycle or missing dependency; using listing order for the rest");
+            result.extend(not_ready);
+            break;
+        }
+        for m in &ready {
+            placed.insert(m.service.as_str());
+        }
+        result.extend(ready);
+        remaining = not_ready;
+    }
+    result
 }
 
 /// The previous CPU counters for one container, used to compute a delta.
@@ -374,5 +635,79 @@ mod tests {
         );
         assert_eq!(parse_health("Up 3 days"), HealthState::None);
         assert_eq!(parse_health("Exited (0) 2 hours ago"), HealthState::None);
+    }
+
+    #[test]
+    fn parse_depends_on_reads_services_and_conditions() {
+        // The format compose writes: `service:condition:restart`.
+        let deps = parse_depends_on("side:service_healthy:false,db:service_started:true");
+        assert_eq!(
+            deps,
+            vec![
+                Dep {
+                    service: "side".to_string(),
+                    condition: DepCondition::Healthy,
+                },
+                Dep {
+                    service: "db".to_string(),
+                    condition: DepCondition::Started,
+                },
+            ]
+        );
+        assert!(parse_depends_on("").is_empty());
+        assert_eq!(
+            parse_depends_on("init:service_completed_successfully:false")[0].condition,
+            DepCondition::CompletedSuccessfully
+        );
+    }
+
+    fn member(service: &str, deps: &[&str]) -> Member {
+        Member {
+            id: format!("id-{service}"),
+            service: service.to_string(),
+            deps: deps
+                .iter()
+                .map(|s| Dep {
+                    service: (*s).to_string(),
+                    condition: DepCondition::Started,
+                })
+                .collect(),
+        }
+    }
+
+    fn order(members: &[Member]) -> Vec<&str> {
+        topo_order(members)
+            .iter()
+            .map(|m| m.service.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn topo_order_places_dependencies_first() {
+        // app depends on side → side must come first regardless of input order.
+        let members = vec![member("app", &["side"]), member("side", &[])];
+        assert_eq!(order(&members), vec!["side", "app"]);
+    }
+
+    #[test]
+    fn topo_order_handles_a_chain() {
+        // a -> b -> c (a depends on b, b depends on c)
+        let members = vec![member("a", &["b"]), member("b", &["c"]), member("c", &[])];
+        assert_eq!(order(&members), vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn topo_order_survives_a_cycle() {
+        // a <-> b cycle: no panic, both still returned.
+        let members = vec![member("a", &["b"]), member("b", &["a"])];
+        let got = order(&members);
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn topo_order_ignores_out_of_stack_dependencies() {
+        // app depends on "external" which isn't part of this stack → ignored.
+        let members = vec![member("app", &["external"])];
+        assert_eq!(order(&members), vec!["app"]);
     }
 }
