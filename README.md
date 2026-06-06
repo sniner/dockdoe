@@ -3,12 +3,16 @@
 A single-binary Docker host monitor with an embedded web UI. Shows the vital
 metrics of your containers — state, CPU, memory — grouped by compose stack,
 with htop-style host stats on top. The dashboard updates live (no full reload):
-HTMX swaps server-rendered fragments over SSE, and uPlot draws live host charts
+HTMX swaps server-rendered fragments over SSE, and uPlot draws live charts
 seeded from history.
 
-> Status: **milestone 2** — live streaming dashboard with SQLite-backed history
-> and trend rollups. Next: per-stack detail pages with logs, compose.yml, and
-> start/stop/restart actions.
+Drill into a container (live CPU/memory charts, facts, logs) or a whole stack
+(aggregate charts, the compose.yml, start/stop/restart-all), and start, stop or
+restart containers right from the UI.
+
+> Status: **milestone 3** — actions, and stack/container detail pages with logs
+> and compose.yml, on top of the live streaming dashboard and SQLite-backed
+> trend history.
 
 ## Run
 
