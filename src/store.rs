@@ -131,13 +131,13 @@ impl Store {
             "INSERT INTO host_sample (ts_ms, cpu_percent, load1, load5, load15, mem_used, mem_total)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
-                ts_ms,
+                to_db(ts_ms),
                 f64::from(host.cpu_percent),
                 host.load_avg.one,
                 host.load_avg.five,
                 host.load_avg.fifteen,
-                host.mem_used,
-                host.mem_total,
+                to_db(host.mem_used),
+                to_db(host.mem_total),
             ],
         )
         .context("insert host sample")?;
@@ -151,12 +151,12 @@ impl Store {
                 .context("prepare container insert")?;
             for c in containers {
                 stmt.execute(rusqlite::params![
-                    ts_ms,
+                    to_db(ts_ms),
                     c.id,
                     c.name,
                     c.cpu_percent,
-                    c.mem_used,
-                    c.mem_limit,
+                    c.mem_used.map(to_db),
+                    c.mem_limit.map(to_db),
                 ])
                 .context("insert container sample")?;
             }
@@ -182,8 +182,8 @@ impl Store {
                 .context("prepare container trend insert")?;
             for t in trends {
                 stmt.execute(rusqlite::params![
-                    t.bucket_start_ms,
-                    t.bucket_secs,
+                    to_db(t.bucket_start_ms),
+                    to_db(t.bucket_secs),
                     t.id,
                     t.name,
                     t.stack,
@@ -217,8 +217,8 @@ impl Store {
                 .context("prepare host trend insert")?;
             for t in trends {
                 stmt.execute(rusqlite::params![
-                    t.bucket_start_ms,
-                    t.bucket_secs,
+                    to_db(t.bucket_start_ms),
+                    to_db(t.bucket_secs),
                     t.metric,
                     t.min,
                     t.max,
@@ -238,10 +238,16 @@ impl Store {
     pub fn prune_raw(&self, before_ms: u64) -> Result<usize> {
         let conn = self.lock();
         let host = conn
-            .execute("DELETE FROM host_sample WHERE ts_ms < ?1", [before_ms])
+            .execute(
+                "DELETE FROM host_sample WHERE ts_ms < ?1",
+                [to_db(before_ms)],
+            )
             .context("prune host samples")?;
         let containers = conn
-            .execute("DELETE FROM container_sample WHERE ts_ms < ?1", [before_ms])
+            .execute(
+                "DELETE FROM container_sample WHERE ts_ms < ?1",
+                [to_db(before_ms)],
+            )
             .context("prune container samples")?;
         Ok(host + containers)
     }
@@ -255,13 +261,13 @@ impl Store {
         let host = conn
             .execute(
                 "DELETE FROM host_trend WHERE bucket_start_ms < ?1",
-                [before_ms],
+                [to_db(before_ms)],
             )
             .context("prune host trends")?;
         let containers = conn
             .execute(
                 "DELETE FROM container_trend WHERE bucket_start_ms < ?1",
-                [before_ms],
+                [to_db(before_ms)],
             )
             .context("prune container trends")?;
         Ok(host + containers)
@@ -278,11 +284,11 @@ impl Store {
             )
             .context("prepare recent host query")?;
         let rows = stmt
-            .query_map([since_ms], |r| {
+            .query_map([to_db(since_ms)], |r| {
                 Ok(HostPoint {
-                    ts_ms: r.get(0)?,
+                    ts_ms: from_db(r.get::<_, i64>(0)?),
                     cpu_percent: r.get(1)?,
-                    mem_used: r.get(2)?,
+                    mem_used: r.get::<_, Option<i64>>(2)?.map(from_db),
                 })
             })
             .context("query recent host samples")?
@@ -295,9 +301,22 @@ impl Store {
     #[cfg(test)]
     pub fn count(&self, table: &str) -> Result<u64> {
         let conn = self.lock();
-        let n: u64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-        Ok(n)
+        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+        Ok(from_db(n))
     }
+}
+
+/// SQLite stores signed 64-bit integers, and rusqlite 0.40 dropped `u64`
+/// binding to avoid silent overflow. Our counters (Unix-ms timestamps, byte
+/// counts, bucket widths) are always well within `i64` range, so we convert at
+/// the storage boundary. `saturating` rather than panicking keeps a freak value
+/// from taking down the collector.
+fn to_db(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+fn from_db(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
 }
 
 const MIGRATIONS: &str = "
