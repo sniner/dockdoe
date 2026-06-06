@@ -101,8 +101,14 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("enabling WAL")?;
+        // We use a single connection behind a Mutex, so all access is already
+        // serialised — WAL's concurrent-reader benefit doesn't apply, and its
+        // side files (`-wal`/`-shm`) only grow without paying for themselves.
+        // The default rollback journal keeps no persistent extra files. Setting
+        // it explicitly also migrates any database left in WAL mode by an
+        // earlier build, cleaning up its stale `-wal`/`-shm`.
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .context("setting rollback journal mode")?;
         conn.execute_batch(MIGRATIONS)
             .context("running migrations")?;
         Ok(Self {
