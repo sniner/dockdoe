@@ -279,3 +279,11 @@ h2 a.stack-link:hover { color: var(--accent); }
   color: #c9d1d9;
 }
 .muted { color: var(--muted); }
+
+.compose-file + .compose-file { margin-top: 0.75rem; }
+.compose-path {
+  font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+  word-break: break-all;
+}

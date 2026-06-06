@@ -60,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/events/stack/{name}/metrics", get(events_stack_metrics))
         .route("/api/container/{id}/logs", get(container_logs))
+        .route("/api/stack/{name}/compose", get(stack_compose))
         .route(
             "/api/container/{id}/{action}",
             axum::routing::post(container_action),
@@ -145,6 +146,55 @@ async fn container_logs(
             html! { span.muted { "Could not read logs: " (err) } }
         }
     }
+}
+
+/// Return a stack's compose file(s) as an HTML fragment for the compose panel.
+async fn stack_compose(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Markup {
+    let paths = match state.docker.compose_config_files(&name).await {
+        Ok(paths) => paths,
+        Err(err) => {
+            tracing::warn!(stack = %name, %err, "resolving compose files failed");
+            return html! { span.muted { "Could not determine compose file: " (err) } };
+        }
+    };
+    if paths.is_empty() {
+        return html! { span.muted { "No compose file recorded for this stack." } };
+    }
+
+    let files = tokio::task::spawn_blocking(move || read_compose_files(&paths))
+        .await
+        .unwrap_or_default();
+    html! {
+        @for (path, body) in &files {
+            div.compose-file {
+                div.compose-path { (path) }
+                pre.logs { (body) }
+            }
+        }
+    }
+}
+
+/// Read each compose file from the host filesystem. Guarded to YAML paths so a
+/// crafted container label can't make us read arbitrary files. Returns
+/// `(path, contents-or-message)` pairs.
+fn read_compose_files(paths: &[String]) -> Vec<(String, String)> {
+    paths
+        .iter()
+        .map(|p| {
+            let is_yaml = std::path::Path::new(p)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"));
+            let body = if is_yaml {
+                std::fs::read_to_string(p).unwrap_or_else(|e| format!("(could not read: {e})"))
+            } else {
+                "(refusing to read a non-YAML path)".to_string()
+            };
+            (p.clone(), body)
+        })
+        .collect()
 }
 
 /// Strip ANSI/VT escape sequences (CSI `ESC [ … final-byte`) so logs render
@@ -526,8 +576,15 @@ fn stack_detail_main(name: &str, members: &[ContainerMetrics]) -> Markup {
             }
         }
         section.panel {
-            h3 { "compose.yml" }
-            p.empty { "The compose file will appear here." }
+            div.panel-head {
+                h3 { "compose.yml" }
+                button.refresh type="button"
+                    hx-get=(format!("/api/stack/{name}/compose"))
+                    hx-target="#compose" hx-swap="innerHTML" { "↻ Refresh" }
+            }
+            div id="compose"
+                hx-get=(format!("/api/stack/{name}/compose"))
+                hx-trigger="load" hx-swap="innerHTML" { "Loading…" }
         }
     }
 }

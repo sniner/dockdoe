@@ -69,6 +69,35 @@ impl DockerHandle {
         .with_context(|| format!("{action:?} container {id}"))
     }
 
+    /// The compose config-file paths recorded for a stack, read from the
+    /// `com.docker.compose.project.config_files` label of any of its
+    /// containers. Empty if the stack has no such label.
+    pub async fn compose_config_files(&self, stack: &str) -> Result<Vec<String>> {
+        let options = ListContainersOptionsBuilder::new().all(true).build();
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .context("listing containers")?;
+        for c in containers {
+            let Some(labels) = c.labels else { continue };
+            if labels.get("com.docker.compose.project").map(String::as_str) != Some(stack) {
+                continue;
+            }
+            let files = labels
+                .get("com.docker.compose.project.config_files")
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(files);
+        }
+        Ok(Vec::new())
+    }
+
     /// Tail the last `lines` log lines (stdout + stderr) of a container.
     /// bollard de-multiplexes the Docker log stream, so each chunk's `Display`
     /// is just the message text.
