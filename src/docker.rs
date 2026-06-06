@@ -170,7 +170,47 @@ impl DockerHandle {
                 .unwrap_or_default();
             members.push(Member { id, service, deps });
         }
+
+        // Belt and suspenders: a member may share another's network/ipc/pid
+        // namespace (`network_mode: container:X`) without that showing up in a
+        // depends_on label — older compose versions don't write the label, and
+        // hand-run containers never do. Those are *hard*, daemon-enforced
+        // start-order dependencies, so derive them from the runtime config too.
+        let service_by_id: HashMap<String, String> = members
+            .iter()
+            .map(|m| (m.id.clone(), m.service.clone()))
+            .collect();
+        for m in &mut members {
+            for target_id in self.namespace_deps(&m.id).await {
+                let Some(service) = resolve_service(&service_by_id, &target_id) else {
+                    continue;
+                };
+                if service != m.service && !m.deps.iter().any(|d| d.service == service) {
+                    m.deps.push(Dep {
+                        service,
+                        condition: DepCondition::Started,
+                    });
+                }
+            }
+        }
         Ok(members)
+    }
+
+    /// Container IDs this container shares a namespace with (network/ipc/pid set
+    /// to `container:<id>`). These bindings are enforced by the daemon — the
+    /// dependent can't start until the target runs — regardless of any label.
+    async fn namespace_deps(&self, id: &str) -> Vec<String> {
+        let options = InspectContainerOptionsBuilder::new().build();
+        let Ok(info) = self.docker.inspect_container(id, Some(options)).await else {
+            return Vec::new();
+        };
+        let Some(host) = info.host_config else {
+            return Vec::new();
+        };
+        [host.network_mode, host.ipc_mode, host.pid_mode]
+            .into_iter()
+            .filter_map(|mode| mode?.strip_prefix("container:").map(str::to_string))
+            .collect()
     }
 
     /// Start members in dependency order, waiting on `service_healthy` /
@@ -346,6 +386,19 @@ fn parse_depends_on(label: &str) -> Vec<Dep> {
             })
         })
         .collect()
+}
+
+/// Resolve a `container:<id>` namespace reference to an in-stack service name.
+/// Compose writes full container IDs; we also accept a short-ID prefix. Returns
+/// `None` when the referenced container isn't part of this stack.
+fn resolve_service(service_by_id: &HashMap<String, String>, target_id: &str) -> Option<String> {
+    if let Some(service) = service_by_id.get(target_id) {
+        return Some(service.clone());
+    }
+    service_by_id
+        .iter()
+        .find(|(id, _)| id.starts_with(target_id) || target_id.starts_with(id.as_str()))
+        .map(|(_, service)| service.clone())
 }
 
 /// Order members so every container comes after the in-stack dependencies it
@@ -709,5 +762,24 @@ mod tests {
         // app depends on "external" which isn't part of this stack → ignored.
         let members = vec![member("app", &["external"])];
         assert_eq!(order(&members), vec!["app"]);
+    }
+
+    #[test]
+    fn resolve_service_matches_full_and_short_ids() {
+        let map: HashMap<String, String> = [
+            ("abc123def456".to_string(), "side".to_string()),
+            ("999888777".to_string(), "db".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // Full id.
+        assert_eq!(
+            resolve_service(&map, "abc123def456").as_deref(),
+            Some("side")
+        );
+        // Short-id prefix (what a `container:abc123` reference would carry).
+        assert_eq!(resolve_service(&map, "abc123").as_deref(), Some("side"));
+        // Unknown container → not in this stack.
+        assert_eq!(resolve_service(&map, "deadbeef"), None);
     }
 }
