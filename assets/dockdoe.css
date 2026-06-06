@@ -159,3 +159,27 @@ td.image { color: var(--muted); font-size: 0.85rem; }
   font-weight: 600;
 }
 .chart-card .u-legend { display: none; }
+
+td.actions-cell { text-align: right; white-space: nowrap; }
+th.actions-col { text-align: right; }
+.actions { display: inline-flex; gap: 0.3rem; }
+.act {
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--fg);
+  border-radius: 6px;
+  width: 1.9rem;
+  height: 1.7rem;
+  font-size: 0.8rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.12s, border-color 0.12s;
+}
+.act:hover { background: var(--border); }
+.act.start:hover { color: var(--ok); border-color: var(--ok); }
+.act.restart:hover { color: var(--warn); border-color: var(--warn); }
+.act.stop:hover { color: var(--err); border-color: var(--err); }
+.act.htmx-request { opacity: 0.5; pointer-events: none; }

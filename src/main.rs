@@ -24,7 +24,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::collector::Config;
-use crate::docker::DockerClient;
+use crate::docker::{DockerClient, DockerHandle};
 use crate::host::HostSampler;
 use crate::store::Store;
 
@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
     info!(db = %db_path.display(), "store ready");
 
     let docker = DockerClient::connect()?;
+    let docker_handle = DockerHandle::connect()?;
     let host = HostSampler::new();
     let shared = Arc::new(RwLock::new(None));
     let (snapshots, _) = tokio::sync::broadcast::channel(16);
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
         shared,
         snapshots,
         store,
+        docker: docker_handle,
         seed_window,
     });
     let listener = tokio::net::TcpListener::bind(&bind)

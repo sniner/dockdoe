@@ -23,6 +23,7 @@ use rust_embed::RustEmbed;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::collector::{SharedDashboard, SnapshotTx};
+use crate::docker::{Action, DockerHandle};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, HostMetrics};
 use crate::store::{HostPoint, Store};
 
@@ -35,6 +36,8 @@ pub struct AppState {
     pub snapshots: SnapshotTx,
     /// Store, for seeding charts with recent history.
     pub store: Store,
+    /// Docker handle for lifecycle actions and logs.
+    pub docker: DockerHandle,
     /// How far back to seed charts on first load.
     pub seed_window: Duration,
 }
@@ -49,8 +52,34 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/events", get(events_html))
         .route("/events/metrics", get(events_metrics))
+        .route(
+            "/api/container/{id}/{action}",
+            axum::routing::post(container_action),
+        )
         .route("/assets/{*path}", get(asset))
         .with_state(state)
+}
+
+/// Apply a start/stop/restart action to a container, then return the freshly
+/// rendered action-button group so HTMX can swap it in place.
+async fn container_action(
+    State(state): State<AppState>,
+    axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(action) = Action::parse(&action) else {
+        return (StatusCode::BAD_REQUEST, "unknown action").into_response();
+    };
+    match state.docker.apply(&id, action).await {
+        Ok(()) => {
+            tracing::info!(%id, ?action, "applied container action");
+            // The next collector cycle refreshes state; echo the buttons back.
+            action_buttons(&id).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(%id, ?action, %err, "container action failed");
+            (StatusCode::BAD_GATEWAY, format!("action failed: {err}")).into_response()
+        }
+    }
 }
 
 /// Serve an embedded static asset.
@@ -258,6 +287,7 @@ fn container_section(containers: &[ContainerMetrics]) -> Markup {
                             th { "State" }
                             th.num { "CPU" }
                             th.num { "Memory" }
+                            th.actions-col { "Actions" }
                         }
                     }
                     tbody {
@@ -298,6 +328,31 @@ fn container_row(c: &ContainerMetrics) -> Markup {
                     None => span style="color:var(--muted)" { "–" }
                 }
             }
+            td.actions-cell { (action_buttons(&c.id)) }
+        }
+    }
+}
+
+/// Start/stop/restart buttons for one container. Stateless so it can be reused
+/// verbatim in the row and as the HTMX response after an action. Destructive
+/// actions ask for confirmation.
+fn action_buttons(id: &str) -> Markup {
+    html! {
+        span.actions {
+            button.act.start type="button"
+                hx-post=(format!("/api/container/{id}/start"))
+                hx-target="closest .actions" hx-swap="outerHTML"
+                title="Start" { "▶" }
+            button.act.restart type="button"
+                hx-post=(format!("/api/container/{id}/restart"))
+                hx-target="closest .actions" hx-swap="outerHTML"
+                hx-confirm="Restart this container?"
+                title="Restart" { "⟳" }
+            button.act.stop type="button"
+                hx-post=(format!("/api/container/{id}/stop"))
+                hx-target="closest .actions" hx-swap="outerHTML"
+                hx-confirm="Stop this container?"
+                title="Stop" { "■" }
         }
     }
 }

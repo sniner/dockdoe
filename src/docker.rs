@@ -19,6 +19,55 @@ use tracing::debug;
 
 use crate::model::{ContainerMetrics, ContainerState, HealthState};
 
+/// A lifecycle action that can be applied to a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl Action {
+    /// Parse an action from a URL path segment.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "start" => Some(Action::Start),
+            "stop" => Some(Action::Stop),
+            "restart" => Some(Action::Restart),
+            _ => None,
+        }
+    }
+}
+
+/// A cheap, cloneable handle to the Docker engine for actions and logs, used by
+/// the web layer. The collector keeps its own [`DockerClient`] for stateful CPU
+/// sampling; `bollard::Docker` is internally reference-counted, so a second
+/// handle is essentially free.
+#[derive(Clone)]
+pub struct DockerHandle {
+    docker: Docker,
+}
+
+impl DockerHandle {
+    /// Connect to the local Docker daemon (honouring `DOCKER_HOST` and the
+    /// default socket).
+    pub fn connect() -> Result<Self> {
+        let docker = Docker::connect_with_defaults().context("connecting to the Docker daemon")?;
+        Ok(Self { docker })
+    }
+
+    /// Apply a lifecycle action to one container.
+    pub async fn apply(&self, id: &str, action: Action) -> Result<()> {
+        match action {
+            Action::Start => self.docker.start_container(id, None).await,
+            Action::Stop => self.docker.stop_container(id, None).await,
+            Action::Restart => self.docker.restart_container(id, None).await,
+        }
+        .with_context(|| format!("{action:?} container {id}"))
+    }
+}
+
 /// The previous CPU counters for one container, used to compute a delta.
 #[derive(Debug, Clone, Copy)]
 struct PrevCpu {
