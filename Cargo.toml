@@ -1,0 +1,21 @@
+[package]
+name = "dockdoe"
+version = "0.1.0"
+edition = "2024"
+authors = ["Stefan Schönberger <stefan@sniner.dev>"]
+license = "GPL-3.0-or-later"
+description = "A single-binary Docker host monitor with an embedded web UI"
+
+[dependencies]
+anyhow = "1.0.102"
+axum = "0.8.9"
+bollard = "0.21.0"
+futures-util = "0.3.32"
+maud = { version = "0.27.0", features = ["axum"] }
+rust-embed = "8.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sysinfo = "0.38.4"
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
