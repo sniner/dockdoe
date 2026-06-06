@@ -316,6 +316,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// Aggregate trend history for a whole stack at or after `since_ms`, oldest
+    /// first, as chart seed points. Stacks have no raw per-stack series, so the
+    /// detail page seeds from trends: per bucket we sum the member medians
+    /// (mirroring the live aggregate, which sums current member values). Trends
+    /// are stored long (one row per metric), so we pivot cpu/mem into one point.
+    pub fn recent_stack_trends(&self, stack: &str, since_ms: u64) -> Result<Vec<MetricPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT bucket_start_ms,
+                        SUM(CASE WHEN metric = 'cpu' THEN median ELSE 0 END) AS cpu,
+                        SUM(CASE WHEN metric = 'mem' THEN median ELSE 0 END) AS mem
+                 FROM container_trend
+                 WHERE stack = ?1 AND bucket_start_ms >= ?2
+                 GROUP BY bucket_start_ms
+                 ORDER BY bucket_start_ms ASC",
+            )
+            .context("prepare recent stack trend query")?;
+        let rows = stmt
+            .query_map(rusqlite::params![stack, to_db(since_ms)], trend_row_to_point)
+            .context("query recent stack trends")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect recent stack trends")?;
+        Ok(rows)
+    }
+
     /// Count rows in a table — test/diagnostic helper.
     #[cfg(test)]
     pub fn count(&self, table: &str) -> Result<u64> {
@@ -344,6 +370,19 @@ fn row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
         ts_ms: from_db(r.get::<_, i64>(0)?),
         cpu_percent: r.get(1)?,
         mem_used: r.get::<_, Option<i64>>(2)?.map(from_db),
+    })
+}
+
+/// Map a pivoted trend row `(bucket_start_ms, cpu, mem)` to a [`MetricPoint`].
+/// Trend medians are floating-point (and summed across members for stacks), so
+/// cpu/mem come back as `REAL`; memory is rounded back to whole bytes.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn trend_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
+    let mem: Option<f64> = r.get(2)?;
+    Ok(MetricPoint {
+        ts_ms: from_db(r.get::<_, i64>(0)?),
+        cpu_percent: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+        mem_used: mem.map(|m| m.round().max(0.0) as u64),
     })
 }
 
@@ -485,6 +524,53 @@ mod tests {
             .unwrap();
         assert_eq!(store.count("container_trend").unwrap(), 1);
         assert_eq!(store.count("host_trend").unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_stack_trends_sums_members_and_pivots() {
+        let store = Store::open_in_memory().unwrap();
+        let ct = |bucket: u64, id: &str, stack: &str, metric, median: f64| ContainerTrend {
+            bucket_start_ms: bucket,
+            bucket_secs: 60,
+            id: id.to_string(),
+            name: format!("c-{id}"),
+            stack: Some(stack.to_string()),
+            metric,
+            min: median,
+            max: median,
+            median,
+            samples: 20,
+        };
+        store
+            .insert_container_trends(&[
+                // bucket 0: web → cpu 4+6=10, mem 100+200=300
+                ct(0, "a", "web", Metric::Cpu.as_str(), 4.0),
+                ct(0, "a", "web", Metric::Mem.as_str(), 100.0),
+                ct(0, "b", "web", Metric::Cpu.as_str(), 6.0),
+                ct(0, "b", "web", Metric::Mem.as_str(), 200.0),
+                // bucket 60_000: web → cpu 2+3=5, mem 150+250=400
+                ct(60_000, "a", "web", Metric::Cpu.as_str(), 2.0),
+                ct(60_000, "a", "web", Metric::Mem.as_str(), 150.0),
+                ct(60_000, "b", "web", Metric::Cpu.as_str(), 3.0),
+                ct(60_000, "b", "web", Metric::Mem.as_str(), 250.0),
+                // a different stack must not leak into the sum
+                ct(0, "c", "db", Metric::Cpu.as_str(), 99.0),
+            ])
+            .unwrap();
+
+        let points = store.recent_stack_trends("web", 0).unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].ts_ms, 0);
+        assert!((points[0].cpu_percent - 10.0).abs() < 1e-9);
+        assert_eq!(points[0].mem_used, Some(300));
+        assert_eq!(points[1].ts_ms, 60_000);
+        assert!((points[1].cpu_percent - 5.0).abs() < 1e-9);
+        assert_eq!(points[1].mem_used, Some(400));
+
+        // since_ms filters out older buckets.
+        let recent = store.recent_stack_trends("web", 60_000).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].ts_ms, 60_000);
     }
 
     #[test]

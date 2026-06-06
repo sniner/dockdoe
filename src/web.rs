@@ -318,13 +318,23 @@ async fn stack_detail(
         return (StatusCode::NOT_FOUND, body).into_response();
     }
 
-    // Stack charts stream live aggregates; no historical seed (raw samples
-    // aren't keyed by stack), so they fill in over the view window.
+    // Stack charts stream live aggregates. Raw samples aren't keyed by stack,
+    // so we seed from trends: the sum of member medians per bucket, which lines
+    // up with the live aggregate (sum of current member values).
+    let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
+    let store = state.store.clone();
+    let seed_name = name.clone();
+    let seed = tokio::task::spawn_blocking(move || store.recent_stack_trends(&seed_name, since))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+
     let live_url = format!("/events/stack/{name}");
     shell(
         snapshot.as_ref(),
         stack_detail_main(&name, &members),
-        &[],
+        &seed,
         &live_url,
     )
     .into_response()
