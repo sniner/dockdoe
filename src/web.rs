@@ -28,7 +28,7 @@ use rust_embed::RustEmbed;
 use crate::collector::SharedDashboard;
 use crate::docker::{Action, DockerHandle};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState};
-use crate::store::{MetricPoint, Store};
+use crate::store::{HistoryPoint, MetricPoint, Store};
 
 /// How often the live SSE streams poll the latest snapshot.
 const SNAPSHOT_POLL: Duration = Duration::from_secs(1);
@@ -68,6 +68,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/metrics/host", get(metrics_host))
         .route("/api/metrics/container/{id}", get(metrics_container))
         .route("/api/metrics/stack/{name}", get(metrics_stack))
+        .route("/api/history/host", get(history_host))
+        .route("/api/history/container/{id}", get(history_container))
+        .route("/api/history/stack/{name}", get(history_stack))
         .route(
             "/api/container/{id}/{action}",
             axum::routing::post(container_action).layer(middleware::from_fn(require_htmx)),
@@ -370,9 +373,10 @@ fn clamp_since(since_ms: u64, window: Duration) -> u64 {
 /// Run a blocking store query for chart points, degrading to an empty series.
 /// The charts just show what they get — but a failing store is worth a log
 /// line, not silence.
-async fn fetch_points<F>(f: F) -> Vec<MetricPoint>
+async fn fetch_points<T, F>(f: F) -> Vec<T>
 where
-    F: FnOnce() -> anyhow::Result<Vec<MetricPoint>> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<Vec<T>> + Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(points)) => points,
@@ -419,6 +423,90 @@ async fn metrics_stack(
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
     Json(fetch_points(move || store.recent_stack_trends(&name, since)).await)
+}
+
+/// Selectable history ranges: query value, lookback window, downsample group.
+/// Group sizes keep responses at ≤ ~1500 points (60 s trend buckets collapse
+/// into 10 min windows for 7 d and 30 min windows for 30 d).
+// No `Duration::from_hours`/`from_days` on stable; same trade-off as elsewhere.
+#[allow(clippy::duration_suboptimal_units)]
+const HISTORY_RANGES: &[(&str, Duration, u64)] = &[
+    ("1h", Duration::from_secs(3600), 60_000),
+    ("6h", Duration::from_secs(6 * 3600), 60_000),
+    ("24h", Duration::from_secs(24 * 3600), 60_000),
+    ("7d", Duration::from_secs(7 * 24 * 3600), 600_000),
+    ("30d", Duration::from_secs(30 * 24 * 3600), 1_800_000),
+];
+
+/// Query for the history endpoints: one of the [`HISTORY_RANGES`] keys.
+#[derive(serde::Deserialize)]
+struct RangeQuery {
+    range: String,
+}
+
+/// Look up a history range, as `(since_ms, group_ms, use_raw)`. Ranges inside
+/// the raw retention are served from raw samples (full resolution, exact
+/// values); longer ranges fall back to the trend buckets.
+fn resolve_range(q: &RangeQuery, seed_window: Duration) -> Option<(u64, u64, bool)> {
+    let &(_, window, group_ms) = HISTORY_RANGES.iter().find(|r| r.0 == q.range)?;
+    let since = now_unix_ms().saturating_sub(duration_ms(window));
+    Some((since, group_ms, window <= seed_window))
+}
+
+const UNKNOWN_RANGE: (StatusCode, &str) = (StatusCode::BAD_REQUEST, "unknown range");
+
+/// History for the host charts: median plus min–max envelope over the range.
+async fn history_host(State(state): State<AppState>, Query(q): Query<RangeQuery>) -> Response {
+    let Some((since, group_ms, raw)) = resolve_range(&q, state.seed_window) else {
+        return UNKNOWN_RANGE.into_response();
+    };
+    let store = state.store.clone();
+    let points = if raw {
+        fetch_points(move || {
+            let samples = store.recent_host_samples(since)?;
+            Ok(samples.iter().map(HistoryPoint::from_raw).collect())
+        })
+        .await
+    } else {
+        fetch_points(move || store.history_host(since, group_ms)).await
+    };
+    Json(points).into_response()
+}
+
+/// History for one container's charts.
+async fn history_container(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Response {
+    let Some((since, group_ms, raw)) = resolve_range(&q, state.seed_window) else {
+        return UNKNOWN_RANGE.into_response();
+    };
+    let store = state.store.clone();
+    let points = if raw {
+        fetch_points(move || {
+            let samples = store.recent_container_samples(&id, since)?;
+            Ok(samples.iter().map(HistoryPoint::from_raw).collect())
+        })
+        .await
+    } else {
+        fetch_points(move || store.history_container(&id, since, group_ms)).await
+    };
+    Json(points).into_response()
+}
+
+/// History for a stack's aggregate charts. Stacks have no raw series, so all
+/// ranges come from the trend buckets.
+async fn history_stack(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Response {
+    let Some((since, group_ms, _)) = resolve_range(&q, state.seed_window) else {
+        return UNKNOWN_RANGE.into_response();
+    };
+    let store = state.store.clone();
+    Json(fetch_points(move || store.history_stack(&name, since, group_ms)).await).into_response()
 }
 
 /// Render the dashboard from the latest snapshot, seeding charts from history.
@@ -1205,6 +1293,27 @@ mod tests {
         assert_eq!(strip_ansi("a\u{1b}[2Kb"), "ab");
         // A bare ESC without CSI doesn't eat following text.
         assert_eq!(strip_ansi("ok"), "ok");
+    }
+
+    #[test]
+    fn resolve_range_picks_source_by_window() {
+        // No `Duration::from_hours` on stable; same trade-off as in docker.rs.
+        #[allow(clippy::duration_suboptimal_units)]
+        let seed_window = Duration::from_secs(3600);
+        let q = |range: &str| RangeQuery {
+            range: range.to_string(),
+        };
+        // 1h fits the raw retention → raw samples, full resolution.
+        let (_, group, raw) = resolve_range(&q("1h"), seed_window).unwrap();
+        assert!(raw);
+        assert_eq!(group, 60_000);
+        // 30d exceeds it → trend buckets, downsampled to 30 min groups.
+        let (since, group, raw) = resolve_range(&q("30d"), seed_window).unwrap();
+        assert!(!raw);
+        assert_eq!(group, 1_800_000);
+        assert!(since <= now_unix_ms() - 29 * 24 * 3_600_000);
+        // Unknown ranges are rejected.
+        assert!(resolve_range(&q("2y"), seed_window).is_none());
     }
 
     #[test]
