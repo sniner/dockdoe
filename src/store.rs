@@ -378,15 +378,21 @@ impl Store {
         Ok(rows)
     }
 
-    /// Host trend history at or after `since_ms`, downsampled into `group_ms`
-    /// windows, oldest first. Within a window the envelope keeps the extremes
-    /// (MIN of minima, MAX of maxima) while the line averages the bucket
-    /// medians — an approximation of the true median that is fine for display.
-    pub fn history_host(&self, since_ms: u64, group_ms: u64) -> Result<Vec<HistoryPoint>> {
+    /// Host trend history between `since_ms` and `until_ms` (inclusive),
+    /// downsampled into `group_ms` windows, oldest first. Within a window the
+    /// envelope keeps the extremes (MIN of minima, MAX of maxima) while the
+    /// line averages the bucket medians — an approximation of the true median
+    /// that is fine for display.
+    pub fn history_host(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+        group_ms: u64,
+    ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT (bucket_start_ms / ?2) * ?2 AS bucket,
+                "SELECT (bucket_start_ms / ?3) * ?3 AS bucket,
                         MIN(CASE WHEN metric = 'cpu' THEN min END),
                         AVG(CASE WHEN metric = 'cpu' THEN median END),
                         MAX(CASE WHEN metric = 'cpu' THEN max END),
@@ -394,13 +400,13 @@ impl Store {
                         AVG(CASE WHEN metric = 'mem' THEN median END),
                         MAX(CASE WHEN metric = 'mem' THEN max END)
                  FROM host_trend
-                 WHERE bucket_start_ms >= ?1
+                 WHERE bucket_start_ms >= ?1 AND bucket_start_ms <= ?2
                  GROUP BY bucket ORDER BY bucket ASC",
             )
             .context("prepare host history query")?;
         let rows = stmt
             .query_map(
-                [to_db(since_ms), to_db(group_ms.max(1))],
+                [to_db(since_ms), to_db(until_ms), to_db(group_ms.max(1))],
                 history_row_to_point,
             )
             .context("query host history")?
@@ -414,12 +420,13 @@ impl Store {
         &self,
         id: &str,
         since_ms: u64,
+        until_ms: u64,
         group_ms: u64,
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT (bucket_start_ms / ?3) * ?3 AS bucket,
+                "SELECT (bucket_start_ms / ?4) * ?4 AS bucket,
                         MIN(CASE WHEN metric = 'cpu' THEN min END),
                         AVG(CASE WHEN metric = 'cpu' THEN median END),
                         MAX(CASE WHEN metric = 'cpu' THEN max END),
@@ -427,13 +434,13 @@ impl Store {
                         AVG(CASE WHEN metric = 'mem' THEN median END),
                         MAX(CASE WHEN metric = 'mem' THEN max END)
                  FROM container_trend
-                 WHERE id = ?1 AND bucket_start_ms >= ?2
+                 WHERE id = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms <= ?3
                  GROUP BY bucket ORDER BY bucket ASC",
             )
             .context("prepare container history query")?;
         let rows = stmt
             .query_map(
-                rusqlite::params![id, to_db(since_ms), to_db(group_ms.max(1))],
+                rusqlite::params![id, to_db(since_ms), to_db(until_ms), to_db(group_ms.max(1))],
                 history_row_to_point,
             )
             .context("query container history")?
@@ -449,6 +456,7 @@ impl Store {
         &self,
         stack: &str,
         since_ms: u64,
+        until_ms: u64,
         group_ms: u64,
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
@@ -463,10 +471,10 @@ impl Store {
                             SUM(CASE WHEN metric = 'mem' THEN median END) AS mem_med,
                             SUM(CASE WHEN metric = 'mem' THEN max END) AS mem_max
                      FROM container_trend
-                     WHERE stack = ?1 AND bucket_start_ms >= ?2
+                     WHERE stack = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms <= ?3
                      GROUP BY b
                  )
-                 SELECT (b / ?3) * ?3 AS bucket,
+                 SELECT (b / ?4) * ?4 AS bucket,
                         MIN(cpu_min), AVG(cpu_med), MAX(cpu_max),
                         MIN(mem_min), AVG(mem_med), MAX(mem_max)
                  FROM per_bucket
@@ -475,7 +483,12 @@ impl Store {
             .context("prepare stack history query")?;
         let rows = stmt
             .query_map(
-                rusqlite::params![stack, to_db(since_ms), to_db(group_ms.max(1))],
+                rusqlite::params![
+                    stack,
+                    to_db(since_ms),
+                    to_db(until_ms),
+                    to_db(group_ms.max(1))
+                ],
                 history_row_to_point,
             )
             .context("query stack history")?
@@ -752,7 +765,7 @@ mod tests {
             .unwrap();
 
         // Group = bucket size → buckets pass through unchanged.
-        let fine = store.history_host(0, 60_000).unwrap();
+        let fine = store.history_host(0, u64::MAX, 60_000).unwrap();
         assert_eq!(fine.len(), 3);
         assert_eq!(fine[0].ts_ms, 0);
         assert_eq!(fine[0].cpu_min, Some(1.0));
@@ -764,16 +777,19 @@ mod tests {
 
         // Coarser group: first two buckets merge — envelope keeps the
         // extremes, the line averages the medians.
-        let coarse = store.history_host(0, 120_000).unwrap();
+        let coarse = store.history_host(0, u64::MAX, 120_000).unwrap();
         assert_eq!(coarse.len(), 2);
         assert_eq!(coarse[0].cpu_min, Some(1.0));
         assert_eq!(coarse[0].cpu_med, Some(5.0)); // avg(4, 6)
         assert_eq!(coarse[0].cpu_max, Some(20.0));
         assert_eq!(coarse[1].ts_ms, 120_000);
 
-        // since_ms filters out older buckets.
-        let late = store.history_host(120_000, 60_000).unwrap();
+        // since_ms and until_ms bound the window at both ends.
+        let late = store.history_host(120_000, u64::MAX, 60_000).unwrap();
         assert_eq!(late.len(), 1);
+        let middle = store.history_host(60_000, 60_000, 60_000).unwrap();
+        assert_eq!(middle.len(), 1);
+        assert_eq!(middle[0].ts_ms, 60_000);
     }
 
     #[test]
@@ -802,24 +818,29 @@ mod tests {
             ])
             .unwrap();
 
-        let fine = store.history_stack("web", 0, 60_000).unwrap();
+        let fine = store.history_stack("web", 0, u64::MAX, 60_000).unwrap();
         assert_eq!(fine.len(), 2);
         assert_eq!(fine[0].cpu_min, Some(3.0));
         assert_eq!(fine[0].cpu_med, Some(10.0));
         assert_eq!(fine[0].cpu_max, Some(19.0));
 
         // Coarse group merges the summed buckets.
-        let coarse = store.history_stack("web", 0, 120_000).unwrap();
+        let coarse = store.history_stack("web", 0, u64::MAX, 120_000).unwrap();
         assert_eq!(coarse.len(), 1);
         assert_eq!(coarse[0].cpu_min, Some(2.0));
         assert_eq!(coarse[0].cpu_med, Some(7.5)); // avg(10, 5)
         assert_eq!(coarse[0].cpu_max, Some(19.0));
 
         // Unknown stack and container queries return empty, not errors.
-        assert!(store.history_stack("nope", 0, 60_000).unwrap().is_empty());
         assert!(
             store
-                .history_container("nope", 0, 60_000)
+                .history_stack("nope", 0, u64::MAX, 60_000)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .history_container("nope", 0, u64::MAX, 60_000)
                 .unwrap()
                 .is_empty()
         );

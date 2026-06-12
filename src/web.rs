@@ -425,50 +425,84 @@ async fn metrics_stack(
     Json(fetch_points(move || store.recent_stack_trends(&name, since)).await)
 }
 
-/// Selectable history ranges: query value, lookback window, downsample group.
-/// Group sizes keep responses at ≤ ~1500 points (60 s trend buckets collapse
-/// into 10 min windows for 7 d and 30 min windows for 30 d).
+/// Selectable named history ranges: query value and lookback window.
 // No `Duration::from_hours`/`from_days` on stable; same trade-off as elsewhere.
 #[allow(clippy::duration_suboptimal_units)]
-const HISTORY_RANGES: &[(&str, Duration, u64)] = &[
-    ("1h", Duration::from_secs(3600), 60_000),
-    ("6h", Duration::from_secs(6 * 3600), 60_000),
-    ("24h", Duration::from_secs(24 * 3600), 60_000),
-    ("7d", Duration::from_secs(7 * 24 * 3600), 600_000),
-    ("30d", Duration::from_secs(30 * 24 * 3600), 1_800_000),
+const HISTORY_RANGES: &[(&str, Duration)] = &[
+    ("1h", Duration::from_secs(3600)),
+    ("6h", Duration::from_secs(6 * 3600)),
+    ("24h", Duration::from_secs(24 * 3600)),
+    ("7d", Duration::from_secs(7 * 24 * 3600)),
+    ("30d", Duration::from_secs(30 * 24 * 3600)),
 ];
 
-/// Query for the history endpoints: one of the [`HISTORY_RANGES`] keys.
+/// Query for the history endpoints: either a named range from
+/// [`HISTORY_RANGES`] or a free `since_ms`/`until_ms` window (used by the
+/// drag-to-drill-down selection in the UI).
 #[derive(serde::Deserialize)]
-struct RangeQuery {
-    range: String,
+struct HistoryQuery {
+    range: Option<String>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
 }
 
-/// Look up a history range, as `(since_ms, group_ms, use_raw)`. Ranges inside
-/// the raw retention are served from raw samples (full resolution, exact
-/// values); longer ranges fall back to the trend buckets.
-fn resolve_range(q: &RangeQuery, seed_window: Duration) -> Option<(u64, u64, bool)> {
-    let &(_, window, group_ms) = HISTORY_RANGES.iter().find(|r| r.0 == q.range)?;
-    let since = now_unix_ms().saturating_sub(duration_ms(window));
-    Some((since, group_ms, window <= seed_window))
+/// A resolved history request window.
+struct HistoryWindow {
+    since: u64,
+    until: u64,
+    group_ms: u64,
+    /// Serve from raw samples (window lies inside the raw retention) instead
+    /// of trend buckets — full resolution, exact values.
+    raw: bool,
 }
 
-const UNKNOWN_RANGE: (StatusCode, &str) = (StatusCode::BAD_REQUEST, "unknown range");
+/// Resolve a history query into a concrete window, or `None` if it is neither
+/// a known named range nor a plausible custom window.
+fn resolve_history(q: &HistoryQuery, seed_window: Duration) -> Option<HistoryWindow> {
+    let now = now_unix_ms();
+    let (since, until) = match (&q.range, q.since_ms, q.until_ms) {
+        (Some(range), None, None) => {
+            let &(_, window) = HISTORY_RANGES.iter().find(|r| r.0 == *range)?;
+            (now.saturating_sub(duration_ms(window)), now)
+        }
+        (None, Some(since), Some(until)) if since < until => (since, until),
+        _ => return None,
+    };
+    Some(HistoryWindow {
+        since,
+        until,
+        group_ms: group_for_window(until - since),
+        raw: since >= now.saturating_sub(duration_ms(seed_window)),
+    })
+}
 
-/// History for the host charts: median plus min–max envelope over the range.
-async fn history_host(State(state): State<AppState>, Query(q): Query<RangeQuery>) -> Response {
-    let Some((since, group_ms, raw)) = resolve_range(&q, state.seed_window) else {
-        return UNKNOWN_RANGE.into_response();
+/// Downsample group for a window: aim for ≤ ~1440 points, in whole trend
+/// buckets (60 s). 24 h stays at one point per bucket; 30 d collapses into
+/// 30 min windows.
+fn group_for_window(window_ms: u64) -> u64 {
+    const TARGET_POINTS: u64 = 1440;
+    (window_ms / TARGET_POINTS).div_ceil(60_000).max(1) * 60_000
+}
+
+const INVALID_RANGE: (StatusCode, &str) = (
+    StatusCode::BAD_REQUEST,
+    "invalid range: pass ?range=1h|6h|24h|7d|30d or ?since_ms=&until_ms=",
+);
+
+/// History for the host charts: median plus min–max envelope over the window.
+async fn history_host(State(state): State<AppState>, Query(q): Query<HistoryQuery>) -> Response {
+    let Some(w) = resolve_history(&q, state.seed_window) else {
+        return INVALID_RANGE.into_response();
     };
     let store = state.store.clone();
-    let points = if raw {
+    let points = if w.raw {
         fetch_points(move || {
-            let samples = store.recent_host_samples(since)?;
-            Ok(samples.iter().map(HistoryPoint::from_raw).collect())
+            let samples = store.recent_host_samples(w.since)?;
+            Ok(raw_history(&samples, w.until))
         })
         .await
     } else {
-        fetch_points(move || store.history_host(since, group_ms)).await
+        fetch_points(move || store.history_host(w.since, w.until, w.group_ms)).await
     };
     Json(points).into_response()
 }
@@ -477,36 +511,47 @@ async fn history_host(State(state): State<AppState>, Query(q): Query<RangeQuery>
 async fn history_container(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Query(q): Query<RangeQuery>,
+    Query(q): Query<HistoryQuery>,
 ) -> Response {
-    let Some((since, group_ms, raw)) = resolve_range(&q, state.seed_window) else {
-        return UNKNOWN_RANGE.into_response();
+    let Some(w) = resolve_history(&q, state.seed_window) else {
+        return INVALID_RANGE.into_response();
     };
     let store = state.store.clone();
-    let points = if raw {
+    let points = if w.raw {
         fetch_points(move || {
-            let samples = store.recent_container_samples(&id, since)?;
-            Ok(samples.iter().map(HistoryPoint::from_raw).collect())
+            let samples = store.recent_container_samples(&id, w.since)?;
+            Ok(raw_history(&samples, w.until))
         })
         .await
     } else {
-        fetch_points(move || store.history_container(&id, since, group_ms)).await
+        fetch_points(move || store.history_container(&id, w.since, w.until, w.group_ms)).await
     };
     Json(points).into_response()
 }
 
 /// History for a stack's aggregate charts. Stacks have no raw series, so all
-/// ranges come from the trend buckets.
+/// windows come from the trend buckets.
 async fn history_stack(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    Query(q): Query<RangeQuery>,
+    Query(q): Query<HistoryQuery>,
 ) -> Response {
-    let Some((since, group_ms, _)) = resolve_range(&q, state.seed_window) else {
-        return UNKNOWN_RANGE.into_response();
+    let Some(w) = resolve_history(&q, state.seed_window) else {
+        return INVALID_RANGE.into_response();
     };
     let store = state.store.clone();
-    Json(fetch_points(move || store.history_stack(&name, since, group_ms)).await).into_response()
+    Json(fetch_points(move || store.history_stack(&name, w.since, w.until, w.group_ms)).await)
+        .into_response()
+}
+
+/// Lift raw samples into the history shape, dropping anything past the
+/// window's upper bound (the raw queries only filter on `since`).
+fn raw_history(samples: &[MetricPoint], until_ms: u64) -> Vec<HistoryPoint> {
+    samples
+        .iter()
+        .filter(|p| p.ts_ms <= until_ms)
+        .map(HistoryPoint::from_raw)
+        .collect()
 }
 
 /// Render the dashboard from the latest snapshot, seeding charts from history.
@@ -1328,24 +1373,69 @@ mod tests {
     }
 
     #[test]
-    fn resolve_range_picks_source_by_window() {
+    fn resolve_history_handles_named_ranges_and_custom_windows() {
         // No `Duration::from_hours` on stable; same trade-off as in docker.rs.
         #[allow(clippy::duration_suboptimal_units)]
         let seed_window = Duration::from_secs(3600);
-        let q = |range: &str| RangeQuery {
-            range: range.to_string(),
+        let named = |range: &str| HistoryQuery {
+            range: Some(range.to_string()),
+            since_ms: None,
+            until_ms: None,
         };
+        let window = |since: u64, until: u64| HistoryQuery {
+            range: None,
+            since_ms: Some(since),
+            until_ms: Some(until),
+        };
+
         // 1h fits the raw retention → raw samples, full resolution.
-        let (_, group, raw) = resolve_range(&q("1h"), seed_window).unwrap();
-        assert!(raw);
-        assert_eq!(group, 60_000);
+        let w = resolve_history(&named("1h"), seed_window).unwrap();
+        assert!(w.raw);
+        assert_eq!(w.group_ms, 60_000);
         // 30d exceeds it → trend buckets, downsampled to 30 min groups.
-        let (since, group, raw) = resolve_range(&q("30d"), seed_window).unwrap();
-        assert!(!raw);
-        assert_eq!(group, 1_800_000);
-        assert!(since <= now_unix_ms() - 29 * 24 * 3_600_000);
-        // Unknown ranges are rejected.
-        assert!(resolve_range(&q("2y"), seed_window).is_none());
+        let w = resolve_history(&named("30d"), seed_window).unwrap();
+        assert!(!w.raw);
+        assert_eq!(w.group_ms, 1_800_000);
+        assert!(w.since <= now_unix_ms() - 29 * 24 * 3_600_000);
+
+        // A recent custom window is served raw, an older one from trends.
+        let now = now_unix_ms();
+        let w = resolve_history(&window(now - 600_000, now), seed_window).unwrap();
+        assert!(w.raw);
+        let w = resolve_history(&window(now - 86_400_000, now - 7_200_000), seed_window).unwrap();
+        assert!(!w.raw);
+        assert_eq!(w.until, now - 7_200_000);
+
+        // Rejected: unknown name, inverted window, range+window mix, nothing.
+        assert!(resolve_history(&named("2y"), seed_window).is_none());
+        assert!(resolve_history(&window(50, 10), seed_window).is_none());
+        let mut mixed = named("1h");
+        mixed.since_ms = Some(0);
+        mixed.until_ms = Some(10);
+        assert!(resolve_history(&mixed, seed_window).is_none());
+        assert!(
+            resolve_history(
+                &HistoryQuery {
+                    range: None,
+                    since_ms: None,
+                    until_ms: None
+                },
+                seed_window
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn group_for_window_targets_whole_buckets() {
+        // Up to 24h: one point per 60s trend bucket.
+        assert_eq!(group_for_window(3_600_000), 60_000);
+        assert_eq!(group_for_window(86_400_000), 60_000);
+        // 7d → 7min groups, 30d → 30min groups (≤ ~1440 points each).
+        assert_eq!(group_for_window(7 * 86_400_000), 420_000);
+        assert_eq!(group_for_window(30 * 86_400_000), 1_800_000);
+        // Degenerate windows never yield a zero group.
+        assert_eq!(group_for_window(0), 60_000);
     }
 
     #[test]
