@@ -23,6 +23,11 @@ services:
       # - /opt/stacks:/opt/stacks:ro
     # Host CPU/load/memory in the header already reflect the real host: the
     # /proc files DockDoe reads are not namespaced. No /proc mount needed.
+    # environment:
+    #   # Recommended when exposing the UI beyond localhost: reject requests
+    #   # whose Host header isn't listed here (DNS-rebinding guard).
+    #   # localhost/127.0.0.1/::1 always work.
+    #   DOCKDOE_ALLOWED_HOSTS: dockhost.lan
 
 volumes:
   dockdoe-data:

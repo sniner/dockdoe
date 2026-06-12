@@ -63,6 +63,13 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_TREND_RETENTION_SECS", default_value_t = 30 * 24 * 3600)]
     trend_retention_secs: u64,
 
+    /// Hostnames the web UI may be addressed as, comma-separated (e.g.
+    /// "dockhost.lan"). When set, requests whose Host header matches neither
+    /// this list nor a localhost form are rejected — a guard against DNS
+    /// rebinding. Unset disables the check.
+    #[arg(long, env = "DOCKDOE_ALLOWED_HOSTS", value_delimiter = ',')]
+    allowed_hosts: Vec<String>,
+
     /// Tracing filter, e.g. "info" or "dockdoe=debug".
     #[arg(long, env = "DOCKDOE_LOG", default_value = "info")]
     log: String,
@@ -101,11 +108,17 @@ async fn main() -> Result<()> {
         Arc::clone(&shared),
     ));
 
+    let allowed_hosts = web::normalize_allowed_hosts(&cli.allowed_hosts);
+    if !allowed_hosts.is_empty() {
+        info!(hosts = ?allowed_hosts, "Host allowlist enabled (plus localhost forms)");
+    }
+
     let app = web::router(web::AppState {
         shared,
         store,
         docker: docker_handle,
         seed_window,
+        allowed_hosts,
     });
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await

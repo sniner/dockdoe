@@ -74,7 +74,20 @@ also reads from an environment variable; the flag wins when both are set.
 | `--raw-retention-secs`    | `DOCKDOE_RAW_RETENTION_SECS`   | `3600`           | How long raw samples are kept ("point A")       |
 | `--trend-bucket-secs`     | `DOCKDOE_TREND_BUCKET_SECS`    | `60`             | Trend rollup window (min/max/median per bucket) |
 | `--trend-retention-secs`  | `DOCKDOE_TREND_RETENTION_SECS` | `2592000` (30 d) | How long trend rollups are kept                 |
+| `--allowed-hosts`         | `DOCKDOE_ALLOWED_HOSTS`        | *(unset)*        | Host-header allowlist, see below                |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
+
+### Request hardening
+
+The start/stop/restart endpoints only accept requests carrying the
+`HX-Request` header that htmx sends with every request. A cross-site HTML form
+can't set custom headers, so drive-by POSTs from other websites are rejected.
+
+That check can't help against DNS rebinding, where the attacker's page ends up
+same-origin. For that, set `--allowed-hosts` (comma-separated, e.g.
+`dockhost.lan`): requests whose `Host` header matches neither the list nor a
+localhost form (`localhost`, `127.0.0.1`, `::1`) are rejected. Recommended
+whenever the UI is exposed beyond localhost.
 
 ## Data model
 

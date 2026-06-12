@@ -11,11 +11,13 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -43,6 +45,9 @@ pub struct AppState {
     pub docker: DockerHandle,
     /// How far back to seed charts on first load.
     pub seed_window: Duration,
+    /// Hostnames the UI may be addressed as (normalized: lowercase, no port).
+    /// Empty disables the Host check; localhost forms are always allowed.
+    pub allowed_hosts: Arc<[String]>,
 }
 
 #[derive(RustEmbed)]
@@ -62,14 +67,81 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stack/{name}/compose", get(stack_compose))
         .route(
             "/api/container/{id}/{action}",
-            axum::routing::post(container_action),
+            axum::routing::post(container_action).layer(middleware::from_fn(require_htmx)),
         )
         .route(
             "/api/stack/{name}/{action}",
-            axum::routing::post(stack_action),
+            axum::routing::post(stack_action).layer(middleware::from_fn(require_htmx)),
         )
         .route("/assets/{*path}", get(asset))
+        .layer(middleware::from_fn_with_state(state.clone(), check_host))
         .with_state(state)
+}
+
+/// CSRF guard for the state-changing POST endpoints: require the
+/// `HX-Request: true` header htmx adds to every request it issues. A cross-site
+/// HTML form can't set custom headers, and setting one from a script makes the
+/// request preflight-checked — which fails, since we never answer CORS
+/// preflights. Same-origin htmx buttons are unaffected.
+async fn require_htmx(req: Request, next: Next) -> Response {
+    if is_htmx_request(req.headers()) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "rejected: not an htmx request (missing HX-Request header)",
+        )
+            .into_response()
+    }
+}
+
+fn is_htmx_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("hx-request")
+        .is_some_and(|v| v.as_bytes() == b"true")
+}
+
+/// Host-header allowlist, a guard against DNS rebinding (where the attacker's
+/// page *is* same-origin, so the htmx-header check above can't help). Active
+/// only when hosts are configured; localhost forms always pass so local access
+/// keeps working alongside a configured LAN hostname.
+async fn check_host(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if host_allowed(req.headers(), &state.allowed_hosts) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "rejected: Host not allowed").into_response()
+    }
+}
+
+fn host_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host_without_port(host.trim()).to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") || allowed.contains(&host)
+}
+
+/// The hostname part of a `Host` header value: strips a `:port` suffix and the
+/// brackets of an IPv6 literal (`[::1]:8080` → `::1`).
+fn host_without_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    }
+}
+
+/// Normalize the configured Host allowlist for [`AppState::allowed_hosts`]:
+/// trim, drop empties, lowercase, strip ports/brackets.
+pub fn normalize_allowed_hosts(hosts: &[String]) -> Arc<[String]> {
+    hosts
+        .iter()
+        .map(|h| host_without_port(h.trim()).to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
 }
 
 /// Apply a start/stop/restart action to a container, then return the freshly
@@ -447,8 +519,7 @@ fn metrics_event(point: &MetricPoint) -> Event {
 /// then the newest one whenever it changes (deduped by timestamp). It polls the
 /// shared snapshot — the same source the page render reads — so the live view
 /// can never drift from a plain reload.
-fn dashboard_stream(state: &AppState) -> impl Stream<Item = std::sync::Arc<Dashboard>> + use<> {
-    use std::sync::Arc;
+fn dashboard_stream(state: &AppState) -> impl Stream<Item = Arc<Dashboard>> + use<> {
     let shared = Arc::clone(&state.shared);
     let ticker = tokio::time::interval(SNAPSHOT_POLL);
     futures_util::stream::unfold(
@@ -962,6 +1033,47 @@ mod tests {
             "nginx:latest"
         );
         assert_eq!(short_image("redis:7"), "redis:7");
+    }
+
+    #[test]
+    fn htmx_header_is_required_verbatim() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_htmx_request(&headers));
+        headers.insert("hx-request", "false".parse().unwrap());
+        assert!(!is_htmx_request(&headers));
+        headers.insert("hx-request", "true".parse().unwrap());
+        assert!(is_htmx_request(&headers));
+    }
+
+    #[test]
+    fn host_without_port_handles_ipv4_ipv6_and_bare_names() {
+        assert_eq!(host_without_port("example.com:8080"), "example.com");
+        assert_eq!(host_without_port("example.com"), "example.com");
+        assert_eq!(host_without_port("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(host_without_port("[::1]:8080"), "::1");
+        assert_eq!(host_without_port("[2001:db8::1]"), "2001:db8::1");
+    }
+
+    #[test]
+    fn host_allowlist_permits_localhost_and_configured_names_only() {
+        let allowed = normalize_allowed_hosts(&[" DockHost.lan:8080 ".to_string()]);
+        let host = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, value.parse().unwrap());
+            headers
+        };
+
+        // Disabled check lets anything through, even a missing Host header.
+        assert!(host_allowed(&HeaderMap::new(), &[]));
+
+        assert!(host_allowed(&host("dockhost.lan"), &allowed));
+        assert!(host_allowed(&host("DockHost.lan:9000"), &allowed));
+        assert!(host_allowed(&host("localhost:8080"), &allowed));
+        assert!(host_allowed(&host("127.0.0.1"), &allowed));
+        assert!(host_allowed(&host("[::1]:8080"), &allowed));
+
+        assert!(!host_allowed(&host("attacker.example"), &allowed));
+        assert!(!host_allowed(&HeaderMap::new(), &allowed));
     }
 
     #[test]
