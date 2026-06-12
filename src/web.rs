@@ -27,7 +27,7 @@ use rust_embed::RustEmbed;
 
 use crate::collector::SharedDashboard;
 use crate::docker::{Action, DockerHandle};
-use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, HostMetrics};
+use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState};
 use crate::store::{MetricPoint, Store};
 
 /// How often the live SSE streams poll the latest snapshot.
@@ -564,7 +564,7 @@ fn detail_event(c: &ContainerMetrics) -> Event {
 fn header_event(dash: &Dashboard) -> Event {
     Event::default()
         .event("header")
-        .data(host_header_inner(&dash.host, dash.generated_at_unix_ms).into_string())
+        .data(host_header_inner(dash).into_string())
 }
 
 /// The `containers` event: the container table's HTML.
@@ -632,7 +632,7 @@ fn shell(
             body {
                 header.host id="host-header" {
                     @match snapshot {
-                        Some(d) => (host_header_inner(&d.host, d.generated_at_unix_ms)),
+                        Some(d) => (host_header_inner(d)),
                         None => a.brand href="/" { "Dock" span { "Doe" } },
                     }
                 }
@@ -820,7 +820,8 @@ fn fact(label: &str, value: &str) -> Markup {
 }
 
 /// The inner content of the host header (everything HTMX swaps on each update).
-fn host_header_inner(host: &HostMetrics, generated_at_unix_ms: u64) -> Markup {
+fn host_header_inner(dash: &Dashboard) -> Markup {
+    let host = &dash.host;
     html! {
         a.brand href="/" { "Dock" span { "Doe" } }
         (metric("CPU", &format!("{:.1}%", host.cpu_percent)))
@@ -836,8 +837,66 @@ fn host_header_inner(host: &HostMetrics, generated_at_unix_ms: u64) -> Markup {
             &format!("{} / {}", fmt_bytes(host.mem_used), fmt_bytes(host.mem_total)),
         ))
         (metric("CPUs", &host.cpu_count.to_string()))
+        (container_counts_metric(&ContainerCounts::of(&dash.containers)))
         span.spacer {}
-        span.generated { "updated " (fmt_age(generated_at_unix_ms)) }
+        span.generated { "updated " (fmt_age(dash.generated_at_unix_ms)) }
+    }
+}
+
+/// Container tally for the header, bucketed the way the badge colours are:
+/// running (green), exited (red), everything else lumped as "other".
+#[derive(Debug, PartialEq, Eq)]
+struct ContainerCounts {
+    total: usize,
+    running: usize,
+    exited: usize,
+    other: usize,
+    unhealthy: usize,
+}
+
+impl ContainerCounts {
+    fn of(containers: &[ContainerMetrics]) -> Self {
+        let mut counts = ContainerCounts {
+            total: containers.len(),
+            running: 0,
+            exited: 0,
+            other: 0,
+            unhealthy: 0,
+        };
+        for c in containers {
+            match c.state {
+                ContainerState::Running => counts.running += 1,
+                ContainerState::Exited => counts.exited += 1,
+                _ => counts.other += 1,
+            }
+            if c.health == HealthState::Unhealthy {
+                counts.unhealthy += 1;
+            }
+        }
+        counts
+    }
+}
+
+/// The header's container tally. Zero buckets are omitted ("0 exited" is
+/// noise), except running — "0 running" is exactly the alarm worth seeing.
+fn container_counts_metric(counts: &ContainerCounts) -> Markup {
+    html! {
+        div.metric {
+            span.label { "Containers" }
+            span.value {
+                (counts.total)
+                span.count-ok { " · " (counts.running) " running" }
+                @if counts.exited > 0 {
+                    span.count-err { " · " (counts.exited) " exited" }
+                }
+                @if counts.other > 0 {
+                    span.count-idle { " · " (counts.other) " other" }
+                }
+                @if counts.unhealthy > 0 {
+                    span.count-err { " · " (counts.unhealthy) " unhealthy" }
+                }
+            }
+        }
     }
 }
 
@@ -1155,6 +1214,49 @@ mod tests {
 
         assert!(!host_allowed(&host("attacker.example"), &allowed));
         assert!(!host_allowed(&HeaderMap::new(), &allowed));
+    }
+
+    #[test]
+    fn container_counts_bucket_by_state_and_health() {
+        let c = |state, health| ContainerMetrics {
+            id: "x".to_string(),
+            name: "c-x".to_string(),
+            image: "img".to_string(),
+            state,
+            status: String::new(),
+            health,
+            stack: None,
+            cpu_percent: None,
+            mem_used: None,
+            mem_limit: None,
+        };
+        let containers = [
+            c(ContainerState::Running, HealthState::Healthy),
+            c(ContainerState::Running, HealthState::Unhealthy),
+            c(ContainerState::Exited, HealthState::None),
+            c(ContainerState::Paused, HealthState::None),
+            c(ContainerState::Created, HealthState::None),
+        ];
+        assert_eq!(
+            ContainerCounts::of(&containers),
+            ContainerCounts {
+                total: 5,
+                running: 2,
+                exited: 1,
+                other: 2,
+                unhealthy: 1,
+            }
+        );
+        assert_eq!(
+            ContainerCounts::of(&[]),
+            ContainerCounts {
+                total: 0,
+                running: 0,
+                exited: 0,
+                other: 0,
+                unhealthy: 0,
+            }
+        );
     }
 
     #[test]

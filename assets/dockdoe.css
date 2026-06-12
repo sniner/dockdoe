@@ -55,6 +55,9 @@ header.host .brand span { color: var(--accent); }
   color: var(--muted);
 }
 .metric .value { font-variant-numeric: tabular-nums; font-weight: 600; }
+.metric .value .count-ok { color: var(--ok); }
+.metric .value .count-err { color: var(--err); }
+.metric .value .count-idle { color: var(--muted); }
 
 .spacer { flex: 1; }
 .generated { color: var(--muted); font-size: 0.75rem; }
