@@ -13,6 +13,7 @@
 
   var cfg = document.getElementById("seed-data");
   var liveUrl = (cfg && cfg.getAttribute("data-live-url")) || "/events";
+  var backfillUrl = cfg && cfg.getAttribute("data-backfill-url");
 
   function readSeed() {
     if (!cfg) return [];
@@ -144,13 +145,47 @@
     push(memChart, t, p.mem_used != null ? p.mem_used / 1048576 : null);
   }
 
-  function connect() {
+  function openStream() {
     if (es) return;
     es = new EventSource(liveUrl);
     es.addEventListener("header", onHeader);
     es.addEventListener("containers", onContainers);
     es.addEventListener("detail", onDetail);
     es.addEventListener("metrics", onMetrics);
+  }
+
+  // While the connection is closed (hidden tab, bfcache, suspend) the charts
+  // receive nothing, so reconnecting would leave a gap. Before reopening the
+  // stream, fetch the missed points from the backfill endpoint and append
+  // them. The stream is opened only after the backfill is in, so chart data
+  // stays in timestamp order.
+  var backfilling = false;
+
+  function connect() {
+    if (es || backfilling) return;
+    if (!cpuChart || !backfillUrl) {
+      openStream();
+      return;
+    }
+    var xs = cpuChart.data[0];
+    var lastTs = xs.length ? xs[xs.length - 1] : 0;
+    backfilling = true;
+    fetch(backfillUrl + "?since_ms=" + (lastTs * 1000 + 1))
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (points) {
+        for (var i = 0; i < points.length; i++) {
+          var p = points[i];
+          var t = Math.floor(p.ts_ms / 1000);
+          push(cpuChart, t, p.cpu_percent);
+          push(memChart, t, p.mem_used != null ? p.mem_used / 1048576 : null);
+        }
+      })
+      .catch(function () {}) // a failed backfill must not block going live
+      .then(function () {
+        backfilling = false;
+        // The page may have been hidden again while the fetch was in flight.
+        if (!document.hidden) openStream();
+      });
   }
 
   function disconnect() {

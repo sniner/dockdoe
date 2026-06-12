@@ -14,13 +14,13 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Json, Router};
 use futures_util::{Stream, StreamExt};
 use maud::{DOCTYPE, Markup, html};
 use rust_embed::RustEmbed;
@@ -65,6 +65,9 @@ pub fn router(state: AppState) -> Router {
         .route("/events/stack/{name}", get(events_stack))
         .route("/api/container/{id}/logs", get(container_logs))
         .route("/api/stack/{name}/compose", get(stack_compose))
+        .route("/api/metrics/host", get(metrics_host))
+        .route("/api/metrics/container/{id}", get(metrics_container))
+        .route("/api/metrics/stack/{name}", get(metrics_stack))
         .route(
             "/api/container/{id}/{action}",
             axum::routing::post(container_action).layer(middleware::from_fn(require_htmx)),
@@ -312,16 +315,80 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
+/// Query for the chart backfill endpoints: return points at or after this
+/// Unix-ms timestamp (clamped to the seed window server-side).
+#[derive(serde::Deserialize)]
+struct SinceQuery {
+    #[serde(default)]
+    since_ms: u64,
+}
+
+/// Clamp a client-supplied `since_ms` to the seed window, so a stale or
+/// malicious value can't request unbounded history in one response.
+fn clamp_since(since_ms: u64, window: Duration) -> u64 {
+    since_ms.max(now_unix_ms().saturating_sub(duration_ms(window)))
+}
+
+/// Run a blocking store query for chart points, degrading to an empty series.
+/// The charts just show what they get — but a failing store is worth a log
+/// line, not silence.
+async fn fetch_points<F>(f: F) -> Vec<MetricPoint>
+where
+    F: FnOnce() -> anyhow::Result<Vec<MetricPoint>> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(points)) => points,
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "loading chart points failed");
+            Vec::new()
+        }
+        Err(join_err) => {
+            tracing::warn!(%join_err, "chart point task panicked");
+            Vec::new()
+        }
+    }
+}
+
+/// JSON backfill for the host charts: raw points since `since_ms`. `live.js`
+/// calls this before (re)opening the SSE stream to fill the gap that built up
+/// while the page was hidden, in the bfcache, or suspended.
+async fn metrics_host(
+    State(state): State<AppState>,
+    Query(q): Query<SinceQuery>,
+) -> Json<Vec<MetricPoint>> {
+    let since = clamp_since(q.since_ms, state.seed_window);
+    let store = state.store.clone();
+    Json(fetch_points(move || store.recent_host_samples(since)).await)
+}
+
+/// JSON backfill for a container detail page's charts.
+async fn metrics_container(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<SinceQuery>,
+) -> Json<Vec<MetricPoint>> {
+    let since = clamp_since(q.since_ms, state.seed_window);
+    let store = state.store.clone();
+    Json(fetch_points(move || store.recent_container_samples(&id, since)).await)
+}
+
+/// JSON backfill for a stack detail page's charts (trend-based, like the seed).
+async fn metrics_stack(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Query(q): Query<SinceQuery>,
+) -> Json<Vec<MetricPoint>> {
+    let since = clamp_since(q.since_ms, state.seed_window);
+    let store = state.store.clone();
+    Json(fetch_points(move || store.recent_stack_trends(&name, since)).await)
+}
+
 /// Render the dashboard from the latest snapshot, seeding charts from history.
 async fn dashboard(State(state): State<AppState>) -> Markup {
-    let snapshot = state.shared.read().ok().and_then(|guard| guard.clone());
+    let snapshot = current_snapshot(&state);
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
-    let seed = tokio::task::spawn_blocking(move || store.recent_host_samples(since))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let seed = fetch_points(move || store.recent_host_samples(since)).await;
     dashboard_page(snapshot.as_ref(), &seed)
 }
 
@@ -340,6 +407,7 @@ async fn container_detail(
             html! { p.empty { "Container not found." } },
             &[],
             "/events",
+            "/api/metrics/host",
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     };
@@ -347,18 +415,16 @@ async fn container_detail(
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
     let seed_id = id.clone();
-    let seed = tokio::task::spawn_blocking(move || store.recent_container_samples(&seed_id, since))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let seed = fetch_points(move || store.recent_container_samples(&seed_id, since)).await;
 
     let live_url = format!("/events/container/{id}");
+    let backfill_url = format!("/api/metrics/container/{id}");
     shell(
         snapshot.as_ref(),
         container_detail_main(&container),
         &seed,
         &live_url,
+        &backfill_url,
     )
     .into_response()
 }
@@ -386,6 +452,7 @@ async fn stack_detail(
             html! { p.empty { "Stack not found." } },
             &[],
             "/events",
+            "/api/metrics/host",
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     }
@@ -396,18 +463,16 @@ async fn stack_detail(
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
     let seed_name = name.clone();
-    let seed = tokio::task::spawn_blocking(move || store.recent_stack_trends(&seed_name, since))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let seed = fetch_points(move || store.recent_stack_trends(&seed_name, since)).await;
 
     let live_url = format!("/events/stack/{name}");
+    let backfill_url = format!("/api/metrics/stack/{name}");
     shell(
         snapshot.as_ref(),
         stack_detail_main(&name, &members),
         &seed,
         &live_url,
+        &backfill_url,
     )
     .into_response()
 }
@@ -540,8 +605,9 @@ fn dashboard_stream(state: &AppState) -> impl Stream<Item = Arc<Dashboard>> + us
 }
 
 /// Full HTML shell shared by every page: the live host header, the page's main
-/// content, and the chart machinery. `metrics_url` is the SSE endpoint the
-/// charts subscribe to; `seed` pre-fills them with history.
+/// content, and the chart machinery. `live_url` is the SSE endpoint the charts
+/// subscribe to; `seed` pre-fills them with history; `backfill_url` is the JSON
+/// endpoint `live.js` uses to close chart gaps before reconnecting.
 // `main_content` is moved in by builder convention — callers hand off a
 // freshly-built fragment they no longer need.
 #[allow(clippy::needless_pass_by_value)]
@@ -550,6 +616,7 @@ fn shell(
     main_content: Markup,
     seed: &[MetricPoint],
     live_url: &str,
+    backfill_url: &str,
 ) -> Markup {
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     html! {
@@ -570,7 +637,8 @@ fn shell(
                     }
                 }
                 main { (main_content) }
-                script id="seed-data" type="application/json" data-live-url=(live_url) {
+                script id="seed-data" type="application/json"
+                    data-live-url=(live_url) data-backfill-url=(backfill_url) {
                     (maud::PreEscaped(seed_json))
                 }
                 script src="/assets/vendor/htmx.min.js" {}
@@ -592,7 +660,7 @@ fn dashboard_page(snapshot: Option<&Dashboard>, seed: &[MetricPoint]) -> Markup 
             }
         }
     };
-    shell(snapshot, main, seed, "/events")
+    shell(snapshot, main, seed, "/events", "/api/metrics/host")
 }
 
 /// Markup for a pair of live charts (CPU + memory). Data comes from `live.js`,
@@ -1033,6 +1101,19 @@ mod tests {
             "nginx:latest"
         );
         assert_eq!(short_image("redis:7"), "redis:7");
+    }
+
+    #[test]
+    fn clamp_since_caps_the_lookback_window() {
+        // No `Duration::from_hours` on stable; same trade-off as in docker.rs.
+        #[allow(clippy::duration_suboptimal_units)]
+        let window = Duration::from_secs(3600);
+        let floor = now_unix_ms() - 3_600_000;
+        // A zero/ancient client value is raised to the window floor…
+        assert!(clamp_since(0, window) >= floor);
+        // …while a recent value passes through unchanged.
+        let recent = now_unix_ms() - 1_000;
+        assert_eq!(clamp_since(recent, window), recent);
     }
 
     #[test]
