@@ -711,21 +711,30 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
     }
 }
 
+/// The shared table header of every container table. The column classes carry
+/// fixed widths (see dockdoe.css), so tables in different stack sections line
+/// up with each other — keep this the single definition.
+fn container_table_head() -> Markup {
+    html! {
+        thead {
+            tr {
+                th { "Container" }
+                th.col-image { "Image" }
+                th.col-state { "State" }
+                th.num.col-cpu { "CPU" }
+                th.num.col-mem { "Memory" }
+                th.actions-col { "Actions" }
+            }
+        }
+    }
+}
+
 /// A stack's member containers as a table (live region on the stack page).
 fn stack_members_table(members: &[&ContainerMetrics]) -> Markup {
     html! {
         section.stack {
             table {
-                thead {
-                    tr {
-                        th { "Container" }
-                        th { "Image" }
-                        th { "State" }
-                        th.num { "CPU" }
-                        th.num { "Memory" }
-                        th.actions-col { "Actions" }
-                    }
-                }
+                (container_table_head())
                 tbody {
                     @for c in members { (container_row(c)) }
                 }
@@ -945,16 +954,7 @@ fn container_section(containers: &[ContainerMetrics]) -> Markup {
                     " " span.count { "(" (members.len()) ")" }
                 }
                 table {
-                    thead {
-                        tr {
-                            th { "Container" }
-                            th { "Image" }
-                            th { "State" }
-                            th.num { "CPU" }
-                            th.num { "Memory" }
-                            th.actions-col { "Actions" }
-                        }
-                    }
+                    (container_table_head())
                     tbody {
                         @for c in members { (container_row(c)) }
                     }
