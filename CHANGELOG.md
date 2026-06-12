@@ -3,6 +3,24 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [0.3.0] — 2026-06-13
+
+### Added
+
+- **History view**: every chart card has an expand button (⤢) that opens a large chart of the
+  stored history — median line plus a shaded min–max band, with 1h/6h/24h/7d/30d ranges.
+  Ranges beyond the raw retention are served from the 30-day trend rollups, downsampled to a
+  chartable density. `#history-cpu-7d`-style URL fragments deep-link into a view
+- **Drill-down**: drag a span on any chart — the small live charts or the history view itself —
+  to zoom into exactly that window, re-fetched at finer resolution down to raw samples;
+  double-click zooms back out step by step. (Dragging on a live chart used to zoom for a
+  second and snap back with the next live update)
+- **History API**: `GET /api/history/{host,container/{id},stack/{name}}` returns
+  median/min/max points, taking `?range=1h|6h|24h|7d|30d` or a free `?since_ms=&until_ms=`
+  window
+- **Log timestamps**: container log lines now show the Docker daemon's per-line timestamp,
+  rendered in the browser's local time so they line up with the chart axes
+
 ## [0.2.1] — 2026-06-12
 
 ### Added
