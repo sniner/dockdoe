@@ -87,12 +87,40 @@
   var cpuChart = null;
   var memChart = null;
 
+  // A straight line between two points that are minutes apart pretends there
+  // was data where there was none (DockDoe restarted, host suspended, page
+  // away for too long). Break the line instead: insert a null sample into any
+  // spacing wider than ~4 typical sample intervals — uPlot renders null as a
+  // hole. The threshold adapts to the series: raw samples arrive every few
+  // seconds, stack trend buckets a minute apart.
+  var gapSecs = 15;
+
+  function gapFromSpacing(times) {
+    if (times.length < 3) return gapSecs;
+    var deltas = [];
+    for (var i = 1; i < times.length; i++) deltas.push(times[i] - times[i - 1]);
+    deltas.sort(function (a, b) { return a - b; });
+    return Math.max(15, deltas[Math.floor(deltas.length / 2)] * 4);
+  }
+
   if (cpuEl && memEl && typeof uPlot !== "undefined") {
-    var ts = seed.map(function (p) { return Math.floor(p.ts_ms / 1000); });
-    var cpu = seed.map(function (p) { return p.cpu_percent; });
-    var mem = seed.map(function (p) {
-      return p.mem_used != null ? p.mem_used / 1048576 : null; // MiB
-    });
+    var rawTs = seed.map(function (p) { return Math.floor(p.ts_ms / 1000); });
+    gapSecs = gapFromSpacing(rawTs);
+
+    var ts = [];
+    var cpu = [];
+    var mem = [];
+    for (var i = 0; i < seed.length; i++) {
+      var t = rawTs[i];
+      if (ts.length && t - ts[ts.length - 1] > gapSecs) {
+        ts.push(ts[ts.length - 1] + 1);
+        cpu.push(null);
+        mem.push(null);
+      }
+      ts.push(t);
+      cpu.push(seed[i].cpu_percent);
+      mem.push(seed[i].mem_used != null ? seed[i].mem_used / 1048576 : null); // MiB
+    }
     cpuChart = new uPlot(
       chartOpts(cpuEl, "CPU", cpuFmt, document.getElementById("readout-cpu")),
       [ts, cpu], cpuEl);
@@ -110,6 +138,11 @@
     var d = chart.data;
     var n = d[0].length;
     if (n && d[0][n - 1] === t) return; // skip duplicate timestamp
+    if (n && t - d[0][n - 1] > gapSecs) {
+      // Data hole (couldn't be backfilled): break the line, don't bridge it.
+      d[0].push(d[0][n - 1] + 1);
+      d[1].push(null);
+    }
     d[0].push(t);
     d[1].push(y);
     while (d[0].length > MAX_POINTS) {
