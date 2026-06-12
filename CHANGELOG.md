@@ -3,6 +3,21 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [0.2.1] — 2026-06-12
+
+### Added
+
+- **Charts** show the hovered point's time and value in the chart's title row
+  ("21:43:05 · 3.2%") — the cursor line finally tells you something
+
+### Fixed
+
+- **Chart gaps** left by a dropped live connection (DockDoe restarting during a container
+  update, a network blip) are now backfilled on reconnect; previously only tab switches and
+  navigation triggered the backfill
+- **Stretches without data** (e.g. DockDoe downtime) are rendered as holes in the line instead
+  of a straight bridge that pretended measurements existed
+
 ## [0.2.0] — 2026-06-12
 
 ### Breaking changes
