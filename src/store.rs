@@ -335,7 +335,10 @@ impl Store {
             )
             .context("prepare recent stack trend query")?;
         let rows = stmt
-            .query_map(rusqlite::params![stack, to_db(since_ms)], trend_row_to_point)
+            .query_map(
+                rusqlite::params![stack, to_db(since_ms)],
+                trend_row_to_point,
+            )
             .context("query recent stack trends")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("collect recent stack trends")?;
