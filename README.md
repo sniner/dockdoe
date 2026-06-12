@@ -1,10 +1,11 @@
 # DockDoe
 
 > [!WARNING]
-> **Very early version (0.1.0).** DockDoe is brand new and under active
-> development. Expect rough edges, bugs, and breaking changes between releases.
-> It is not yet battle-tested — use it at your own risk, and don't rely on it as
-> your only monitoring just yet. Feedback and bug reports are very welcome.
+> **Early version (0.x).** DockDoe is young and under active development.
+> Expect rough edges, bugs, and breaking changes between releases (see
+> [CHANGELOG.md](CHANGELOG.md)). It is not yet battle-tested — use it at your
+> own risk, and don't rely on it as your only monitoring just yet. Feedback
+> and bug reports are very welcome.
 
 A single-binary Docker host monitor with an embedded web UI. Shows the vital
 metrics of your containers — state, CPU, memory — grouped by compose stack,
