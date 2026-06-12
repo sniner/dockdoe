@@ -45,7 +45,10 @@ struct Cli {
     db_path: PathBuf,
 
     /// Seconds between metric samples.
-    #[arg(long, env = "DOCKDOE_INTERVAL_SECS", default_value_t = 3)]
+    // Zero would panic in `tokio::time::interval` — inside the spawned
+    // collector task, killing it silently while the web UI keeps running.
+    #[arg(long, env = "DOCKDOE_INTERVAL_SECS", default_value_t = 3,
+          value_parser = clap::value_parser!(u64).range(1..))]
     interval_secs: u64,
 
     /// How long raw samples are kept, in seconds ("point A").
@@ -120,4 +123,15 @@ fn init_tracing(filter: &str) {
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap_or_default();
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_interval_is_rejected_at_parse_time() {
+        assert!(Cli::try_parse_from(["dockdoe", "--interval-secs", "0"]).is_err());
+        assert!(Cli::try_parse_from(["dockdoe", "--interval-secs", "1"]).is_ok());
+    }
 }
