@@ -68,6 +68,39 @@ pub struct MetricPoint {
     pub mem_used: Option<u64>,
 }
 
+/// One bucket of the history view: median line plus min–max envelope for both
+/// metrics. A field is `None` when the bucket has no rows for that metric
+/// (e.g. a container the runtime reports no memory stats for).
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryPoint {
+    pub ts_ms: u64,
+    pub cpu_min: Option<f64>,
+    pub cpu_med: Option<f64>,
+    pub cpu_max: Option<f64>,
+    pub mem_min: Option<f64>,
+    pub mem_med: Option<f64>,
+    pub mem_max: Option<f64>,
+}
+
+impl HistoryPoint {
+    /// Lift a raw sample into the history shape: a single value is its own
+    /// minimum, median and maximum. Used for ranges inside the raw retention,
+    /// where we have full-resolution data instead of trend buckets.
+    pub fn from_raw(p: &MetricPoint) -> Self {
+        #[allow(clippy::cast_precision_loss)] // chart data; precision is moot
+        let mem = p.mem_used.map(|m| m as f64);
+        Self {
+            ts_ms: p.ts_ms,
+            cpu_min: Some(p.cpu_percent),
+            cpu_med: Some(p.cpu_percent),
+            cpu_max: Some(p.cpu_percent),
+            mem_min: mem,
+            mem_med: mem,
+            mem_max: mem,
+        }
+    }
+}
+
 /// A min/max/median rollup over one time bucket for the host.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostTrend {
@@ -345,6 +378,112 @@ impl Store {
         Ok(rows)
     }
 
+    /// Host trend history at or after `since_ms`, downsampled into `group_ms`
+    /// windows, oldest first. Within a window the envelope keeps the extremes
+    /// (MIN of minima, MAX of maxima) while the line averages the bucket
+    /// medians — an approximation of the true median that is fine for display.
+    pub fn history_host(&self, since_ms: u64, group_ms: u64) -> Result<Vec<HistoryPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT (bucket_start_ms / ?2) * ?2 AS bucket,
+                        MIN(CASE WHEN metric = 'cpu' THEN min END),
+                        AVG(CASE WHEN metric = 'cpu' THEN median END),
+                        MAX(CASE WHEN metric = 'cpu' THEN max END),
+                        MIN(CASE WHEN metric = 'mem' THEN min END),
+                        AVG(CASE WHEN metric = 'mem' THEN median END),
+                        MAX(CASE WHEN metric = 'mem' THEN max END)
+                 FROM host_trend
+                 WHERE bucket_start_ms >= ?1
+                 GROUP BY bucket ORDER BY bucket ASC",
+            )
+            .context("prepare host history query")?;
+        let rows = stmt
+            .query_map(
+                [to_db(since_ms), to_db(group_ms.max(1))],
+                history_row_to_point,
+            )
+            .context("query host history")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect host history")?;
+        Ok(rows)
+    }
+
+    /// Trend history for one container, downsampled like [`Self::history_host`].
+    pub fn history_container(
+        &self,
+        id: &str,
+        since_ms: u64,
+        group_ms: u64,
+    ) -> Result<Vec<HistoryPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT (bucket_start_ms / ?3) * ?3 AS bucket,
+                        MIN(CASE WHEN metric = 'cpu' THEN min END),
+                        AVG(CASE WHEN metric = 'cpu' THEN median END),
+                        MAX(CASE WHEN metric = 'cpu' THEN max END),
+                        MIN(CASE WHEN metric = 'mem' THEN min END),
+                        AVG(CASE WHEN metric = 'mem' THEN median END),
+                        MAX(CASE WHEN metric = 'mem' THEN max END)
+                 FROM container_trend
+                 WHERE id = ?1 AND bucket_start_ms >= ?2
+                 GROUP BY bucket ORDER BY bucket ASC",
+            )
+            .context("prepare container history query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![id, to_db(since_ms), to_db(group_ms.max(1))],
+                history_row_to_point,
+            )
+            .context("query container history")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect container history")?;
+        Ok(rows)
+    }
+
+    /// Trend history for a whole stack: per trend bucket the member values are
+    /// summed (mirroring the live aggregate and [`Self::recent_stack_trends`]),
+    /// then the summed buckets are downsampled like [`Self::history_host`].
+    pub fn history_stack(
+        &self,
+        stack: &str,
+        since_ms: u64,
+        group_ms: u64,
+    ) -> Result<Vec<HistoryPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "WITH per_bucket AS (
+                     SELECT bucket_start_ms AS b,
+                            SUM(CASE WHEN metric = 'cpu' THEN min END) AS cpu_min,
+                            SUM(CASE WHEN metric = 'cpu' THEN median END) AS cpu_med,
+                            SUM(CASE WHEN metric = 'cpu' THEN max END) AS cpu_max,
+                            SUM(CASE WHEN metric = 'mem' THEN min END) AS mem_min,
+                            SUM(CASE WHEN metric = 'mem' THEN median END) AS mem_med,
+                            SUM(CASE WHEN metric = 'mem' THEN max END) AS mem_max
+                     FROM container_trend
+                     WHERE stack = ?1 AND bucket_start_ms >= ?2
+                     GROUP BY b
+                 )
+                 SELECT (b / ?3) * ?3 AS bucket,
+                        MIN(cpu_min), AVG(cpu_med), MAX(cpu_max),
+                        MIN(mem_min), AVG(mem_med), MAX(mem_max)
+                 FROM per_bucket
+                 GROUP BY bucket ORDER BY bucket ASC",
+            )
+            .context("prepare stack history query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![stack, to_db(since_ms), to_db(group_ms.max(1))],
+                history_row_to_point,
+            )
+            .context("query stack history")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect stack history")?;
+        Ok(rows)
+    }
+
     /// Count rows in a table — test/diagnostic helper.
     #[cfg(test)]
     pub fn count(&self, table: &str) -> Result<u64> {
@@ -386,6 +525,21 @@ fn trend_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
         ts_ms: from_db(r.get::<_, i64>(0)?),
         cpu_percent: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
         mem_used: mem.map(|m| m.round().max(0.0) as u64),
+    })
+}
+
+/// Map a downsampled history row to a [`HistoryPoint`]. All value columns are
+/// nullable: a CASE without ELSE yields NULL for the other metric's rows, and
+/// MIN/AVG/MAX ignore NULLs but return NULL when nothing matched.
+fn history_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryPoint> {
+    Ok(HistoryPoint {
+        ts_ms: from_db(r.get::<_, i64>(0)?),
+        cpu_min: r.get(1)?,
+        cpu_med: r.get(2)?,
+        cpu_max: r.get(3)?,
+        mem_min: r.get(4)?,
+        mem_med: r.get(5)?,
+        mem_max: r.get(6)?,
     })
 }
 
@@ -574,6 +728,101 @@ mod tests {
         let recent = store.recent_stack_trends("web", 60_000).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].ts_ms, 60_000);
+    }
+
+    #[test]
+    fn history_host_downsamples_into_groups() {
+        let store = Store::open_in_memory().unwrap();
+        let ht = |bucket: u64, metric, min: f64, median: f64, max: f64| HostTrend {
+            bucket_start_ms: bucket,
+            bucket_secs: 60,
+            metric,
+            min,
+            max,
+            median,
+            samples: 20,
+        };
+        store
+            .insert_host_trends(&[
+                ht(0, Metric::Cpu.as_str(), 1.0, 4.0, 9.0),
+                ht(60_000, Metric::Cpu.as_str(), 2.0, 6.0, 20.0),
+                ht(0, Metric::Mem.as_str(), 100.0, 400.0, 900.0),
+                ht(120_000, Metric::Cpu.as_str(), 3.0, 5.0, 7.0),
+            ])
+            .unwrap();
+
+        // Group = bucket size → buckets pass through unchanged.
+        let fine = store.history_host(0, 60_000).unwrap();
+        assert_eq!(fine.len(), 3);
+        assert_eq!(fine[0].ts_ms, 0);
+        assert_eq!(fine[0].cpu_min, Some(1.0));
+        assert_eq!(fine[0].cpu_med, Some(4.0));
+        assert_eq!(fine[0].cpu_max, Some(9.0));
+        assert_eq!(fine[0].mem_med, Some(400.0));
+        // Bucket without mem rows yields None for the mem envelope.
+        assert_eq!(fine[1].mem_med, None);
+
+        // Coarser group: first two buckets merge — envelope keeps the
+        // extremes, the line averages the medians.
+        let coarse = store.history_host(0, 120_000).unwrap();
+        assert_eq!(coarse.len(), 2);
+        assert_eq!(coarse[0].cpu_min, Some(1.0));
+        assert_eq!(coarse[0].cpu_med, Some(5.0)); // avg(4, 6)
+        assert_eq!(coarse[0].cpu_max, Some(20.0));
+        assert_eq!(coarse[1].ts_ms, 120_000);
+
+        // since_ms filters out older buckets.
+        let late = store.history_host(120_000, 60_000).unwrap();
+        assert_eq!(late.len(), 1);
+    }
+
+    #[test]
+    fn history_stack_sums_members_then_downsamples() {
+        let store = Store::open_in_memory().unwrap();
+        let ct = |bucket: u64, id: &str, min: f64, median: f64, max: f64| ContainerTrend {
+            bucket_start_ms: bucket,
+            bucket_secs: 60,
+            id: id.to_string(),
+            name: format!("c-{id}"),
+            stack: Some("web".to_string()),
+            metric: Metric::Cpu.as_str(),
+            min,
+            max,
+            median,
+            samples: 20,
+        };
+        store
+            .insert_container_trends(&[
+                // bucket 0: summed envelope = min 3, med 10, max 19
+                ct(0, "a", 1.0, 4.0, 9.0),
+                ct(0, "b", 2.0, 6.0, 10.0),
+                // bucket 60_000: summed envelope = min 2, med 5, max 8
+                ct(60_000, "a", 1.0, 2.0, 3.0),
+                ct(60_000, "b", 1.0, 3.0, 5.0),
+            ])
+            .unwrap();
+
+        let fine = store.history_stack("web", 0, 60_000).unwrap();
+        assert_eq!(fine.len(), 2);
+        assert_eq!(fine[0].cpu_min, Some(3.0));
+        assert_eq!(fine[0].cpu_med, Some(10.0));
+        assert_eq!(fine[0].cpu_max, Some(19.0));
+
+        // Coarse group merges the summed buckets.
+        let coarse = store.history_stack("web", 0, 120_000).unwrap();
+        assert_eq!(coarse.len(), 1);
+        assert_eq!(coarse[0].cpu_min, Some(2.0));
+        assert_eq!(coarse[0].cpu_med, Some(7.5)); // avg(10, 5)
+        assert_eq!(coarse[0].cpu_max, Some(19.0));
+
+        // Unknown stack and container queries return empty, not errors.
+        assert!(store.history_stack("nope", 0, 60_000).unwrap().is_empty());
+        assert!(
+            store
+                .history_container("nope", 0, 60_000)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
