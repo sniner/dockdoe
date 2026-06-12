@@ -637,6 +637,10 @@ fn shell(
                     }
                 }
                 main { (main_content) }
+                // Error toast: filled by live.js on htmx request failures.
+                // Lives outside the live regions so the 1s SSE swaps of
+                // #containers / #detail-live can't wipe the message.
+                div id="toast" role="alert" {}
                 script id="seed-data" type="application/json"
                     data-live-url=(live_url) data-backfill-url=(backfill_url) {
                     (maud::PreEscaped(seed_json))

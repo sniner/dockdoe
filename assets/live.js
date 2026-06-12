@@ -101,6 +101,33 @@
     chart.setData(d);
   }
 
+  // --- Error toast -----------------------------------------------------------
+  //
+  // htmx does not swap non-2xx responses, so a failed action (or logs/compose
+  // fetch) would be invisible: the click just seems to do nothing. Surface the
+  // server's error text in a transient toast instead. The toast element lives
+  // outside the live regions, so the periodic SSE swaps can't wipe it.
+
+  var toastTimer = null;
+
+  function showToast(msg) {
+    var el = document.getElementById("toast");
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.remove("show"); }, 6000);
+  }
+
+  document.body.addEventListener("htmx:responseError", function (e) {
+    var xhr = e.detail && e.detail.xhr;
+    var text = xhr && xhr.responseText;
+    showToast(text || "Request failed (HTTP " + (xhr ? xhr.status : "?") + ")");
+  });
+  document.body.addEventListener("htmx:sendError", function () {
+    showToast("Network error: could not reach DockDoe");
+  });
+
   // --- Single live connection ------------------------------------------------
   //
   // The connection is closed whenever the page is hidden or navigated away

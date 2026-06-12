@@ -303,6 +303,25 @@ h2 a.stack-link:hover { color: var(--accent); }
 }
 .muted { color: var(--muted); }
 
+#toast {
+  position: fixed;
+  left: 50%;
+  bottom: 1.25rem;
+  transform: translateX(-50%);
+  max-width: min(90vw, 40rem);
+  background: var(--panel-2);
+  border: 1px solid var(--err);
+  color: var(--fg);
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  font-size: 0.85rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+  z-index: 100;
+}
+#toast.show { opacity: 1; }
+
 .compose-file + .compose-file { margin-top: 0.75rem; }
 .compose-path {
   font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
