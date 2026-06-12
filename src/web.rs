@@ -675,11 +675,18 @@ fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
     html! {
         section.charts {
             div.chart-card {
-                span.chart-title { (cpu_title) }
+                div.chart-head {
+                    span.chart-title { (cpu_title) }
+                    // Filled by live.js while hovering: "21:43:05 · 3.2%".
+                    span.chart-readout id="readout-cpu" {}
+                }
                 div id="chart-cpu" {}
             }
             div.chart-card {
-                span.chart-title { (mem_title) }
+                div.chart-head {
+                    span.chart-title { (mem_title) }
+                    span.chart-readout id="readout-mem" {}
+                }
                 div id="chart-mem" {}
             }
         }

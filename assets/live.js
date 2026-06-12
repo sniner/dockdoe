@@ -31,7 +31,7 @@
   var grid = { stroke: "#2c313c", width: 1 };
   var axisStyle = { stroke: "#8b93a1", grid: grid, ticks: grid, size: 40 };
 
-  function chartOpts(el, label, fmt) {
+  function chartOpts(el, label, fmt, readout) {
     return {
       width: el.clientWidth || 320,
       height: 110,
@@ -50,18 +50,32 @@
           values: function (u, vals) { return vals.map(fmt); },
         }),
       ],
+      hooks: {
+        // The legend is hidden, so surface the hovered point's time and value
+        // in the chart's title row instead ("21:43:05 · 3.2%").
+        setCursor: [function (u) {
+          if (!readout) return;
+          var i = u.cursor.idx;
+          if (i == null || u.data[0][i] == null) {
+            readout.textContent = "";
+            return;
+          }
+          var v = u.data[1][i];
+          readout.textContent =
+            timeStr(u.data[0][i]) + " · " + (v == null ? "--" : fmt(v));
+        }],
+      },
     };
   }
 
   // uPlot's default time axis shows only the second component (":ss") when all
   // ticks fall in the same minute, hiding the hour/minute. Always show HH:MM.
   var pad = function (n) { return n < 10 ? "0" + n : "" + n; };
-  var timeFmt = function (u, splits) {
-    return splits.map(function (s) {
-      var d = new Date(s * 1000);
-      return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
-    });
+  var timeStr = function (s) {
+    var d = new Date(s * 1000);
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
   };
+  var timeFmt = function (u, splits) { return splits.map(timeStr); };
 
   var cpuFmt = function (v) { return v.toFixed(0) + "%"; };
   var memFmt = function (v) {
@@ -79,8 +93,12 @@
     var mem = seed.map(function (p) {
       return p.mem_used != null ? p.mem_used / 1048576 : null; // MiB
     });
-    cpuChart = new uPlot(chartOpts(cpuEl, "CPU", cpuFmt), [ts.slice(), cpu.slice()], cpuEl);
-    memChart = new uPlot(chartOpts(memEl, "Memory", memFmt), [ts.slice(), mem.slice()], memEl);
+    cpuChart = new uPlot(
+      chartOpts(cpuEl, "CPU", cpuFmt, document.getElementById("readout-cpu")),
+      [ts, cpu], cpuEl);
+    memChart = new uPlot(
+      chartOpts(memEl, "Memory", memFmt, document.getElementById("readout-mem")),
+      [ts.slice(), mem], memEl);
 
     window.addEventListener("resize", function () {
       cpuChart.setSize({ width: cpuEl.clientWidth, height: 110 });

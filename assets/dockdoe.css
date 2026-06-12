@@ -169,12 +169,25 @@ td.image { color: var(--muted); font-size: 0.85rem; }
   border-radius: 10px;
   padding: 0.6rem 0.8rem 0.3rem;
 }
+.chart-card .chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
 .chart-card .chart-title {
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--muted);
   font-weight: 600;
+}
+/* Hover readout ("21:43:05 · 3.2%"), filled by live.js. */
+.chart-card .chart-readout {
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  white-space: nowrap;
 }
 .chart-card .u-legend { display: none; }
 
