@@ -465,11 +465,13 @@ async fn stack_detail(
     let seed_name = name.clone();
     let seed = fetch_points(move || store.recent_stack_trends(&seed_name, since)).await;
 
+    // Members are non-empty here, so a snapshot exists; 1 is just a fallback.
+    let cpu_count = snapshot.as_ref().map_or(1, |d| d.host.cpu_count);
     let live_url = format!("/events/stack/{name}");
     let backfill_url = format!("/api/metrics/stack/{name}");
     shell(
         snapshot.as_ref(),
-        stack_detail_main(&name, &members),
+        stack_detail_main(&name, &members, cpu_count),
         &seed,
         &live_url,
         &backfill_url,
@@ -539,7 +541,7 @@ async fn events_stack(
         }
         let members_event = Event::default()
             .event("containers")
-            .data(stack_members_table(&members).into_string());
+            .data(stack_members_table(&members, dash.host.cpu_count).into_string());
         futures_util::stream::iter([
             Ok(header_event(&dash)),
             Ok(members_event),
@@ -571,7 +573,7 @@ fn header_event(dash: &Dashboard) -> Event {
 fn containers_event(dash: &Dashboard) -> Event {
     Event::default()
         .event("containers")
-        .data(container_section(&dash.containers).into_string())
+        .data(container_section(&dash.containers, dash.host.cpu_count).into_string())
 }
 
 /// The `metrics` event: a metric point as JSON.
@@ -659,7 +661,7 @@ fn dashboard_page(snapshot: Option<&Dashboard>, seed: &[MetricPoint]) -> Markup 
         (charts_section("Host CPU", "Host Memory"))
         div id="containers" {
             @match snapshot {
-                Some(d) => (container_section(&d.containers)),
+                Some(d) => (container_section(&d.containers, d.host.cpu_count)),
                 None => p.empty { "Collecting first metrics sample…" },
             }
         }
@@ -734,13 +736,13 @@ fn container_table_head() -> Markup {
 }
 
 /// A stack's member containers as a table (live region on the stack page).
-fn stack_members_table(members: &[&ContainerMetrics]) -> Markup {
+fn stack_members_table(members: &[&ContainerMetrics], cpu_count: usize) -> Markup {
     html! {
         section.stack {
             table {
                 (container_table_head())
                 tbody {
-                    @for c in members { (container_row(c)) }
+                    @for c in members { (container_row(c, cpu_count)) }
                 }
             }
         }
@@ -769,7 +771,7 @@ fn container_detail_live(c: &ContainerMetrics) -> Markup {
 
 /// Body of a stack detail page: aggregate charts, stack actions, and the
 /// stack's containers.
-fn stack_detail_main(name: &str, members: &[ContainerMetrics]) -> Markup {
+fn stack_detail_main(name: &str, members: &[ContainerMetrics], cpu_count: usize) -> Markup {
     html! {
         section.detail-head {
             div.detail-title {
@@ -785,7 +787,7 @@ fn stack_detail_main(name: &str, members: &[ContainerMetrics]) -> Markup {
         ))
         // Live region: the `containers` SSE event swaps the member table so its
         // states/metrics track reality.
-        div id="containers" { (stack_members_table(&members.iter().collect::<Vec<_>>())) }
+        div id="containers" { (stack_members_table(&members.iter().collect::<Vec<_>>(), cpu_count)) }
         section.panel {
             div.panel-head {
                 h3 { "compose.yml" }
@@ -924,7 +926,7 @@ fn metric(label: &str, value: &str) -> Markup {
 
 /// Render all containers, grouped by compose stack. Standalone containers
 /// (no compose project) are grouped last under "Standalone".
-fn container_section(containers: &[ContainerMetrics]) -> Markup {
+fn container_section(containers: &[ContainerMetrics], cpu_count: usize) -> Markup {
     if containers.is_empty() {
         return html! { p.empty { "No containers found." } };
     }
@@ -960,7 +962,7 @@ fn container_section(containers: &[ContainerMetrics]) -> Markup {
                 table {
                     (container_table_head())
                     tbody {
-                        @for c in members { (container_row(c)) }
+                        @for c in members { (container_row(c, cpu_count)) }
                     }
                 }
             }
@@ -968,7 +970,10 @@ fn container_section(containers: &[ContainerMetrics]) -> Markup {
     }
 }
 
-fn container_row(c: &ContainerMetrics) -> Markup {
+/// One container table row. `cpu_count` scales the CPU bar: container CPU% is
+/// per-core cumulative (a busy 4-core container reads 400%), so full bar =
+/// the whole host, and the bar matches what the host CPU chart would show.
+fn container_row(c: &ContainerMetrics, cpu_count: usize) -> Markup {
     html! {
         tr {
             td.name { a href=(format!("/container/{}", c.id)) { (c.name) } }
@@ -981,7 +986,7 @@ fn container_row(c: &ContainerMetrics) -> Markup {
                 @match c.cpu_percent {
                     Some(pct) => {
                         (format!("{pct:.1}%"))
-                        (bar(pct, 100.0))
+                        (bar(pct, cpu_count.max(1) as f64 * 100.0))
                     }
                     None => span style="color:var(--muted)" { "–" }
                 }
