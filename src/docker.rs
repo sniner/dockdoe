@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::models::{
-    ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum, HealthStatusEnum,
+    ContainerCpuStats, ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum,
+    HealthStatusEnum,
 };
 use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
@@ -600,38 +601,58 @@ impl DockerClient {
         let total_usage = cpu_stats.cpu_usage.as_ref()?.total_usage?;
         let system_usage = cpu_stats.system_cpu_usage?;
 
+        // Remember this sample as the next baseline; `insert` hands back the
+        // previous one, absent on the first sample.
         let prev = self.prev_cpu.insert(
             id.to_string(),
             PrevCpu {
                 total_usage,
                 system_usage,
             },
-        );
-        let prev = prev?;
+        )?;
 
-        let cpu_delta = total_usage.saturating_sub(prev.total_usage);
-        let system_delta = system_usage.saturating_sub(prev.system_usage);
-        if cpu_delta == 0 || system_delta == 0 {
-            return Some(0.0);
-        }
-
-        // online_cpus is omitted on some setups; fall back to the per-core
-        // count, then to 1.
-        let online_cpus = cpu_stats
-            .online_cpus
-            .map(f64::from)
-            .or_else(|| {
-                cpu_stats
-                    .cpu_usage
-                    .as_ref()
-                    .and_then(|u| u.percpu_usage.as_ref())
-                    .map(|v| v.len() as f64)
-            })
-            .filter(|&n| n > 0.0)
-            .unwrap_or(1.0);
-
-        Some((cpu_delta as f64 / system_delta as f64) * online_cpus * 100.0)
+        Some(cpu_percent_from_deltas(
+            prev,
+            total_usage,
+            system_usage,
+            online_cpus(cpu_stats),
+        ))
     }
+}
+
+/// The CPU% formula: the container's share of the host's total CPU time
+/// between two samples, scaled to per-core percent (one busy core = 100%,
+/// n busy cores = n·100%) — the convention `docker stats` uses. Counter
+/// regressions (e.g. a daemon restart) saturate to 0 instead of wrapping.
+fn cpu_percent_from_deltas(
+    prev: PrevCpu,
+    total_usage: u64,
+    system_usage: u64,
+    online_cpus: f64,
+) -> f64 {
+    let cpu_delta = total_usage.saturating_sub(prev.total_usage);
+    let system_delta = system_usage.saturating_sub(prev.system_usage);
+    if cpu_delta == 0 || system_delta == 0 {
+        return 0.0;
+    }
+    (cpu_delta as f64 / system_delta as f64) * online_cpus * 100.0
+}
+
+/// Number of CPUs available to the container. `online_cpus` is omitted on some
+/// setups; fall back to the per-core counter list, then to 1.
+fn online_cpus(cpu_stats: &ContainerCpuStats) -> f64 {
+    cpu_stats
+        .online_cpus
+        .map(f64::from)
+        .or_else(|| {
+            cpu_stats
+                .cpu_usage
+                .as_ref()
+                .and_then(|u| u.percpu_usage.as_ref())
+                .map(|v| v.len() as f64)
+        })
+        .filter(|&n| n > 0.0)
+        .unwrap_or(1.0)
 }
 
 /// Memory used (cache excluded) and limit, both in bytes.
@@ -718,6 +739,69 @@ fn parse_health(status: &str) -> HealthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bollard::models::ContainerCpuUsage;
+
+    #[test]
+    fn cpu_percent_matches_the_docker_stats_formula() {
+        let prev = PrevCpu {
+            total_usage: 1_000,
+            system_usage: 100_000,
+        };
+        // 500 of 10_000 ns of host CPU time on 2 CPUs → 5% · 2 = 10%.
+        let pct = cpu_percent_from_deltas(prev, 1_500, 110_000, 2.0);
+        assert!((pct - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cpu_percent_is_zero_without_progress() {
+        let prev = PrevCpu {
+            total_usage: 5_000,
+            system_usage: 100_000,
+        };
+        // No container CPU consumed; also guards the division by zero when
+        // the system counter didn't move.
+        assert!(cpu_percent_from_deltas(prev, 5_000, 110_000, 4.0).abs() < f64::EPSILON);
+        assert!(cpu_percent_from_deltas(prev, 6_000, 100_000, 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cpu_percent_saturates_on_counter_regression() {
+        // Counters jumped backwards (daemon restart): saturating deltas read
+        // as 0% instead of wrapping to astronomic values.
+        let prev = PrevCpu {
+            total_usage: 5_000,
+            system_usage: 100_000,
+        };
+        assert!(cpu_percent_from_deltas(prev, 1_000, 110_000, 4.0).abs() < f64::EPSILON);
+        assert!(cpu_percent_from_deltas(prev, 6_000, 90_000, 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn online_cpus_prefers_field_then_percpu_list_then_one() {
+        let with_field = ContainerCpuStats {
+            online_cpus: Some(3),
+            ..Default::default()
+        };
+        assert!((online_cpus(&with_field) - 3.0).abs() < f64::EPSILON);
+
+        let with_percpu = ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage {
+                percpu_usage: Some(vec![1, 2]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!((online_cpus(&with_percpu) - 2.0).abs() < f64::EPSILON);
+
+        assert!((online_cpus(&ContainerCpuStats::default()) - 1.0).abs() < f64::EPSILON);
+
+        // A reported 0 must not zero the percentage — fall back to 1.
+        let zero_field = ContainerCpuStats {
+            online_cpus: Some(0),
+            ..Default::default()
+        };
+        assert!((online_cpus(&zero_field) - 1.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn parse_health_recognises_states() {
