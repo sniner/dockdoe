@@ -223,6 +223,8 @@
     push(memChart, t, p.mem_used != null ? p.mem_used / 1048576 : null);
   }
 
+  var reconnectTimer = null;
+
   function openStream() {
     if (es) return;
     es = new EventSource(liveUrl);
@@ -230,6 +232,18 @@
     es.addEventListener("containers", onContainers);
     es.addEventListener("detail", onDetail);
     es.addEventListener("metrics", onMetrics);
+    // On a dropped connection the browser would reconnect on its own — but
+    // that bypasses the backfill and leaves a hole in the charts (e.g. when
+    // the DockDoe server restarts while the page stays open). Take over:
+    // drop the source and go back through connect(), which fetches the
+    // missed points before reopening the stream.
+    es.onerror = function () {
+      disconnect();
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(function () {
+        if (!document.hidden) connect();
+      }, 3000);
+    };
   }
 
   // While the connection is closed (hidden tab, bfcache, suspend) the charts
