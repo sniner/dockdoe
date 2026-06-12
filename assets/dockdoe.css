@@ -241,6 +241,13 @@ td.image { color: var(--muted); font-size: 0.85rem; }
   color: var(--fg);
   border-color: var(--accent);
 }
+.history-hint {
+  color: var(--muted);
+  font-size: 0.7rem;
+  white-space: nowrap;
+  display: none;
+}
+.history-hint.show { display: inline; }
 .history-head .chart-readout {
   font-size: 0.75rem;
   font-variant-numeric: tabular-nums;

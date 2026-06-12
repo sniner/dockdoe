@@ -833,6 +833,11 @@ fn shell(
                                 button type="button" data-range="7d" { "7d" }
                                 button type="button" data-range="30d" { "30d" }
                             }
+                            // Shown by history.js while a drag-selected
+                            // window is displayed.
+                            span.history-hint id="history-hint" {
+                                "double-click to zoom out"
+                            }
                             span.chart-readout id="history-readout" {}
                             button.history-close id="history-close" type="button"
                                 aria-label="Close" { "✕" }

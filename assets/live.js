@@ -35,7 +35,10 @@
     return {
       width: el.clientWidth || 320,
       height: 110,
-      cursor: { y: false },
+      // Drag selects but never zooms here: uPlot's own zoom would be undone
+      // by the next SSE point (setData resets the scales). The selection is
+      // handed to history.js instead, which opens the overlay on that window.
+      cursor: { y: false, drag: { x: true, y: false, setScale: false } },
       legend: { show: false },
       scales: { x: { time: true } },
       series: [
@@ -63,6 +66,20 @@
           var v = u.data[1][i];
           readout.textContent =
             timeStr(u.data[0][i]) + " · " + (v == null ? "--" : fmt(v));
+        }],
+        // A completed drag selection drills into the history overlay.
+        setSelect: [function (u) {
+          if (u.select.width <= 0) return;
+          var sinceMs = Math.round(u.posToVal(u.select.left, "x") * 1000);
+          var untilMs = Math.round(u.posToVal(u.select.left + u.select.width, "x") * 1000);
+          u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+          document.dispatchEvent(new CustomEvent("dockdoe:drill", {
+            detail: {
+              metric: el.id === "chart-mem" ? "mem" : "cpu",
+              sinceMs: sinceMs,
+              untilMs: untilMs,
+            },
+          }));
         }],
       },
     };

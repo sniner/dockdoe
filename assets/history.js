@@ -1,8 +1,12 @@
 // History overlay: a native <dialog> with one large chart, opened from the
-// expand button on any chart card. Shows the median as a line and the min-max
-// envelope as a shaded band, fetched once per range from the history endpoint
-// (no SSE involved - this view is deliberately static and separate from the
-// live machinery in live.js).
+// expand button on any chart card or by drag-selecting a span on a small live
+// chart. Shows the median as a line and the min-max envelope as a shaded band,
+// fetched once per view from the history endpoint (no SSE involved - this view
+// is deliberately static and separate from the live machinery in live.js).
+//
+// A view is either a named range ({range: "24h"}) or a free window
+// ({sinceMs, untilMs}). Drag-selecting inside the overlay drills into the
+// selected window (re-fetched at finer resolution); double-click goes back.
 (function () {
   "use strict";
 
@@ -15,6 +19,7 @@
   var titleEl = document.getElementById("history-title");
   var readoutEl = document.getElementById("history-readout");
   var rangesEl = document.getElementById("history-ranges");
+  var hintEl = document.getElementById("history-hint");
 
   var stroke = "#4f9cf9";
   var band = "rgba(79,156,249,0.18)";
@@ -49,12 +54,20 @@
   }
 
   var metric = "cpu"; // which metric the open dialog shows
-  var range = "24h";
+  var baseTitle = "";
+  var lastRange = "24h"; // most recent named range; double-click fallback
+  var view = { range: lastRange }; // what the chart currently shows
+  var backStack = []; // drill-down trail, popped by double-click
   var chart = null;
   var loadSeq = 0; // ignore out-of-order fetch responses after rapid clicks
 
-  // Long ranges need the day in the axis labels and the readout; within a day
-  // the clock alone is enough.
+  // Within a day the clock alone is enough; longer windows - and windows that
+  // lie further in the past - need the day to be intelligible.
+  function needsDate(v) {
+    if (v.range) return v.range === "7d" || v.range === "30d";
+    return v.untilMs - v.sinceMs > 72e6 || Date.now() - v.sinceMs > 864e5;
+  }
+
   function timeStr(s, withDate) {
     var d = new Date(s * 1000);
     var clock = pad(d.getHours()) + ":" + pad(d.getMinutes());
@@ -62,7 +75,10 @@
     return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + clock;
   }
 
-  function showsDate() { return range === "7d" || range === "30d"; }
+  function windowLabel(v) {
+    var withDate = needsDate(v);
+    return timeStr(v.sinceMs / 1000, withDate) + " – " + timeStr(v.untilMs / 1000, withDate);
+  }
 
   // Same idea as in live.js: break the line over stretches without data
   // instead of bridging them. Threshold adapts to the series spacing (raw
@@ -79,7 +95,9 @@
     return {
       width: chartEl.clientWidth || 800,
       height: 420,
-      cursor: { y: false },
+      // Drag drills into the selected window via a re-fetch; uPlot's own
+      // zoom would only stretch the already-loaded resolution.
+      cursor: { y: false, drag: { x: true, y: false, setScale: false } },
       legend: { show: false },
       scales: { x: { time: true } },
       // Data layout: [ts, median, max, min]. The band fills from series 2
@@ -95,7 +113,7 @@
         Object.assign({}, axisStyle, {
           size: 30,
           values: function (u, splits) {
-            var withDate = showsDate();
+            var withDate = needsDate(view);
             return splits.map(function (s) { return timeStr(s, withDate); });
           },
         }),
@@ -125,7 +143,15 @@
             ? "  (" + fmt(lo) + " – " + fmt(hi) + ")"
             : "";
           readoutEl.textContent =
-            timeStr(u.data[0][i], showsDate()) + " · " + fmt(med) + spread;
+            timeStr(u.data[0][i], needsDate(view)) + " · " + fmt(med) + spread;
+        }],
+        // A completed drag selection drills into that window.
+        setSelect: [function (u) {
+          if (u.select.width <= 0) return;
+          var sinceMs = Math.round(u.posToVal(u.select.left, "x") * 1000);
+          var untilMs = Math.round(u.posToVal(u.select.left + u.select.width, "x") * 1000);
+          u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+          drill(sinceMs, untilMs);
         }],
       },
     };
@@ -162,15 +188,24 @@
     }
   }
 
-  function load(r) {
-    range = r;
+  // Fetch and display a view. The chrome (title, active range button, hint)
+  // updates immediately; the chart follows when the data lands.
+  function show(v) {
+    view = v;
+    if (v.range) lastRange = v.range;
     readoutEl.textContent = "";
+    titleEl.textContent = v.range ? baseTitle : baseTitle + " · " + windowLabel(v);
     var btns = rangesEl.querySelectorAll("button");
     for (var i = 0; i < btns.length; i++) {
-      btns[i].classList.toggle("active", btns[i].getAttribute("data-range") === r);
+      btns[i].classList.toggle("active", btns[i].getAttribute("data-range") === v.range);
     }
+    hintEl.classList.toggle("show", !v.range);
+
+    var query = v.range
+      ? "?range=" + v.range
+      : "?since_ms=" + v.sinceMs + "&until_ms=" + v.untilMs;
     var seq = ++loadSeq;
-    fetch(historyUrl + "?range=" + encodeURIComponent(r))
+    fetch(historyUrl + query)
       .then(function (resp) {
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         return resp.json();
@@ -185,22 +220,53 @@
       });
   }
 
-  rangesEl.addEventListener("click", function (e) {
-    var btn = e.target.closest("button[data-range]");
-    if (btn) load(btn.getAttribute("data-range"));
+  function drill(sinceMs, untilMs) {
+    if (untilMs - sinceMs < 10000) return; // ignore accidental nudges
+    backStack.push(view);
+    show({ sinceMs: sinceMs, untilMs: untilMs });
+  }
+
+  // Double-click walks the drill-down trail back; from a window opened
+  // directly off a small chart it falls back to the last named range.
+  chartEl.addEventListener("dblclick", function () {
+    if (backStack.length) show(backStack.pop());
+    else if (!view.range) show({ range: lastRange });
   });
 
-  // Open from any chart card's expand button. The dialog title borrows the
-  // card's title ("Host CPU", "Memory", ...), which already names the metric.
+  rangesEl.addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-range]");
+    if (!btn) return;
+    backStack = [];
+    show({ range: btn.getAttribute("data-range") });
+  });
+
+  // Put the dialog into "showing <metric> of this page's entity" state. The
+  // title borrows the matching chart card's title ("Host CPU", "Memory", ...),
+  // which already names the metric.
+  function openFor(m) {
+    metric = m;
+    var btn = document.querySelector('.chart-zoom[data-metric="' + m + '"]');
+    var head = btn && btn.closest(".chart-head");
+    var title = head && head.querySelector(".chart-title");
+    baseTitle = (title ? title.textContent : m) + " — history";
+    backStack = [];
+    dlg.showModal();
+  }
+
+  // Open from any chart card's expand button.
   document.body.addEventListener("click", function (e) {
     var btn = e.target.closest(".chart-zoom");
     if (!btn) return;
-    metric = btn.getAttribute("data-metric") || "cpu";
-    var head = btn.closest(".chart-head");
-    var title = head && head.querySelector(".chart-title");
-    titleEl.textContent = (title ? title.textContent : metric) + " — history";
-    dlg.showModal();
-    load(range);
+    openFor(btn.getAttribute("data-metric") || "cpu");
+    show({ range: lastRange });
+  });
+
+  // Open from a drag selection on a small live chart (see live.js).
+  document.addEventListener("dockdoe:drill", function (e) {
+    var d = e.detail;
+    if (d.untilMs - d.sinceMs < 10000) return;
+    openFor(d.metric);
+    show({ sinceMs: d.sinceMs, untilMs: d.untilMs });
   });
 
   document.getElementById("history-close").addEventListener("click", function () {
@@ -222,8 +288,7 @@
   // view can be bookmarked or shared (and exercised by headless UI checks).
   var hash = /^#history-(cpu|mem)(?:-(1h|6h|24h|7d|30d))?$/.exec(location.hash);
   if (hash) {
-    if (hash[2]) range = hash[2];
-    var zoom = document.querySelector('.chart-zoom[data-metric="' + hash[1] + '"]');
-    if (zoom) zoom.click();
+    openFor(hash[1]);
+    show({ range: hash[2] || lastRange });
   }
 })();
