@@ -747,6 +747,10 @@ fn shell(
     backfill_url: &str,
 ) -> Markup {
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
+    // The history endpoints mirror the backfill endpoints by design — same
+    // entity, same path shape — so the URL is derived instead of threaded
+    // through every page handler.
+    let history_url = backfill_url.replacen("/api/metrics/", "/api/history/", 1);
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -769,13 +773,37 @@ fn shell(
                 // Lives outside the live regions so the 1s SSE swaps of
                 // #containers / #detail-live can't wipe the message.
                 div id="toast" role="alert" {}
+                // History overlay, opened by the expand button on any chart
+                // card and driven by history.js. The inner .history-body
+                // covers the whole dialog so a click landing on the <dialog>
+                // element itself can only mean the backdrop.
+                dialog id="history-dialog" {
+                    div.history-body {
+                        div.history-head {
+                            span.history-title id="history-title" {}
+                            div.history-ranges id="history-ranges" {
+                                button type="button" data-range="1h" { "1h" }
+                                button type="button" data-range="6h" { "6h" }
+                                button type="button" data-range="24h" { "24h" }
+                                button type="button" data-range="7d" { "7d" }
+                                button type="button" data-range="30d" { "30d" }
+                            }
+                            span.chart-readout id="history-readout" {}
+                            button.history-close id="history-close" type="button"
+                                aria-label="Close" { "✕" }
+                        }
+                        div id="history-chart" {}
+                    }
+                }
                 script id="seed-data" type="application/json"
-                    data-live-url=(live_url) data-backfill-url=(backfill_url) {
+                    data-live-url=(live_url) data-backfill-url=(backfill_url)
+                    data-history-url=(history_url) {
                     (maud::PreEscaped(seed_json))
                 }
                 script src="/assets/vendor/htmx.min.js" {}
                 script src="/assets/vendor/uPlot.iife.min.js" {}
                 script src="/assets/live.js" {}
+                script src="/assets/history.js" {}
             }
         }
     }
@@ -805,6 +833,8 @@ fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
                     span.chart-title { (cpu_title) }
                     // Filled by live.js while hovering: "21:43:05 · 3.2%".
                     span.chart-readout id="readout-cpu" {}
+                    button.chart-zoom type="button" data-metric="cpu"
+                        title="Show history" aria-label="Show history" { "⤢" }
                 }
                 div id="chart-cpu" {}
             }
@@ -812,6 +842,8 @@ fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
                 div.chart-head {
                     span.chart-title { (mem_title) }
                     span.chart-readout id="readout-mem" {}
+                    button.chart-zoom type="button" data-metric="mem"
+                        title="Show history" aria-label="Show history" { "⤢" }
                 }
                 div id="chart-mem" {}
             }
