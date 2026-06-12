@@ -51,6 +51,7 @@ pub async fn run(
     let mut bucketer = Bucketer::new(config.trend_bucket_secs);
     let raw_retention_ms = duration_ms(config.raw_retention);
     let trend_retention_ms = duration_ms(config.trend_retention);
+    let mut primed = false;
 
     loop {
         ticker.tick().await;
@@ -63,6 +64,17 @@ pub async fn run(
                 continue;
             }
         };
+
+        // The first successful cycle only primes the delta-based readings:
+        // sysinfo's first CPU refresh reads ~0%, and container CPU% is None
+        // without a previous sample. Publishing or persisting it would put a
+        // bogus 0% dip at the start of every chart after a restart — discard
+        // it and let the next cycle deliver real values.
+        if !primed {
+            primed = true;
+            debug!("priming cycle done; publishing starts next cycle");
+            continue;
+        }
 
         let ts_ms = now_unix_ms();
         let flushed = bucketer.push(ts_ms, &host_metrics, &containers);
