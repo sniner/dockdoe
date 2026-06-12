@@ -84,10 +84,12 @@ main { padding: 1.25rem; max-width: 1100px; margin: 0 auto; }
    widths below keep the columns aligned across all of them (auto layout
    computed different widths per stack). Column 1 (name) takes the rest. */
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-th.col-image { width: 18%; }
-th.col-state { width: 160px; }
-th.col-cpu { width: 145px; }
-th.col-mem { width: 170px; }
+/* Widths include the 2×1rem cell padding: value text + 0.5rem gap + 80px bar
+   (CPU/Memory), badge + health marker (State) must fit on one line. */
+th.col-image { width: 15%; }
+th.col-state { width: 190px; }
+th.col-cpu { width: 175px; }
+th.col-mem { width: 200px; }
 th.actions-col { width: 120px; }
 td.name, td.image {
   overflow: hidden;
