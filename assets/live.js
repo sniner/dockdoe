@@ -152,6 +152,30 @@
     chart.setData(d);
   }
 
+  // --- Log timestamps ----------------------------------------------------------
+  //
+  // The server renders each log line's daemon timestamp as UTC inside a
+  // .log-ts span (data-ts = seconds-precision RFC 3339). Rewrite them to the
+  // browser's local time so they line up with the chart axes. The attribute is
+  // removed afterwards so a span is never converted twice.
+
+  function localizeLogTimestamps(root) {
+    if (!root || !root.querySelectorAll) return;
+    var spans = root.querySelectorAll(".log-ts[data-ts]");
+    for (var i = 0; i < spans.length; i++) {
+      var d = new Date(spans[i].getAttribute("data-ts"));
+      if (isNaN(d)) continue;
+      spans[i].textContent =
+        d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+        " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+      spans[i].removeAttribute("data-ts");
+    }
+  }
+
+  document.body.addEventListener("htmx:afterSwap", function (e) {
+    localizeLogTimestamps(e.target);
+  });
+
   // --- Error toast -----------------------------------------------------------
   //
   // htmx does not swap non-2xx responses, so a failed action (or logs/compose

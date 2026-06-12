@@ -316,6 +316,7 @@ h2 a.stack-link:hover { color: var(--accent); }
   word-break: break-word;
   color: #c9d1d9;
 }
+.logs .log-ts { color: var(--muted); }
 .muted { color: var(--muted); }
 
 #toast {

@@ -105,11 +105,13 @@ impl DockerHandle {
 
     /// Tail the last `lines` log lines (stdout + stderr) of a container.
     /// bollard de-multiplexes the Docker log stream, so each chunk's `Display`
-    /// is just the message text.
+    /// is just the message text. Each line carries the daemon's RFC 3339
+    /// timestamp prefix (`2026-06-12T10:15:30.123456789Z message`).
     pub async fn logs_tail(&self, id: &str, lines: u32) -> Result<String> {
         let options = LogsOptionsBuilder::new()
             .stdout(true)
             .stderr(true)
+            .timestamps(true)
             .tail(&lines.to_string())
             .build();
         let mut stream = self.docker.logs(id, Some(options));

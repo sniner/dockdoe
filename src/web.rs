@@ -216,12 +216,50 @@ async fn container_logs(
 ) -> Markup {
     match state.docker.logs_tail(&id, LOG_TAIL_LINES).await {
         Ok(text) if text.trim().is_empty() => html! { span.muted { "(no logs)" } },
-        Ok(text) => html! { (strip_ansi(&text)) },
+        Ok(text) => render_log_lines(&strip_ansi(&text)),
         Err(err) => {
             tracing::warn!(%id, %err, "fetching logs failed");
             html! { span.muted { "Could not read logs: " (err) } }
         }
     }
+}
+
+/// Render log lines with their daemon timestamp prefix as a styled span.
+/// `data-ts` carries the timestamp truncated to seconds (plain RFC 3339, no
+/// fractional part) so the browser can re-render it in local time; the span
+/// text is a UTC fallback for the brief moment before that happens.
+fn render_log_lines(text: &str) -> Markup {
+    html! {
+        @for line in text.lines() {
+            @if let Some((ts, msg)) = split_log_timestamp(line) {
+                span.log-ts data-ts=(format!("{}Z", &ts[..19])) {
+                    (ts[..19].replacen('T', " ", 1))
+                } " " (msg) "\n"
+            } @else {
+                (line) "\n"
+            }
+        }
+    }
+}
+
+/// Split a daemon-timestamped log line (`2026-06-12T10:15:30.123456789Z msg`)
+/// into timestamp and message. Returns `None` when the line doesn't carry the
+/// expected prefix (e.g. logs from a driver without timestamp support).
+fn split_log_timestamp(line: &str) -> Option<(&str, &str)> {
+    let (ts, msg) = line.split_once(' ')?;
+    let b = ts.as_bytes();
+    if b.len() < 20 || !ts.ends_with('Z') {
+        return None;
+    }
+    // "YYYY-MM-DDTHH:MM:SS" — digits with fixed separators. Checking every
+    // byte also guarantees the `ts[..19]` slice above lands on a char boundary.
+    let pattern_ok = b[..19].iter().enumerate().all(|(i, c)| match i {
+        4 | 7 => *c == b'-',
+        10 => *c == b'T',
+        13 | 16 => *c == b':',
+        _ => c.is_ascii_digit(),
+    });
+    pattern_ok.then_some((ts, msg))
 }
 
 /// Return a stack's compose file(s) as an HTML fragment for the compose panel.
@@ -1167,6 +1205,36 @@ mod tests {
         assert_eq!(strip_ansi("a\u{1b}[2Kb"), "ab");
         // A bare ESC without CSI doesn't eat following text.
         assert_eq!(strip_ansi("ok"), "ok");
+    }
+
+    #[test]
+    fn split_log_timestamp_extracts_daemon_prefix() {
+        // The daemon's nanosecond timestamp is recognised and split off.
+        assert_eq!(
+            split_log_timestamp("2026-06-12T10:15:30.123456789Z hello world"),
+            Some(("2026-06-12T10:15:30.123456789Z", "hello world"))
+        );
+        // Seconds-precision (no fractional part) works too.
+        assert_eq!(
+            split_log_timestamp("2026-06-12T10:15:30Z msg"),
+            Some(("2026-06-12T10:15:30Z", "msg"))
+        );
+        // Lines without the prefix are left alone.
+        assert_eq!(split_log_timestamp("plain log line"), None);
+        assert_eq!(split_log_timestamp(""), None);
+        // A first word that merely resembles a timestamp is rejected.
+        assert_eq!(split_log_timestamp("2026-06-12T10:15:30 msg"), None);
+        assert_eq!(split_log_timestamp("not-a-timestamp-atallZ msg"), None);
+    }
+
+    #[test]
+    fn render_log_lines_wraps_timestamps_in_spans() {
+        let html = render_log_lines("2026-06-12T10:15:30.5Z started\nplain line\n").into_string();
+        // Timestamp lands in a span with a seconds-precision data-ts…
+        assert!(html.contains(r#"<span class="log-ts" data-ts="2026-06-12T10:15:30Z">"#));
+        assert!(html.contains("2026-06-12 10:15:30</span> started\n"));
+        // …while prefix-less lines pass through untouched.
+        assert!(html.contains("plain line\n"));
     }
 
     #[test]
