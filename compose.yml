@@ -28,6 +28,10 @@ services:
     #   # whose Host header isn't listed here (DNS-rebinding guard).
     #   # localhost/127.0.0.1/::1 always work.
     #   DOCKDOE_ALLOWED_HOSTS: dockhost.lan
+    #   # Notify on container state changes via an Apprise endpoint. The target
+    #   # services (Discord, e-mail, …) are configured in Apprise; DockDoe just
+    #   # POSTs here. Unset = notifications off.
+    #   DOCKDOE_APPRISE_URL: https://apprise.example/notify/your-key
 
 volumes:
   dockdoe-data:

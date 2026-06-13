@@ -3,6 +3,18 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Notifications**: when `DOCKDOE_APPRISE_URL` is set, DockDoe POSTs a message to that
+  [Apprise](https://github.com/caronc/apprise-api) endpoint whenever a container's state settles
+  into a change — down (`failure`), unhealthy (`warning`), or recovered (`success`). DockDoe only
+  sends `{title, body, type}`; which services it reaches (Discord, e-mail, …) is configured in
+  Apprise, so no per-service setup or secrets live here. Unset disables notifications
+- **`DOCKDOE_NOTIFY_DELAY`** (`--notify-delay-secs`, default 30) sets how long a new state must
+  persist before it is reported, swallowing flapping such as restart loops and brief blips
+
 ## [0.3.0] — 2026-06-13
 
 ### Added

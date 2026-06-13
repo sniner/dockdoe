@@ -76,6 +76,8 @@ also reads from an environment variable; the flag wins when both are set.
 | `--trend-bucket-secs`     | `DOCKDOE_TREND_BUCKET_SECS`    | `60`             | Trend rollup window (min/max/median per bucket) |
 | `--trend-retention-secs`  | `DOCKDOE_TREND_RETENTION_SECS` | `2592000` (30 d) | How long trend rollups are kept                 |
 | `--allowed-hosts`         | `DOCKDOE_ALLOWED_HOSTS`        | *(unset)*        | Host-header allowlist, see below                |
+| `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
+| `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
 
 ### Request hardening
@@ -89,6 +91,25 @@ same-origin. For that, set `--allowed-hosts` (comma-separated, e.g.
 `dockhost.lan`): requests whose `Host` header matches neither the list nor a
 localhost form (`localhost`, `127.0.0.1`, `::1`) are rejected. Recommended
 whenever the UI is exposed beyond localhost.
+
+### Notifications
+
+Set `--apprise-url` / `DOCKDOE_APPRISE_URL` to an
+[Apprise](https://github.com/caronc/apprise-api) endpoint and DockDoe sends a
+message whenever a container's state settles into a change: down (`failure`),
+unhealthy (`warning`), or recovered (`success`). DockDoe only ever POSTs
+`{title, body, type}` to that one URL — which services it fans out to (Discord,
+e-mail, Telegram, …) is configured in Apprise, so no per-service setup or
+secrets live in DockDoe. Leave it unset to disable notifications entirely.
+
+Point it at a stateful config key, e.g. `https://apprise.example/notify/<key>`;
+the target services then live under that key in Apprise.
+
+To avoid alert storms from flapping, a new state must persist for
+`--notify-delay-secs` / `DOCKDOE_NOTIFY_DELAY` (default 30) before it is
+reported — a container that restarts and recovers within that window stays
+quiet. The state seen at startup is adopted as the baseline, so DockDoe doesn't
+fire a burst when it boots.
 
 ## Data model
 
