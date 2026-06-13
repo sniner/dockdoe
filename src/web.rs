@@ -803,6 +803,12 @@ fn shell(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "DockDoe" }
+                // Two favicon variants picked by the browser's tab-bar theme:
+                // the dark mark for light chrome, the white one for dark.
+                link rel="icon" type="image/svg+xml" href="/assets/dockdoe.svg"
+                    media="(prefers-color-scheme: light)";
+                link rel="icon" type="image/svg+xml" href="/assets/dockdoe-white.svg"
+                    media="(prefers-color-scheme: dark)";
                 link rel="stylesheet" href="/assets/vendor/uPlot.min.css";
                 link rel="stylesheet" href="/assets/dockdoe.css";
             }
@@ -810,7 +816,7 @@ fn shell(
                 header.host id="host-header" {
                     @match snapshot {
                         Some(d) => (host_header_inner(d)),
-                        None => a.brand href="/" { "Dock" span { "Doe" } },
+                        None => (brand()),
                     }
                 }
                 main { (main_content) }
@@ -1049,11 +1055,23 @@ fn fact(label: &str, value: &str) -> Markup {
     }
 }
 
+/// The brand mark in the header: the app icon followed by the wordmark. The
+/// white icon variant is used because the UI is dark-themed throughout. `alt`
+/// is empty — the adjacent "DockDoe" text already names the link.
+fn brand() -> Markup {
+    html! {
+        a.brand href="/" {
+            img.brand-icon src="/assets/dockdoe-white.svg" alt="";
+            span.brand-name { "Dock" span { "Doe" } }
+        }
+    }
+}
+
 /// The inner content of the host header (everything HTMX swaps on each update).
 fn host_header_inner(dash: &Dashboard) -> Markup {
     let host = &dash.host;
     html! {
-        a.brand href="/" { "Dock" span { "Doe" } }
+        (brand())
         (metric("CPU", &format!("{:.1}%", host.cpu_percent)))
         (metric(
             "Load 1/5/15",

@@ -37,11 +37,19 @@ header.host {
 }
 
 header.host .brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   font-weight: 700;
   font-size: 1.1rem;
   letter-spacing: 0.02em;
 }
-header.host .brand span { color: var(--accent); }
+header.host .brand-icon {
+  display: block;
+  height: 1.6rem;
+  width: auto;
+}
+header.host .brand-name span { color: var(--accent); }
 
 .metric {
   display: flex;

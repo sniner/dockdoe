@@ -3,6 +3,14 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [0.4.1] — 2026-06-13
+
+### Added
+
+- **Web UI**: the app icon now sits at the left of the header bar, before the DockDoe wordmark,
+  and a matching favicon appears in the browser tab — both come in a light and a white variant
+  that the browser picks by its colour-scheme theme
+
 ## [0.4.0] — 2026-06-13
 
 ### Added
