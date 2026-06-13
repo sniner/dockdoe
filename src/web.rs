@@ -14,6 +14,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -21,13 +22,14 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Form, Json, Router};
-use futures_util::{Stream, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use maud::{DOCTYPE, Markup, html};
 use rust_embed::RustEmbed;
+use tokio::io::AsyncWriteExt;
 
 use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
-use crate::docker::{Action, DockerHandle};
+use crate::docker::{Action, DockerHandle, ExecSession};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
 use crate::store::{HistoryPoint, MetricPoint, Store};
 
@@ -84,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", get(logout))
+        .route("/ws/container/{id}/exec", get(ws_exec))
         .route("/assets/{*path}", get(asset))
         // Auth wraps everything (it allowlists /login and /assets internally);
         // the host check sits outside it so rejected hosts never reach auth.
@@ -433,6 +436,93 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
     }
 }
 
+/// Query for the exec WebSocket: the command to run (defaults to `/bin/sh`).
+#[derive(serde::Deserialize)]
+struct ExecQuery {
+    cmd: Option<String>,
+}
+
+/// A terminal resize message from the client.
+#[derive(serde::Deserialize)]
+struct ResizeMsg {
+    cols: u16,
+    rows: u16,
+}
+
+/// WebSocket endpoint backing the container terminal. Authentication (when on)
+/// is already enforced by the middleware on the upgrade request, which carries
+/// the session cookie. Binary frames are stdin, text frames are resize JSON.
+async fn ws_exec(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<ExecQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let cmd = q.cmd.unwrap_or_default();
+    let docker = state.docker.clone();
+    ws.on_upgrade(move |socket| exec_bridge(socket, docker, id, cmd))
+}
+
+/// Bridge a WebSocket to a container exec session: engine output → client
+/// (binary), client input → engine stdin (binary), client resize JSON →
+/// `resize_exec` (text). Ends — closing the exec — as soon as either side does.
+async fn exec_bridge(mut socket: WebSocket, docker: DockerHandle, id: String, cmd: String) {
+    let session = match docker.exec_start(&id, &cmd).await {
+        Ok(session) => session,
+        Err(err) => {
+            // Surface the failure in the terminal itself, then close.
+            let msg = format!("\r\n\x1b[31mfailed to start terminal: {err}\x1b[0m\r\n");
+            let _ = socket.send(Message::Text(msg.into())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    let ExecSession {
+        exec_id,
+        mut output,
+        mut input,
+    } = session;
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Engine → client.
+    let to_client = async {
+        while let Some(chunk) = output.next().await {
+            let Ok(out) = chunk else { break };
+            if ws_tx.send(Message::Binary(out.into_bytes())).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // Client → engine (stdin) and resize control.
+    let from_client = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            match msg {
+                Message::Binary(bytes) => {
+                    if input.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                    let _ = input.flush().await;
+                }
+                Message::Text(text) => {
+                    if let Ok(r) = serde_json::from_str::<ResizeMsg>(text.as_str()) {
+                        let _ = docker.exec_resize(&exec_id, r.cols, r.rows).await;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    };
+
+    // Whichever side ends first tears down the other (dropping `input` ends the
+    // exec, closing the socket ends the browser session).
+    tokio::select! {
+        () = to_client => {},
+        () = from_client => {},
+    }
+}
+
 /// Clear the session cookie and return to the login page.
 async fn logout(State(state): State<AppState>) -> Response {
     let mut resp = Redirect::to("/login").into_response();
@@ -668,6 +758,7 @@ async fn container_detail(
             "/events",
             "/api/metrics/host",
             state.auth.is_some(),
+            false,
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     };
@@ -686,6 +777,7 @@ async fn container_detail(
         &live_url,
         &backfill_url,
         state.auth.is_some(),
+        true,
     )
     .into_response()
 }
@@ -715,6 +807,7 @@ async fn stack_detail(
             "/events",
             "/api/metrics/host",
             state.auth.is_some(),
+            false,
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     }
@@ -738,6 +831,7 @@ async fn stack_detail(
         &live_url,
         &backfill_url,
         state.auth.is_some(),
+        false,
     )
     .into_response()
 }
@@ -928,6 +1022,7 @@ fn shell(
     live_url: &str,
     backfill_url: &str,
     auth_enabled: bool,
+    terminal: bool,
 ) -> Markup {
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     // The history endpoints mirror the backfill endpoints by design — same
@@ -948,6 +1043,9 @@ fn shell(
                 link rel="icon" type="image/svg+xml" href="/assets/dockdoe-white.svg"
                     media="(prefers-color-scheme: dark)";
                 link rel="stylesheet" href="/assets/vendor/uPlot.min.css";
+                @if terminal {
+                    link rel="stylesheet" href="/assets/vendor/xterm.css";
+                }
                 link rel="stylesheet" href="/assets/dockdoe.css";
             }
             body {
@@ -998,6 +1096,11 @@ fn shell(
                 script src="/assets/vendor/uPlot.iife.min.js" {}
                 script src="/assets/live.js" {}
                 script src="/assets/history.js" {}
+                @if terminal {
+                    script src="/assets/vendor/xterm.js" {}
+                    script src="/assets/vendor/addon-fit.js" {}
+                    script src="/assets/terminal.js" {}
+                }
             }
         }
     }
@@ -1025,6 +1128,7 @@ fn dashboard_page(
         "/events",
         "/api/metrics/host",
         auth_enabled,
+        false,
     )
 }
 
@@ -1118,6 +1222,36 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
             pre.logs id="logs"
                 hx-get=(format!("/api/container/{}/logs", c.id))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
+        }
+        (terminal_panel(c))
+    }
+}
+
+/// The interactive terminal panel. Connects lazily (a shell is a real process,
+/// so we don't spawn one on every page view) and only for running containers;
+/// `terminal.js` opens the WebSocket on "Connect". The `⛶` button toggles a
+/// fullscreen class on the panel. Stopped containers get a disabled note.
+fn terminal_panel(c: &ContainerMetrics) -> Markup {
+    let running = c.state == ContainerState::Running;
+    html! {
+        section.panel.terminal id="terminal" data-ws=(format!("/ws/container/{}/exec", c.id)) {
+            div.panel-head {
+                h3 { "Terminal" }
+                @if running {
+                    div.term-controls {
+                        input.term-cmd type="text" value="/bin/sh"
+                            aria-label="Command" spellcheck="false" autocapitalize="off";
+                        button.term-connect type="button" { "Connect" }
+                        button.term-fs type="button" title="Toggle fullscreen"
+                            aria-label="Toggle fullscreen" { "⛶" }
+                    }
+                }
+            }
+            @if running {
+                div.term-view id="term-view" {}
+            } @else {
+                p.empty { "Container is not running." }
+            }
         }
     }
 }

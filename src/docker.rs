@@ -8,10 +8,14 @@
 //! one collection interval.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bollard::Docker;
+use bollard::container::LogOutput;
+use bollard::errors::Error as BollardError;
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
     ContainerCpuStats, ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum,
     HealthStatusEnum, PortSummaryTypeEnum,
@@ -20,11 +24,21 @@ use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
     StatsOptionsBuilder,
 };
-use futures_util::StreamExt;
 use futures_util::future::join_all;
+use futures_util::{Stream, StreamExt};
+use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
 
 use crate::model::{ContainerMetrics, ContainerState, HealthState, Port};
+
+/// An attached interactive `exec` session: the engine's combined output stream
+/// (TTY merges stdout/stderr) and input sink, plus the exec id used to resize
+/// the pseudo-TTY.
+pub struct ExecSession {
+    pub exec_id: String,
+    pub output: Pin<Box<dyn Stream<Item = Result<LogOutput, BollardError>> + Send>>,
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+}
 
 /// A lifecycle action that can be applied to a container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +135,68 @@ impl DockerHandle {
             out.push_str(&log.to_string());
         }
         Ok(out)
+    }
+
+    /// Start an interactive TTY `exec` session running `cmd` inside the
+    /// container. Returns the exec id (needed to resize the pseudo-TTY) plus the
+    /// attached output stream and input sink, which the web layer bridges to a
+    /// WebSocket. `cmd` is split on whitespace into argv (so `bash -l` works);
+    /// an empty command falls back to `/bin/sh`.
+    pub async fn exec_start(&self, id: &str, cmd: &str) -> Result<ExecSession> {
+        let mut argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+        if argv.is_empty() {
+            argv.push("/bin/sh".to_string());
+        }
+        let created = self
+            .docker
+            .create_exec(
+                id,
+                CreateExecOptions {
+                    cmd: Some(argv),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("creating exec in {id}"))?;
+
+        let started = self
+            .docker
+            .start_exec(
+                &created.id,
+                Some(StartExecOptions {
+                    tty: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("starting exec")?;
+
+        match started {
+            StartExecResults::Attached { output, input } => Ok(ExecSession {
+                exec_id: created.id,
+                output,
+                input,
+            }),
+            StartExecResults::Detached => anyhow::bail!("exec started detached"),
+        }
+    }
+
+    /// Resize an exec session's pseudo-TTY to `cols`×`rows` characters.
+    pub async fn exec_resize(&self, exec_id: &str, cols: u16, rows: u16) -> Result<()> {
+        self.docker
+            .resize_exec(
+                exec_id,
+                ResizeExecOptions {
+                    width: cols,
+                    height: rows,
+                },
+            )
+            .await
+            .context("resizing exec")
     }
 
     /// Apply an action to a whole compose stack, honouring the dependency order

@@ -9,7 +9,7 @@ description = "A single-binary Docker host monitor with an embedded web UI"
 
 [dependencies]
 anyhow = "1.0.102"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 bollard = "0.21.0"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 futures-util = "0.3.32"

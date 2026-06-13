@@ -12,6 +12,10 @@ All notable, user-facing changes to DockDoe. The format is based on
   a successful login sets a signed, stateless session cookie that survives restarts and upgrades, so
   you stay logged in, with a logout link in the header. Set `DOCKDOE_COOKIE_SECURE=true` behind a
   TLS proxy. Both unset keeps the UI open as before
+- **Container terminal**: each running container's detail page has a Terminal panel that opens an
+  interactive shell (`docker exec`, `/bin/sh` by default) inside the container over a WebSocket,
+  with a fullscreen toggle. It connects on demand and is gated by authentication when that is on.
+  Behind a reverse proxy, the WebSocket upgrade must be allowed (see the README)
 
 ### Fixed
 

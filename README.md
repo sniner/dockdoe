@@ -114,6 +114,29 @@ Behind a TLS-terminating reverse proxy, also set `--cookie-secure` /
 off for plain-http access on a trusted LAN, where it would otherwise stop the
 cookie from being sent at all.
 
+### Terminal
+
+Each running container's detail page has a **Terminal** panel: click *Connect* to
+open an interactive shell (`docker exec`) inside the container. The command
+defaults to `/bin/sh`; change it to e.g. `bash` for images that ship it. The `⛶`
+button toggles fullscreen. The session opens only on demand and ends when you
+disconnect or leave the page. Put the UI behind [authentication](#authentication)
+before exposing it — this is a real shell into your containers.
+
+The terminal uses a **WebSocket**. Direct access needs nothing extra, but behind
+a reverse proxy you must allow the WebSocket upgrade for it to work. For example,
+in Nginx Proxy Manager tick *Websockets Support* on the proxy host; in a plain
+nginx config, forward the upgrade headers:
+
+```nginx
+location / {
+    proxy_pass http://dockdoe:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
 ### Notifications
 
 Set `--apprise-url` / `DOCKDOE_APPRISE_URL` to an
