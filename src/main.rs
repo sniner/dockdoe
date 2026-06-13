@@ -11,6 +11,7 @@ mod collector;
 mod docker;
 mod host;
 mod model;
+mod notify;
 mod store;
 mod trend;
 mod web;
@@ -27,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 use crate::collector::Config;
 use crate::docker::{DockerClient, DockerHandle};
 use crate::host::HostSampler;
+use crate::notify::Notifier;
 use crate::store::Store;
 
 /// DockDoe — a single-binary Docker host monitor with an embedded web UI.
@@ -70,6 +72,17 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_ALLOWED_HOSTS", value_delimiter = ',')]
     allowed_hosts: Vec<String>,
 
+    /// Apprise endpoint to POST container state-change notifications to, e.g.
+    /// "https://apprise.example/notify/<key>". Unset disables notifications
+    /// entirely. The target services are configured in Apprise, not here.
+    #[arg(long, env = "DOCKDOE_APPRISE_URL")]
+    apprise_url: Option<String>,
+
+    /// How long a container's new state must persist before it is notified
+    /// about, in seconds. Swallows flapping (restart loops, brief blips).
+    #[arg(long, env = "DOCKDOE_NOTIFY_DELAY", default_value_t = 30)]
+    notify_delay_secs: u64,
+
     /// Tracing filter, e.g. "info" or "dockdoe=debug".
     #[arg(long, env = "DOCKDOE_LOG", default_value = "info")]
     log: String,
@@ -100,12 +113,21 @@ async fn main() -> Result<()> {
     // can show before the live stream takes over.
     let seed_window = config.raw_retention;
 
+    let notifier = cli.apprise_url.map(|url| {
+        info!(
+            delay_secs = cli.notify_delay_secs,
+            "Apprise notifications enabled"
+        );
+        Notifier::new(url, Duration::from_secs(cli.notify_delay_secs))
+    });
+
     tokio::spawn(collector::run(
         docker,
         host,
         store.clone(),
         config,
         Arc::clone(&shared),
+        notifier,
     ));
 
     let allowed_hosts = web::normalize_allowed_hosts(&cli.allowed_hosts);

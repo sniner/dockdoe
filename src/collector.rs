@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::docker::DockerClient;
 use crate::host::HostSampler;
 use crate::model::Dashboard;
+use crate::notify::Notifier;
 use crate::store::Store;
 use crate::trend::Bucketer;
 
@@ -40,6 +41,7 @@ pub async fn run(
     store: Store,
     config: Config,
     shared: SharedDashboard,
+    mut notifier: Option<Notifier>,
 ) {
     info!(
         interval = ?config.interval,
@@ -77,6 +79,14 @@ pub async fn run(
         }
 
         let ts_ms = now_unix_ms();
+
+        // Check for container state changes worth notifying about. Runs only on
+        // real cycles (the priming cycle above already `continue`d), so the
+        // notifier's first sighting is a genuine baseline, not a startup flood.
+        if let Some(n) = notifier.as_mut() {
+            n.observe(ts_ms, &containers);
+        }
+
         let flushed = bucketer.push(ts_ms, &host_metrics, &containers);
         if !flushed.is_empty() {
             debug!(
