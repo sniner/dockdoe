@@ -222,6 +222,29 @@ a.port-pill:hover { background: rgba(79,156,249,0.3); }
   margin-left: auto;
 }
 .chart-card .u-legend { display: none; }
+/* Dual-line chart legend: a coloured key per series — rx/read blue (the line
+   colour), tx/write green — so the two lines are tellable apart at a glance. */
+.chart-card .chart-legend {
+  display: inline-flex;
+  gap: 0.6rem;
+  font-size: 0.65rem;
+  color: var(--muted);
+}
+.chart-card .chart-legend .k {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.chart-card .chart-legend .k::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+}
+.chart-card .chart-legend .in::before { background: var(--accent); }
+.chart-card .chart-legend .out::before { background: var(--ok); }
 .chart-zoom {
   cursor: pointer;
   border: none;

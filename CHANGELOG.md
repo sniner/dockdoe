@@ -11,6 +11,11 @@ All notable, user-facing changes to DockDoe. The format is based on
   after the state badge — published ones as blue links that open `http://<host>:<port>` in a new
   tab, internal-only ones as muted pills. The dashboard and stack tables show the first two
   published ports under the state badge, collapsing any remainder into a `+N` chip
+- **Network & disk I/O charts**: container and stack detail pages now show a Network chart (rx/tx)
+  and a Disk I/O chart (read/write) alongside CPU and memory, as live byte-per-second rates
+  derived from the Docker stats counters. Stack charts sum the rates across the stack's members.
+  These charts are live-only for now (no history overlay), but the underlying trends are recorded
+  so a history view can be added later without a data gap
 
 ## [0.4.1] — 2026-06-13
 

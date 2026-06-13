@@ -98,11 +98,64 @@
   var memFmt = function (v) {
     return v >= 1024 ? (v / 1024).toFixed(1) + "G" : v.toFixed(0) + "M";
   };
+  // Bytes/second, for the network and disk-I/O charts.
+  var rateFmt = function (v) {
+    if (v == null) return "--";
+    if (v >= 1048576) return (v / 1048576).toFixed(1) + " MB/s";
+    if (v >= 1024) return (v / 1024).toFixed(1) + " KB/s";
+    return Math.round(v) + " B/s";
+  };
+
+  var strokeOut = "#3fb950"; // tx / write line (green); rx / read reuses `stroke`
+
+  // A dual-line chart (rx+tx, or read+write). Unlike the CPU/memory charts
+  // these are live-only: no drag-to-history hook, since the I/O metrics have no
+  // history overlay yet. The hovered values surface in the card's readout row,
+  // labelled to match the static legend.
+  function ioChartOpts(el, readout, inLabel, outLabel) {
+    return {
+      width: el.clientWidth || 320,
+      height: 110,
+      cursor: { y: false },
+      legend: { show: false },
+      scales: { x: { time: true } },
+      series: [
+        {},
+        { stroke: stroke, width: 1.5 },
+        { stroke: strokeOut, width: 1.5 },
+      ],
+      axes: [
+        Object.assign({}, axisStyle, { size: 30, values: timeFmt }),
+        Object.assign({}, axisStyle, {
+          size: 62, // room for "1.5 MB/s"
+          values: function (u, vals) { return vals.map(rateFmt); },
+        }),
+      ],
+      hooks: {
+        setCursor: [function (u) {
+          if (!readout) return;
+          var i = u.cursor.idx;
+          if (i == null || u.data[0][i] == null) {
+            readout.textContent = "";
+            return;
+          }
+          readout.textContent =
+            timeStr(u.data[0][i]) + " · " +
+            inLabel + " " + rateFmt(u.data[1][i]) + " · " +
+            outLabel + " " + rateFmt(u.data[2][i]);
+        }],
+      },
+    };
+  }
 
   var cpuEl = document.getElementById("chart-cpu");
   var memEl = document.getElementById("chart-mem");
+  var netEl = document.getElementById("chart-net");
+  var diskEl = document.getElementById("chart-disk");
   var cpuChart = null;
   var memChart = null;
+  var netChart = null;
+  var diskChart = null;
 
   // A straight line between two points that are minutes apart pretends there
   // was data where there was none (DockDoe restarted, host suspended, page
@@ -127,16 +180,25 @@
     var ts = [];
     var cpu = [];
     var mem = [];
+    // The I/O series share the timeline and gap handling, so they are seeded in
+    // the same pass. They stay empty on pages without the net/disk charts (the
+    // dashboard), where the seed carries no I/O fields anyway.
+    var netRx = [], netTx = [], diskRead = [], diskWrite = [];
     for (var i = 0; i < seed.length; i++) {
       var t = rawTs[i];
       if (ts.length && t - ts[ts.length - 1] > gapSecs) {
         ts.push(ts[ts.length - 1] + 1);
-        cpu.push(null);
-        mem.push(null);
+        cpu.push(null); mem.push(null);
+        netRx.push(null); netTx.push(null);
+        diskRead.push(null); diskWrite.push(null);
       }
       ts.push(t);
       cpu.push(seed[i].cpu_percent);
       mem.push(seed[i].mem_used != null ? seed[i].mem_used / 1048576 : null); // MiB
+      netRx.push(seed[i].net_rx != null ? seed[i].net_rx : null);
+      netTx.push(seed[i].net_tx != null ? seed[i].net_tx : null);
+      diskRead.push(seed[i].disk_read != null ? seed[i].disk_read : null);
+      diskWrite.push(seed[i].disk_write != null ? seed[i].disk_write : null);
     }
     cpuChart = new uPlot(
       chartOpts(cpuEl, "CPU", cpuFmt, document.getElementById("readout-cpu")),
@@ -144,10 +206,22 @@
     memChart = new uPlot(
       chartOpts(memEl, "Memory", memFmt, document.getElementById("readout-mem")),
       [ts.slice(), mem], memEl);
+    if (netEl) {
+      netChart = new uPlot(
+        ioChartOpts(netEl, document.getElementById("readout-net"), "rx", "tx"),
+        [ts.slice(), netRx, netTx], netEl);
+    }
+    if (diskEl) {
+      diskChart = new uPlot(
+        ioChartOpts(diskEl, document.getElementById("readout-disk"), "read", "write"),
+        [ts.slice(), diskRead, diskWrite], diskEl);
+    }
 
     window.addEventListener("resize", function () {
       cpuChart.setSize({ width: cpuEl.clientWidth, height: 110 });
       memChart.setSize({ width: memEl.clientWidth, height: 110 });
+      if (netChart) netChart.setSize({ width: netEl.clientWidth, height: 110 });
+      if (diskChart) diskChart.setSize({ width: diskEl.clientWidth, height: 110 });
     });
   }
 
@@ -165,6 +239,29 @@
     while (d[0].length > MAX_POINTS) {
       d[0].shift();
       d[1].shift();
+    }
+    chart.setData(d);
+  }
+
+  // Append one sample to a two-series (in/out) chart, with the same duplicate
+  // and gap handling as push().
+  function push2(chart, t, yIn, yOut) {
+    if (!chart) return;
+    var d = chart.data;
+    var n = d[0].length;
+    if (n && d[0][n - 1] === t) return;
+    if (n && t - d[0][n - 1] > gapSecs) {
+      d[0].push(d[0][n - 1] + 1);
+      d[1].push(null);
+      d[2].push(null);
+    }
+    d[0].push(t);
+    d[1].push(yIn);
+    d[2].push(yOut);
+    while (d[0].length > MAX_POINTS) {
+      d[0].shift();
+      d[1].shift();
+      d[2].shift();
     }
     chart.setData(d);
   }
@@ -283,6 +380,10 @@
     var t = Math.floor(p.ts_ms / 1000);
     push(cpuChart, t, p.cpu_percent);
     push(memChart, t, p.mem_used != null ? p.mem_used / 1048576 : null);
+    push2(netChart, t, p.net_rx != null ? p.net_rx : null, p.net_tx != null ? p.net_tx : null);
+    push2(diskChart, t,
+      p.disk_read != null ? p.disk_read : null,
+      p.disk_write != null ? p.disk_write : null);
   }
 
   var reconnectTimer = null;
@@ -332,6 +433,10 @@
           var t = Math.floor(p.ts_ms / 1000);
           push(cpuChart, t, p.cpu_percent);
           push(memChart, t, p.mem_used != null ? p.mem_used / 1048576 : null);
+          push2(netChart, t, p.net_rx != null ? p.net_rx : null, p.net_tx != null ? p.net_tx : null);
+          push2(diskChart, t,
+            p.disk_read != null ? p.disk_read : null,
+            p.disk_write != null ? p.disk_write : null);
         }
       })
       .catch(function () {}) // a failed backfill must not block going live

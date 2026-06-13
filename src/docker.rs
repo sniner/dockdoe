@@ -485,12 +485,27 @@ struct PrevCpu {
     system_usage: u64,
 }
 
-/// A client for the Docker engine that remembers prior CPU samples so it can
-/// turn cumulative counters into a percentage.
+/// The previous I/O counters for one container plus when they were read, so
+/// network and block-I/O rates can be derived from the byte deltas over the
+/// elapsed wall-clock time. Each counter is optional because the runtime may
+/// report some categories and not others (e.g. no block-I/O stats).
+#[derive(Debug, Clone, Copy)]
+struct PrevIo {
+    net_rx: Option<u64>,
+    net_tx: Option<u64>,
+    disk_read: Option<u64>,
+    disk_write: Option<u64>,
+    at: Instant,
+}
+
+/// A client for the Docker engine that remembers prior CPU and I/O samples so
+/// it can turn cumulative counters into rates.
 pub struct DockerClient {
     docker: Docker,
     /// Previous CPU counters keyed by container ID.
     prev_cpu: HashMap<String, PrevCpu>,
+    /// Previous network/block-I/O counters keyed by container ID.
+    prev_io: HashMap<String, PrevIo>,
 }
 
 impl DockerClient {
@@ -501,6 +516,7 @@ impl DockerClient {
         Ok(Self {
             docker,
             prev_cpu: HashMap::new(),
+            prev_io: HashMap::new(),
         })
     }
 
@@ -536,15 +552,19 @@ impl DockerClient {
             })
             .collect();
 
-        // Reap prev-CPU entries for containers that no longer exist so the map
-        // doesn't grow unbounded.
+        // Reap prev-sample entries for containers that no longer exist so the
+        // maps don't grow unbounded.
         let live: std::collections::HashSet<&str> =
             summaries.iter().filter_map(|s| s.id.as_deref()).collect();
         self.prev_cpu.retain(|id, _| live.contains(id.as_str()));
+        self.prev_io.retain(|id, _| live.contains(id.as_str()));
 
+        // One clock reading for the whole cycle: rates derive from the elapsed
+        // time since this container's previous sample.
+        let now = Instant::now();
         let mut out = Vec::with_capacity(summaries.len());
         for summary in &summaries {
-            out.push(self.build_metrics(summary, stats.get(id_of(summary))));
+            out.push(self.build_metrics(summary, stats.get(id_of(summary)), now));
         }
         Ok(out)
     }
@@ -569,6 +589,7 @@ impl DockerClient {
         &mut self,
         summary: &ContainerSummary,
         sample: Option<&ContainerStatsResponse>,
+        now: Instant,
     ) -> ContainerMetrics {
         let id = id_of(summary).to_string();
         let status = summary.status.clone().unwrap_or_default();
@@ -580,6 +601,10 @@ impl DockerClient {
                 (cpu, used, limit)
             }
             None => (None, None, None),
+        };
+        let io = match sample {
+            Some(sample) => self.io_rates(&id, sample, now),
+            None => IoRates::default(),
         };
 
         ContainerMetrics {
@@ -593,7 +618,44 @@ impl DockerClient {
             cpu_percent,
             mem_used,
             mem_limit,
+            net_rx_bps: io.net_rx,
+            net_tx_bps: io.net_tx,
+            disk_read_bps: io.disk_read,
+            disk_write_bps: io.disk_write,
             ports: ports(summary),
+        }
+    }
+
+    /// Network and block-I/O rates in bytes/second, derived from the byte
+    /// deltas against this container's previous sample over the elapsed time.
+    /// Returns all-`None` on the first sample (no baseline) or when no time has
+    /// passed. Each category is independent: a metric the runtime doesn't
+    /// report stays `None` without suppressing the others.
+    fn io_rates(&mut self, id: &str, stats: &ContainerStatsResponse, now: Instant) -> IoRates {
+        let (net_rx, net_tx) = network_totals(stats);
+        let (disk_read, disk_write) = blkio_totals(stats);
+        let prev = self.prev_io.insert(
+            id.to_string(),
+            PrevIo {
+                net_rx,
+                net_tx,
+                disk_read,
+                disk_write,
+                at: now,
+            },
+        );
+        let Some(prev) = prev else {
+            return IoRates::default();
+        };
+        let secs = now.saturating_duration_since(prev.at).as_secs_f64();
+        if secs <= 0.0 {
+            return IoRates::default();
+        }
+        IoRates {
+            net_rx: rate(net_rx, prev.net_rx, secs),
+            net_tx: rate(net_tx, prev.net_tx, secs),
+            disk_read: rate(disk_read, prev.disk_read, secs),
+            disk_write: rate(disk_write, prev.disk_write, secs),
         }
     }
 
@@ -680,6 +742,67 @@ fn memory(stats: &ContainerStatsResponse) -> (Option<u64>, Option<u64>) {
         usage.saturating_sub(cache)
     });
     (used, mem.limit)
+}
+
+/// Per-second I/O rates for one container, all in bytes/second.
+#[derive(Debug, Clone, Copy, Default)]
+struct IoRates {
+    net_rx: Option<f64>,
+    net_tx: Option<f64>,
+    disk_read: Option<f64>,
+    disk_write: Option<f64>,
+}
+
+/// A bytes/second rate from two cumulative counter readings `secs` apart, or
+/// `None` if either reading is missing. Counter regressions (e.g. the metric
+/// disappearing and reappearing) saturate to 0 rather than wrapping.
+#[allow(clippy::cast_precision_loss)] // byte counters; rate precision is moot
+fn rate(now: Option<u64>, prev: Option<u64>, secs: f64) -> Option<f64> {
+    let (now, prev) = (now?, prev?);
+    Some(now.saturating_sub(prev) as f64 / secs)
+}
+
+/// Total received and transmitted bytes across every network interface, or
+/// `None` when the runtime reports no network stats at all (e.g. a container
+/// sharing another's network namespace).
+fn network_totals(stats: &ContainerStatsResponse) -> (Option<u64>, Option<u64>) {
+    let Some(networks) = stats.networks.as_ref() else {
+        return (None, None);
+    };
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for net in networks.values() {
+        rx = rx.saturating_add(net.rx_bytes.unwrap_or(0));
+        tx = tx.saturating_add(net.tx_bytes.unwrap_or(0));
+    }
+    (Some(rx), Some(tx))
+}
+
+/// Total bytes read from and written to block devices, summed over devices, or
+/// `None` when the runtime reports no `io_service_bytes_recursive` (e.g.
+/// Windows containers, or some cgroup setups). The `op` label is matched
+/// case-insensitively because Docker has used both "Read"/"Write" and
+/// lowercase across versions.
+fn blkio_totals(stats: &ContainerStatsResponse) -> (Option<u64>, Option<u64>) {
+    let Some(entries) = stats
+        .blkio_stats
+        .as_ref()
+        .and_then(|b| b.io_service_bytes_recursive.as_ref())
+    else {
+        return (None, None);
+    };
+    let mut read = 0u64;
+    let mut write = 0u64;
+    for e in entries {
+        let Some(op) = e.op.as_deref() else { continue };
+        let value = e.value.unwrap_or(0);
+        if op.eq_ignore_ascii_case("read") {
+            read = read.saturating_add(value);
+        } else if op.eq_ignore_ascii_case("write") {
+            write = write.saturating_add(value);
+        }
+    }
+    (Some(read), Some(write))
 }
 
 /// Ports a container exposes, taken from its summary. Docker lists each
@@ -1012,5 +1135,71 @@ mod tests {
     #[test]
     fn ports_empty_when_none_reported() {
         assert!(ports(&ContainerSummary::default()).is_empty());
+    }
+
+    #[test]
+    fn rate_is_delta_over_seconds_and_none_without_both_readings() {
+        // 3000 bytes over 2 s → 1500 B/s.
+        assert_eq!(rate(Some(5_000), Some(2_000), 2.0), Some(1500.0));
+        // A counter regression saturates to 0 instead of wrapping.
+        assert_eq!(rate(Some(1_000), Some(5_000), 2.0), Some(0.0));
+        // Missing either reading → unknown.
+        assert_eq!(rate(None, Some(2_000), 2.0), None);
+        assert_eq!(rate(Some(5_000), None, 2.0), None);
+    }
+
+    #[test]
+    fn network_totals_sum_interfaces_or_none() {
+        use bollard::models::ContainerNetworkStats;
+        let net = |rx, tx| ContainerNetworkStats {
+            rx_bytes: Some(rx),
+            tx_bytes: Some(tx),
+            ..Default::default()
+        };
+        let stats = ContainerStatsResponse {
+            networks: Some(
+                [
+                    ("eth0".to_string(), net(100, 10)),
+                    ("eth1".to_string(), net(50, 5)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(network_totals(&stats), (Some(150), Some(15)));
+        // No networks reported at all → unknown, not zero.
+        assert_eq!(
+            network_totals(&ContainerStatsResponse::default()),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn blkio_totals_sum_read_write_case_insensitively() {
+        use bollard::models::{ContainerBlkioStatEntry, ContainerBlkioStats};
+        let entry = |op: &str, value| ContainerBlkioStatEntry {
+            op: Some(op.to_string()),
+            value: Some(value),
+            ..Default::default()
+        };
+        let stats = ContainerStatsResponse {
+            blkio_stats: Some(ContainerBlkioStats {
+                io_service_bytes_recursive: Some(vec![
+                    entry("Read", 100), // capitalised (older Docker)
+                    entry("read", 50),  // lowercase (newer)
+                    entry("write", 30),
+                    entry("Async", 999), // unrelated op is ignored
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(blkio_totals(&stats), (Some(150), Some(30)));
+        // No block-I/O stats → unknown.
+        assert_eq!(
+            blkio_totals(&ContainerStatsResponse::default()),
+            (None, None)
+        );
     }
 }

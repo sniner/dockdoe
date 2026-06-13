@@ -217,6 +217,10 @@ mod tests {
             cpu_percent: None,
             mem_used: None,
             mem_limit: None,
+            net_rx_bps: None,
+            net_tx_bps: None,
+            disk_read_bps: None,
+            disk_write_bps: None,
             ports: Vec::new(),
         }
     }

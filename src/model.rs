@@ -57,6 +57,16 @@ pub struct ContainerMetrics {
     pub mem_used: Option<u64>,
     /// Memory limit in bytes, if the container has one.
     pub mem_limit: Option<u64>,
+    /// Network receive rate in bytes/second, summed over all interfaces;
+    /// `None` until a second sample gives a delta to rate against.
+    pub net_rx_bps: Option<f64>,
+    /// Network transmit rate in bytes/second; `None` until the second sample.
+    pub net_tx_bps: Option<f64>,
+    /// Block-device read rate in bytes/second; `None` until the second sample
+    /// (or when the runtime reports no block-I/O stats).
+    pub disk_read_bps: Option<f64>,
+    /// Block-device write rate in bytes/second; `None` until the second sample.
+    pub disk_write_bps: Option<f64>,
     /// Network ports the container exposes (published first, then internal),
     /// de-duplicated across host IP families.
     pub ports: Vec<Port>,

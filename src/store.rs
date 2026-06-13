@@ -23,11 +23,19 @@ use serde::Serialize;
 use crate::model::{ContainerMetrics, HostMetrics};
 
 /// Which metric a trend row describes. Stored as a short string so new metrics
-/// (network, block I/O) can be added without a schema change.
+/// can be added without a trend-schema change (the `metric` column is text).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Metric {
     Cpu,
     Mem,
+    /// Network receive rate, bytes/second.
+    NetRx,
+    /// Network transmit rate, bytes/second.
+    NetTx,
+    /// Block-device read rate, bytes/second.
+    DiskRead,
+    /// Block-device write rate, bytes/second.
+    DiskWrite,
 }
 
 impl Metric {
@@ -35,6 +43,10 @@ impl Metric {
         match self {
             Metric::Cpu => "cpu",
             Metric::Mem => "mem",
+            Metric::NetRx => "net_rx",
+            Metric::NetTx => "net_tx",
+            Metric::DiskRead => "disk_read",
+            Metric::DiskWrite => "disk_write",
         }
     }
 }
@@ -59,13 +71,19 @@ pub struct ContainerTrend {
     pub samples: u32,
 }
 
-/// One raw metric point (CPU%, memory) at a timestamp, used to seed the live
-/// charts on first page load. Shared by host and per-container series.
+/// One raw metric point at a timestamp, used to seed the live charts on first
+/// page load and streamed live over SSE. Shared by host and per-container
+/// series; the I/O rates are `None` for the host (which has no per-container
+/// I/O) and bytes/second elsewhere.
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricPoint {
     pub ts_ms: u64,
     pub cpu_percent: f64,
     pub mem_used: Option<u64>,
+    pub net_rx: Option<f64>,
+    pub net_tx: Option<f64>,
+    pub disk_read: Option<f64>,
+    pub disk_write: Option<f64>,
 }
 
 /// One bucket of the history view: median line plus min–max envelope for both
@@ -144,6 +162,16 @@ impl Store {
             .context("setting rollback journal mode")?;
         conn.execute_batch(MIGRATIONS)
             .context("running migrations")?;
+        // Columns added after the first release: present in the CREATE above for
+        // fresh databases, added here for ones created by an earlier build.
+        for (col, decl) in [
+            ("net_rx", "REAL"),
+            ("net_tx", "REAL"),
+            ("disk_read", "REAL"),
+            ("disk_write", "REAL"),
+        ] {
+            add_column_if_missing(&conn, "container_sample", col, decl)?;
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -185,8 +213,10 @@ impl Store {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO container_sample (ts_ms, id, name, cpu_percent, mem_used, mem_limit)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO container_sample
+                       (ts_ms, id, name, cpu_percent, mem_used, mem_limit,
+                        net_rx, net_tx, disk_read, disk_write)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
                 .context("prepare container insert")?;
             for c in containers {
@@ -197,6 +227,10 @@ impl Store {
                     c.cpu_percent,
                     c.mem_used.map(to_db),
                     c.mem_limit.map(to_db),
+                    c.net_rx_bps,
+                    c.net_tx_bps,
+                    c.disk_read_bps,
+                    c.disk_write_bps,
                 ])
                 .context("insert container sample")?;
             }
@@ -319,7 +353,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT ts_ms, cpu_percent, mem_used
+                "SELECT ts_ms, cpu_percent, mem_used, NULL, NULL, NULL, NULL
                  FROM host_sample WHERE ts_ms >= ?1 ORDER BY ts_ms ASC",
             )
             .context("prepare recent host query")?;
@@ -337,7 +371,7 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT ts_ms, cpu_percent, mem_used
+                "SELECT ts_ms, cpu_percent, mem_used, net_rx, net_tx, disk_read, disk_write
                  FROM container_sample WHERE id = ?1 AND ts_ms >= ?2 ORDER BY ts_ms ASC",
             )
             .context("prepare recent container query")?;
@@ -360,7 +394,11 @@ impl Store {
             .prepare_cached(
                 "SELECT bucket_start_ms,
                         SUM(CASE WHEN metric = 'cpu' THEN median ELSE 0 END) AS cpu,
-                        SUM(CASE WHEN metric = 'mem' THEN median ELSE 0 END) AS mem
+                        SUM(CASE WHEN metric = 'mem' THEN median ELSE 0 END) AS mem,
+                        SUM(CASE WHEN metric = 'net_rx' THEN median END) AS net_rx,
+                        SUM(CASE WHEN metric = 'net_tx' THEN median END) AS net_tx,
+                        SUM(CASE WHEN metric = 'disk_read' THEN median END) AS disk_read,
+                        SUM(CASE WHEN metric = 'disk_write' THEN median END) AS disk_write
                  FROM container_trend
                  WHERE stack = ?1 AND bucket_start_ms >= ?2
                  GROUP BY bucket_start_ms
@@ -511,6 +549,27 @@ impl Store {
 /// counts, bucket widths) are always well within `i64` range, so we convert at
 /// the storage boundary. `saturating` rather than panicking keeps a freak value
 /// from taking down the collector.
+/// Add `column` to `table` if it isn't there yet, so databases from earlier
+/// builds gain columns introduced later. `ALTER TABLE ADD COLUMN` errors if the
+/// column already exists, so we check `table_info` first.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("reading columns of {table}"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .with_context(|| format!("adding column {column} to {table}"))?;
+    }
+    Ok(())
+}
+
 fn to_db(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
@@ -519,12 +578,17 @@ fn from_db(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-/// Map a `(ts_ms, cpu_percent, mem_used)` row to a [`MetricPoint`].
+/// Map a `(ts_ms, cpu_percent, mem_used, net_rx, net_tx, disk_read, disk_write)`
+/// row to a [`MetricPoint`]. The I/O columns are `NULL` for host samples.
 fn row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
     Ok(MetricPoint {
         ts_ms: from_db(r.get::<_, i64>(0)?),
         cpu_percent: r.get(1)?,
         mem_used: r.get::<_, Option<i64>>(2)?.map(from_db),
+        net_rx: r.get(3)?,
+        net_tx: r.get(4)?,
+        disk_read: r.get(5)?,
+        disk_write: r.get(6)?,
     })
 }
 
@@ -538,6 +602,10 @@ fn trend_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
         ts_ms: from_db(r.get::<_, i64>(0)?),
         cpu_percent: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
         mem_used: mem.map(|m| m.round().max(0.0) as u64),
+        net_rx: r.get(3)?,
+        net_tx: r.get(4)?,
+        disk_read: r.get(5)?,
+        disk_write: r.get(6)?,
     })
 }
 
@@ -574,7 +642,11 @@ CREATE TABLE IF NOT EXISTS container_sample (
     name        TEXT    NOT NULL,
     cpu_percent REAL,
     mem_used    INTEGER,
-    mem_limit   INTEGER
+    mem_limit   INTEGER,
+    net_rx      REAL,
+    net_tx      REAL,
+    disk_read   REAL,
+    disk_write  REAL
 );
 CREATE INDEX IF NOT EXISTS container_sample_id_ts ON container_sample(id, ts_ms);
 
@@ -636,6 +708,10 @@ mod tests {
             cpu_percent: cpu,
             mem_used: Some(123),
             mem_limit: Some(456),
+            net_rx_bps: Some(10.0),
+            net_tx_bps: Some(20.0),
+            disk_read_bps: Some(30.0),
+            disk_write_bps: Some(40.0),
             ports: Vec::new(),
         }
     }
@@ -663,6 +739,29 @@ mod tests {
         assert_eq!(removed, 1 + 2);
         assert_eq!(store.count("host_sample").unwrap(), 1);
         assert_eq!(store.count("container_sample").unwrap(), 2);
+    }
+
+    #[test]
+    fn container_samples_roundtrip_io_rates() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_samples(
+                1_000,
+                &host_sample(10.0),
+                &[container_sample("a", Some(1.0))],
+            )
+            .unwrap();
+        let points = store.recent_container_samples("a", 0).unwrap();
+        assert_eq!(points.len(), 1);
+        let p = &points[0];
+        assert_eq!(p.net_rx, Some(10.0));
+        assert_eq!(p.net_tx, Some(20.0));
+        assert_eq!(p.disk_read, Some(30.0));
+        assert_eq!(p.disk_write, Some(40.0));
+        // Host samples carry no per-container I/O.
+        let host = store.recent_host_samples(0).unwrap();
+        assert_eq!(host[0].net_rx, None);
+        assert_eq!(host[0].disk_write, None);
     }
 
     #[test]
@@ -724,6 +823,9 @@ mod tests {
                 ct(60_000, "a", "web", Metric::Mem.as_str(), 150.0),
                 ct(60_000, "b", "web", Metric::Cpu.as_str(), 3.0),
                 ct(60_000, "b", "web", Metric::Mem.as_str(), 250.0),
+                // network rates pivot and sum like cpu/mem: rx 5+15=20
+                ct(0, "a", "web", Metric::NetRx.as_str(), 5.0),
+                ct(0, "b", "web", Metric::NetRx.as_str(), 15.0),
                 // a different stack must not leak into the sum
                 ct(0, "c", "db", Metric::Cpu.as_str(), 99.0),
             ])
@@ -734,6 +836,11 @@ mod tests {
         assert_eq!(points[0].ts_ms, 0);
         assert!((points[0].cpu_percent - 10.0).abs() < 1e-9);
         assert_eq!(points[0].mem_used, Some(300));
+        assert_eq!(points[0].net_rx, Some(20.0));
+        // No disk trends inserted → the pivot yields NULL → None.
+        assert_eq!(points[0].disk_read, None);
+        // Second bucket has no network rows at all.
+        assert_eq!(points[1].net_rx, None);
         assert_eq!(points[1].ts_ms, 60_000);
         assert!((points[1].cpu_percent - 5.0).abs() < 1e-9);
         assert_eq!(points[1].mem_used, Some(400));

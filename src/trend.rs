@@ -89,6 +89,18 @@ impl Bucketer {
             if let Some(mem) = c.mem_used {
                 self.acc(c, Metric::Mem).push(mem as f64);
             }
+            if let Some(rx) = c.net_rx_bps {
+                self.acc(c, Metric::NetRx).push(rx);
+            }
+            if let Some(tx) = c.net_tx_bps {
+                self.acc(c, Metric::NetTx).push(tx);
+            }
+            if let Some(read) = c.disk_read_bps {
+                self.acc(c, Metric::DiskRead).push(read);
+            }
+            if let Some(write) = c.disk_write_bps {
+                self.acc(c, Metric::DiskWrite).push(write);
+            }
         }
 
         flushed
@@ -216,6 +228,10 @@ mod tests {
             cpu_percent: cpu,
             mem_used: Some(100),
             mem_limit: Some(200),
+            net_rx_bps: None,
+            net_tx_bps: None,
+            disk_read_bps: None,
+            disk_write_bps: None,
             ports: Vec::new(),
         }
     }

@@ -661,6 +661,11 @@ async fn events_dashboard(
             ts_ms: dash.generated_at_unix_ms,
             cpu_percent: f64::from(dash.host.cpu_percent),
             mem_used: Some(dash.host.mem_used),
+            // The host series has no per-container I/O.
+            net_rx: None,
+            net_tx: None,
+            disk_read: None,
+            disk_write: None,
         };
         futures_util::stream::iter([
             Ok(header_event(&dash)),
@@ -685,6 +690,10 @@ async fn events_container(
                 ts_ms: dash.generated_at_unix_ms,
                 cpu_percent: c.cpu_percent.unwrap_or(0.0),
                 mem_used: c.mem_used,
+                net_rx: c.net_rx_bps,
+                net_tx: c.net_tx_bps,
+                disk_read: c.disk_read_bps,
+                disk_write: c.disk_write_bps,
             })));
         }
         futures_util::stream::iter(events)
@@ -706,9 +715,11 @@ async fn events_stack(
             .collect();
         let mut cpu = 0.0;
         let mut mem = 0u64;
+        let mut io = StackIo::default();
         for c in &members {
             cpu += c.cpu_percent.unwrap_or(0.0);
             mem += c.mem_used.unwrap_or(0);
+            io.add(c);
         }
         let members_event = Event::default()
             .event("containers")
@@ -720,6 +731,10 @@ async fn events_stack(
                 ts_ms: dash.generated_at_unix_ms,
                 cpu_percent: cpu,
                 mem_used: Some(mem),
+                net_rx: io.net_rx,
+                net_tx: io.net_tx,
+                disk_read: io.disk_read,
+                disk_write: io.disk_write,
             })),
         ])
     });
@@ -745,6 +760,33 @@ fn containers_event(dash: &Dashboard) -> Event {
     Event::default()
         .event("containers")
         .data(container_section(&dash.containers, dash.host.cpu_count).into_string())
+}
+
+/// Accumulates a stack's per-second I/O rates across its members. A category
+/// stays `None` until at least one member reports it, then sums it (members
+/// without that category contribute nothing) — mirroring the trend-based seed,
+/// where `SUM` over all-NULL is NULL but any value makes it that sum.
+#[derive(Default)]
+struct StackIo {
+    net_rx: Option<f64>,
+    net_tx: Option<f64>,
+    disk_read: Option<f64>,
+    disk_write: Option<f64>,
+}
+
+impl StackIo {
+    fn add(&mut self, c: &ContainerMetrics) {
+        add_opt(&mut self.net_rx, c.net_rx_bps);
+        add_opt(&mut self.net_tx, c.net_tx_bps);
+        add_opt(&mut self.disk_read, c.disk_read_bps);
+        add_opt(&mut self.disk_write, c.disk_write_bps);
+    }
+}
+
+fn add_opt(acc: &mut Option<f64>, v: Option<f64>) {
+    if let Some(v) = v {
+        *acc = Some(acc.unwrap_or(0.0) + v);
+    }
 }
 
 /// The `metrics` event: a metric point as JSON.
@@ -907,6 +949,37 @@ fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
     }
 }
 
+/// Network and disk-I/O charts: two dual-line cards (rx/read in blue,
+/// tx/write in green), fed by `live.js` from the same SSE point stream as the
+/// CPU/memory charts. Deliberately live-only — no history-expand button yet, so
+/// the underlying I/O trends accumulate for a future history view without one.
+fn io_charts_section() -> Markup {
+    html! {
+        section.charts {
+            (io_chart_card("Network", "net", "rx", "tx"))
+            (io_chart_card("Disk I/O", "disk", "read", "write"))
+        }
+    }
+}
+
+/// One dual-line I/O chart card: a title, a two-key colour legend, a hover
+/// readout, and the uPlot mount point (`chart-net` / `chart-disk`).
+fn io_chart_card(title: &str, key: &str, in_label: &str, out_label: &str) -> Markup {
+    html! {
+        div.chart-card {
+            div.chart-head {
+                span.chart-title { (title) }
+                span.chart-legend {
+                    span.k.in { (in_label) }
+                    span.k.out { (out_label) }
+                }
+                span.chart-readout id=(format!("readout-{key}")) {}
+            }
+            div id=(format!("chart-{key}")) {}
+        }
+    }
+}
+
 /// Body of a single-container detail page.
 fn container_detail_main(c: &ContainerMetrics) -> Markup {
     html! {
@@ -924,6 +997,7 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
         // facts track reality. The charts below are left untouched.
         div id="detail-live" { (container_detail_live(c)) }
         (charts_section(&format!("{} · CPU", c.name), &format!("{} · Memory", c.name)))
+        (io_charts_section())
         section.panel {
             div.panel-head {
                 h3 { "Logs " span.count { "(last " (LOG_TAIL_LINES) " lines)" } }
@@ -1007,6 +1081,7 @@ fn stack_detail_main(name: &str, members: &[ContainerMetrics], cpu_count: usize)
             &format!("{name} · CPU (sum)"),
             &format!("{name} · Memory (sum)"),
         ))
+        (io_charts_section())
         // Live region: the `containers` SSE event swaps the member table so its
         // states/metrics track reality.
         div id="containers" { (stack_members_table(&members.iter().collect::<Vec<_>>(), cpu_count)) }
@@ -1652,6 +1727,10 @@ mod tests {
             cpu_percent: None,
             mem_used: None,
             mem_limit: None,
+            net_rx_bps: None,
+            net_tx_bps: None,
+            disk_read_bps: None,
+            disk_write_bps: None,
             ports: Vec::new(),
         };
         let containers = [
