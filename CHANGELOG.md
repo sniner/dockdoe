@@ -3,6 +3,14 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **arm64 image**: the published container image is now multi-arch — `linux/arm64` alongside
+  `linux/amd64` — so it runs on a 64-bit Raspberry Pi (3/4/5, Zero 2) and other ARM hosts. Docker
+  pulls the matching variant automatically
+
 ## [0.6.0] — 2026-06-13
 
 ### Added

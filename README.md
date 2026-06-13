@@ -34,8 +34,11 @@ host values out of the box — no `/proc` mount or `pid: host` needed.
 
 ### With Docker
 
-A prebuilt image is published to GHCR (`ghcr.io/sniner/dockdoe`). The simplest
-way to run it is the example [`compose.yml`](compose.yml):
+A prebuilt image is published to GHCR (`ghcr.io/sniner/dockdoe`), multi-arch for
+`linux/amd64` and `linux/arm64` — so it runs on a 64-bit Raspberry Pi (3/4/5,
+Zero 2) just as well as on a regular server; Docker picks the right variant
+automatically. The simplest way to run it is the example
+[`compose.yml`](compose.yml):
 
 ```sh
 docker compose up -d

@@ -13,14 +13,17 @@ WORKDIR /src
 COPY . .
 
 # The alpine toolchain targets musl with crt-static by default → static binary.
-RUN cargo build --release --target x86_64-unknown-linux-musl \
-    && strip target/x86_64-unknown-linux-musl/release/dockdoe \
+# No explicit --target, so this builds for whatever arch the image is (amd64
+# natively, arm64 under buildx/QEMU emulation) — the binary lands in the default
+# target dir either way.
+RUN cargo build --release \
+    && strip target/release/dockdoe \
     && mkdir -p /out/data
 
 # --- Runtime: scratch (nothing but the static binary) ------------------------
 FROM scratch
 
-COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/dockdoe /dockdoe
+COPY --from=builder /src/target/release/dockdoe /dockdoe
 # Pre-create the data dir so the volume mountpoint exists even on scratch.
 COPY --from=builder /out/data /data
 
