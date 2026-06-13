@@ -3,6 +3,19 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **aarch64 release binary**: each release now also ships a standalone static `aarch64-linux-musl`
+  binary alongside the `x86_64` one, for running directly on a 64-bit Raspberry Pi or other ARM
+  host without Docker
+
+### Changed
+
+- The release pipeline now cross-compiles the binaries and assembles the multi-arch image from
+  them, instead of building the arm64 image under QEMU emulation — same image, much faster builds
+
 ## [0.6.2] — 2026-06-13
 
 ### Fixed

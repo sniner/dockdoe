@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+
+# Release image: assembled from binaries cross-compiled in CI (see
+# .github/workflows/release.yml) — no compiler and no emulation, so the
+# multi-arch build is fast. For a self-contained build from source on the host's
+# own architecture, use the regular Dockerfile instead.
+
+FROM scratch
+
+# buildx sets TARGETARCH per platform: "amd64" for linux/amd64, "arm64" for
+# linux/arm64. The matching static binary is staged under binaries/<arch>/.
+ARG TARGETARCH
+COPY binaries/${TARGETARCH}/dockdoe /dockdoe
+
+# Pre-create the data dir so the volume mountpoint exists even on scratch.
+COPY data /data
+
+ENV DOCKDOE_BIND=0.0.0.0:8080 \
+    DOCKDOE_DB_PATH=/data/dockdoe.sqlite
+
+EXPOSE 8080
+VOLUME ["/data"]
+
+ENTRYPOINT ["/dockdoe"]

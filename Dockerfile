@@ -13,11 +13,14 @@ WORKDIR /src
 COPY . .
 
 # The alpine toolchain targets musl with crt-static by default → static binary.
-# No explicit --target, so this builds for whatever arch the image is (amd64
-# natively, arm64 under buildx/QEMU emulation) — the binary lands in the default
-# target dir either way.
+# No explicit --target, so this builds for whatever arch the image is — the
+# binary lands in the default target dir either way. The release profile strips
+# symbols, so no separate strip step is needed.
+#
+# This Dockerfile builds from source for the host's own architecture and is the
+# handy "docker build ." path. The published multi-arch image is assembled from
+# cross-compiled binaries instead (see Dockerfile.release + the release workflow).
 RUN cargo build --release \
-    && strip target/release/dockdoe \
     && mkdir -p /out/data
 
 # --- Runtime: scratch (nothing but the static binary) ------------------------
