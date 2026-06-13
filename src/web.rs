@@ -1429,7 +1429,7 @@ fn port_link(p: &Port, full: bool) -> Markup {
         a.port-pill data-port=(public) target="_blank" rel="noopener"
             href=(format!("http://localhost:{public}"))
             title=(format!("host {public} → container {}/{}", p.private, p.proto)) {
-            ":" (public)
+            (public)
             @if full { " → " (p.private) }
             (proto_suffix(&p.proto))
         }
@@ -1451,7 +1451,7 @@ fn overflow_list(rest: &[&Port]) -> String {
     rest.iter()
         .filter_map(|p| {
             p.public
-                .map(|public| format!(":{public}{}", proto_suffix(&p.proto)))
+                .map(|public| format!("{public}{}", proto_suffix(&p.proto)))
         })
         .collect::<Vec<_>>()
         .join("  ")
