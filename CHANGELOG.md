@@ -3,6 +3,14 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Fixed
+
+- **Drag-to-history on the I/O charts**: dragging a range on the small Network or Disk I/O charts now
+  opens the history overlay for that window, like the CPU and memory charts — instead of zooming the
+  chart's axes and snapping back on the next live update
+
 ## [0.6.1] — 2026-06-13
 
 ### Added

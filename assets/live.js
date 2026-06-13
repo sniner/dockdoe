@@ -113,10 +113,14 @@
   // history overlay yet. The hovered values surface in the card's readout row,
   // labelled to match the static legend.
   function ioChartOpts(el, readout, inLabel, outLabel) {
+    // Drag drills into history like the CPU/memory charts; without
+    // setScale:false uPlot would instead zoom the axes, only to be reset by the
+    // next SSE point. The drill metric ("net"/"disk") comes from the element id.
+    var metric = el.id === "chart-disk" ? "disk" : "net";
     return {
       width: el.clientWidth || 320,
       height: 110,
-      cursor: { y: false },
+      cursor: { y: false, drag: { x: true, y: false, setScale: false } },
       legend: { show: false },
       scales: { x: { time: true } },
       series: [
@@ -143,6 +147,16 @@
             timeStr(u.data[0][i]) + " · " +
             inLabel + " " + rateFmt(u.data[1][i]) + " · " +
             outLabel + " " + rateFmt(u.data[2][i]);
+        }],
+        // A completed drag selection drills into the history overlay.
+        setSelect: [function (u) {
+          if (u.select.width <= 0) return;
+          var sinceMs = Math.round(u.posToVal(u.select.left, "x") * 1000);
+          var untilMs = Math.round(u.posToVal(u.select.left + u.select.width, "x") * 1000);
+          u.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+          document.dispatchEvent(new CustomEvent("dockdoe:drill", {
+            detail: { metric: metric, sinceMs: sinceMs, untilMs: untilMs },
+          }));
         }],
       },
     };
