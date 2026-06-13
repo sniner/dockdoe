@@ -193,6 +193,24 @@
     localizeLogTimestamps(e.target);
   });
 
+  // --- Port links --------------------------------------------------------------
+  //
+  // Port pills are rendered server-side with a localhost href as a fallback, but
+  // the real target is whatever host the browser is pointed at — only known
+  // here. Rewrite each pill's href to that host. Re-run after every SSE swap of
+  // a live region, since innerHTML replaces the freshly-rendered pills.
+
+  function localizePortLinks(root) {
+    if (!root || !root.querySelectorAll) return;
+    var links = root.querySelectorAll("a.port-pill[data-port]");
+    for (var i = 0; i < links.length; i++) {
+      links[i].href =
+        "http://" + location.hostname + ":" + links[i].getAttribute("data-port");
+    }
+  }
+
+  localizePortLinks(document);
+
   // --- Error toast -----------------------------------------------------------
   //
   // htmx does not swap non-2xx responses, so a failed action (or logs/compose
@@ -243,12 +261,15 @@
     el.innerHTML = e.data;
     // Re-bind htmx attributes (action buttons) in the swapped-in markup.
     if (window.htmx) window.htmx.process(el);
+    localizePortLinks(el);
   }
 
   // The live region of a container detail page (state badge + facts).
   function onDetail(e) {
     var el = document.getElementById("detail-live");
-    if (el) el.innerHTML = e.data;
+    if (!el) return;
+    el.innerHTML = e.data;
+    localizePortLinks(el);
   }
 
   function onMetrics(e) {

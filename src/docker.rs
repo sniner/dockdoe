@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::models::{
     ContainerCpuStats, ContainerStatsResponse, ContainerSummary, ContainerSummaryStateEnum,
-    HealthStatusEnum,
+    HealthStatusEnum, PortSummaryTypeEnum,
 };
 use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
@@ -24,7 +24,7 @@ use futures_util::StreamExt;
 use futures_util::future::join_all;
 use tracing::{debug, warn};
 
-use crate::model::{ContainerMetrics, ContainerState, HealthState};
+use crate::model::{ContainerMetrics, ContainerState, HealthState, Port};
 
 /// A lifecycle action that can be applied to a container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +593,7 @@ impl DockerClient {
             cpu_percent,
             mem_used,
             mem_limit,
+            ports: ports(summary),
         }
     }
 
@@ -679,6 +680,40 @@ fn memory(stats: &ContainerStatsResponse) -> (Option<u64>, Option<u64>) {
         usage.saturating_sub(cache)
     });
     (used, mem.limit)
+}
+
+/// Ports a container exposes, taken from its summary. Docker lists each
+/// published mapping once per host IP family (0.0.0.0 and ::), so identical
+/// entries are de-duplicated. Sorted published-first (by host port), then
+/// internal-only (by container port), giving the UI a stable, useful order.
+fn ports(summary: &ContainerSummary) -> Vec<Port> {
+    let mut seen = HashSet::new();
+    let mut ports: Vec<Port> = summary
+        .ports
+        .iter()
+        .flatten()
+        .filter_map(|p| {
+            let proto = match p.typ {
+                Some(PortSummaryTypeEnum::UDP) => "udp",
+                Some(PortSummaryTypeEnum::SCTP) => "sctp",
+                _ => "tcp",
+            }
+            .to_string();
+            seen.insert((p.public_port, p.private_port, proto.clone()))
+                .then_some(Port {
+                    private: p.private_port,
+                    public: p.public_port,
+                    proto,
+                })
+        })
+        .collect();
+    ports.sort_by(|a, b| match (a.public, b.public) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.private.cmp(&b.private),
+    });
+    ports
 }
 
 fn is_running(summary: &ContainerSummary) -> bool {
@@ -911,5 +946,71 @@ mod tests {
         assert_eq!(resolve_service(&map, "abc123").as_deref(), Some("side"));
         // Unknown container → not in this stack.
         assert_eq!(resolve_service(&map, "deadbeef"), None);
+    }
+
+    fn port_summary(
+        ip: Option<&str>,
+        public: Option<u16>,
+        private: u16,
+        typ: PortSummaryTypeEnum,
+    ) -> bollard::models::PortSummary {
+        bollard::models::PortSummary {
+            ip: ip.map(str::to_string),
+            public_port: public,
+            private_port: private,
+            typ: Some(typ),
+        }
+    }
+
+    #[test]
+    fn ports_dedupes_and_sorts_published_first() {
+        let summary = ContainerSummary {
+            ports: Some(vec![
+                // An internal-only exposed port.
+                port_summary(None, None, 5432, PortSummaryTypeEnum::TCP),
+                // The same published mapping over IPv4 and IPv6 → one entry.
+                port_summary(Some("0.0.0.0"), Some(8080), 80, PortSummaryTypeEnum::TCP),
+                port_summary(Some("::"), Some(8080), 80, PortSummaryTypeEnum::TCP),
+                // A second published port, lower host port → sorts first.
+                port_summary(Some("0.0.0.0"), Some(443), 443, PortSummaryTypeEnum::TCP),
+                // UDP keeps its protocol and is distinct from a same-number TCP.
+                port_summary(Some("0.0.0.0"), Some(53), 53, PortSummaryTypeEnum::UDP),
+            ]),
+            ..Default::default()
+        };
+
+        let got = ports(&summary);
+
+        assert_eq!(
+            got,
+            vec![
+                Port {
+                    private: 53,
+                    public: Some(53),
+                    proto: "udp".to_string()
+                },
+                Port {
+                    private: 443,
+                    public: Some(443),
+                    proto: "tcp".to_string()
+                },
+                Port {
+                    private: 80,
+                    public: Some(8080),
+                    proto: "tcp".to_string()
+                },
+                // Internal-only last.
+                Port {
+                    private: 5432,
+                    public: None,
+                    proto: "tcp".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ports_empty_when_none_reported() {
+        assert!(ports(&ContainerSummary::default()).is_empty());
     }
 }

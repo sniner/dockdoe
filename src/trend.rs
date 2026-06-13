@@ -216,6 +216,7 @@ mod tests {
             cpu_percent: cpu,
             mem_used: Some(100),
             mem_limit: Some(200),
+            ports: Vec::new(),
         }
     }
 

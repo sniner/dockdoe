@@ -57,6 +57,22 @@ pub struct ContainerMetrics {
     pub mem_used: Option<u64>,
     /// Memory limit in bytes, if the container has one.
     pub mem_limit: Option<u64>,
+    /// Network ports the container exposes (published first, then internal),
+    /// de-duplicated across host IP families.
+    pub ports: Vec<Port>,
+}
+
+/// A network port a container exposes. When `public` is set the port is
+/// published to the host and reachable from outside; otherwise it is only
+/// exposed inside Docker's network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Port {
+    /// Port inside the container.
+    pub private: u16,
+    /// Host port, if this mapping is published to the host.
+    pub public: Option<u16>,
+    /// Transport protocol: "tcp", "udp", or "sctp".
+    pub proto: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

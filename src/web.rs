@@ -27,7 +27,7 @@ use rust_embed::RustEmbed;
 
 use crate::collector::SharedDashboard;
 use crate::docker::{Action, DockerHandle};
-use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState};
+use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
 use crate::store::{HistoryPoint, MetricPoint, Store};
 
 /// How often the live SSE streams poll the latest snapshot.
@@ -977,6 +977,7 @@ fn container_detail_live(c: &ContainerMetrics) -> Markup {
         div.status-line {
             span.badge.(state_class(c.state)) { (state_label(c.state)) }
             (health_marker(c.health))
+            (port_pills(&c.ports))
         }
         section.facts {
             (fact("Image", short_image(&c.image)))
@@ -1214,6 +1215,7 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize) -> Markup {
             td {
                 span.badge.(state_class(c.state)) { (state_label(c.state)) }
                 (health_marker(c.health))
+                (port_chips(&c.ports))
             }
             td.num {
                 @match c.cpu_percent {
@@ -1292,6 +1294,89 @@ fn health_marker(health: HealthState) -> Markup {
         HealthState::None => return html! {},
     };
     html! { span class=(format!("health {class}")) { (label) } }
+}
+
+/// All ports for the container detail page: every published port as a blue
+/// link to the browsing host, every internal-only port as a muted,
+/// non-clickable pill. Renders nothing when the container exposes no ports.
+fn port_pills(ports: &[Port]) -> Markup {
+    if ports.is_empty() {
+        return html! {};
+    }
+    html! {
+        span.ports {
+            @for p in ports {
+                @match p.public {
+                    Some(_) => (port_link(p, true)),
+                    None => span.port-pill.muted
+                        title="exposed inside Docker, not published to the host" {
+                        (p.private) (proto_suffix(&p.proto))
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Compact published-port chips for the dense tables: the first two host ports
+/// as links, any remainder collapsed into a neutral "+N" chip (the rest are
+/// listed in its tooltip). Internal-only ports are omitted here — they show on
+/// the detail page. Renders nothing without any published port.
+fn port_chips(ports: &[Port]) -> Markup {
+    const SHOWN: usize = 2;
+    let published: Vec<&Port> = ports.iter().filter(|p| p.public.is_some()).collect();
+    if published.is_empty() {
+        return html! {};
+    }
+    html! {
+        span.ports {
+            @for p in published.iter().take(SHOWN) { (port_link(p, false)) }
+            @if published.len() > SHOWN {
+                span.port-more title=(overflow_list(&published[SHOWN..])) {
+                    "+" (published.len() - SHOWN)
+                }
+            }
+        }
+    }
+}
+
+/// A blue, clickable pill for one published port. `full` adds the
+/// "→ container-port" detail used on the container page; the dense tables show
+/// only the host port. The href targets `localhost` as a sane default for the
+/// common "browsing from the Docker host" case and is rewritten to the actual
+/// browsing host by live.js, the only place the real hostname is known.
+fn port_link(p: &Port, full: bool) -> Markup {
+    let public = p.public.expect("port_link called on an unpublished port");
+    html! {
+        a.port-pill data-port=(public) target="_blank" rel="noopener"
+            href=(format!("http://localhost:{public}"))
+            title=(format!("host {public} → container {}/{}", p.private, p.proto)) {
+            ":" (public)
+            @if full { " → " (p.private) }
+            (proto_suffix(&p.proto))
+        }
+    }
+}
+
+/// "/udp" / "/sctp" suffix for non-TCP ports; empty for plain TCP, which is the
+/// overwhelming default and would only add noise.
+fn proto_suffix(proto: &str) -> String {
+    if proto == "tcp" {
+        String::new()
+    } else {
+        format!("/{proto}")
+    }
+}
+
+/// Space-separated list of published ports for the "+N" chip's tooltip.
+fn overflow_list(rest: &[&Port]) -> String {
+    rest.iter()
+        .filter_map(|p| {
+            p.public
+                .map(|public| format!(":{public}{}", proto_suffix(&p.proto)))
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Key that sorts named stacks alphabetically before standalone containers.
@@ -1567,6 +1652,7 @@ mod tests {
             cpu_percent: None,
             mem_used: None,
             mem_limit: None,
+            ports: Vec::new(),
         };
         let containers = [
             c(ContainerState::Running, HealthState::Healthy),

@@ -3,6 +3,15 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Exposed ports**: containers now show the ports they expose. The detail page lists every port
+  after the state badge — published ones as blue links that open `http://<host>:<port>` in a new
+  tab, internal-only ones as muted pills. The dashboard and stack tables show the first two
+  published ports under the state badge, collapsing any remainder into a `+N` chip
+
 ## [0.4.1] — 2026-06-13
 
 ### Added

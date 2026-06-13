@@ -136,6 +136,30 @@ td.image { color: var(--muted); font-size: 0.85rem; }
 .badge.paused, .badge.restarting, .badge.stopping, .badge.removing,
 .badge.created, .badge.unknown { background: rgba(110,118,129,0.2); color: var(--idle); }
 
+/* Exposed ports. Blue (the link/accent colour) reads as "clickable" and stays
+   clear of the green/red/grey state badges. Inline after the state badge on the
+   detail page; on its own line under the badge in the dense tables. */
+.ports {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  vertical-align: middle;
+}
+td .ports { display: flex; margin-top: 0.4rem; }
+.port-pill, .port-more {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.port-pill { background: rgba(79,156,249,0.15); color: var(--accent); }
+a.port-pill:hover { background: rgba(79,156,249,0.3); }
+.port-pill.muted { background: rgba(110,118,129,0.2); color: var(--muted); }
+.port-more { background: rgba(110,118,129,0.2); color: var(--muted); cursor: default; }
+
 .health { margin-left: 0.4rem; font-size: 0.7rem; }
 .health.healthy { color: var(--ok); }
 .health.unhealthy { color: var(--err); }
@@ -329,6 +353,7 @@ h2 a.stack-link:hover { color: var(--accent); }
 .status-line {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.4rem;
   margin-bottom: 1rem;
 }
