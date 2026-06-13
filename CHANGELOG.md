@@ -3,6 +3,13 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [0.5.1] — 2026-06-13
+
+### Changed
+
+- **Port pills** drop the leading colon: a chip now reads `3030` (and `3030 → 8000` on the detail
+  page) instead of `:3030`. The pill styling and tooltip already mark it as a port
+
 ## [0.5.0] — 2026-06-13
 
 ### Added
