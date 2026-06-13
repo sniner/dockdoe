@@ -147,10 +147,47 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding to {}", cli.bind))?;
     info!(bind = %cli.bind, "DockDoe listening");
 
-    axum::serve(listener, app)
-        .await
-        .context("running the web server")?;
+    // Stop on SIGTERM (what `docker stop` sends) or SIGINT (Ctrl-C). Without a
+    // handler this matters most in a container: as PID 1 the process gets no
+    // default action for these signals, so SIGTERM is ignored and Docker falls
+    // back to SIGKILL after its grace period (~10 s). We exit on the signal
+    // instead of draining connections — the long-lived SSE streams would never
+    // close on their own, and a monitoring UI has nothing to flush (the next
+    // collector cycle is abandoned; SQLite's rollback journal keeps the file
+    // consistent). Browsers simply reconnect on the next start.
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            result.context("running the web server")?;
+        }
+        () = shutdown_signal() => {
+            info!("shutdown signal received; exiting");
+        }
+    }
     Ok(())
+}
+
+/// Resolves when the process is asked to stop: SIGTERM or SIGINT.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
 }
 
 fn init_tracing(filter: &str) {

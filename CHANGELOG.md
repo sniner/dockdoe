@@ -3,6 +3,15 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Fixed
+
+- **Graceful shutdown**: DockDoe now handles `SIGTERM` (what `docker stop` sends) and `SIGINT`,
+  and exits at once. Running as PID 1 in a container, the process got no default action for these
+  signals, so `docker stop` was ignored and fell back to `SIGKILL` after its ~10 s grace period;
+  the container now stops in well under a second
+
 ## [0.5.1] — 2026-06-13
 
 ### Changed
