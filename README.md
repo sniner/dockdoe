@@ -76,6 +76,9 @@ also reads from an environment variable; the flag wins when both are set.
 | `--trend-bucket-secs`     | `DOCKDOE_TREND_BUCKET_SECS`    | `60`             | Trend rollup window (min/max/median per bucket) |
 | `--trend-retention-secs`  | `DOCKDOE_TREND_RETENTION_SECS` | `2592000` (30 d) | How long trend rollups are kept                 |
 | `--allowed-hosts`         | `DOCKDOE_ALLOWED_HOSTS`        | *(unset)*        | Host-header allowlist, see below                |
+| `--auth-user`             | `DOCKDOE_AUTH_USER`            | *(unset)*        | Web UI login username, see below                |
+| `--auth-password`         | `DOCKDOE_AUTH_PASSWORD`        | *(unset)*        | Web UI login password, see below                |
+| `--cookie-secure`         | `DOCKDOE_COOKIE_SECURE`        | `false`          | Mark the session cookie `Secure` (HTTPS only)   |
 | `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
 | `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
@@ -91,6 +94,25 @@ same-origin. For that, set `--allowed-hosts` (comma-separated, e.g.
 `dockhost.lan`): requests whose `Host` header matches neither the list nor a
 localhost form (`localhost`, `127.0.0.1`, `::1`) are rejected. Recommended
 whenever the UI is exposed beyond localhost.
+
+### Authentication
+
+Set both `--auth-user` / `DOCKDOE_AUTH_USER` and `--auth-password` /
+`DOCKDOE_AUTH_PASSWORD` to put the web UI behind a login. There is one credential
+pair — no user database, no sign-up. Leave both unset to keep the UI open;
+setting only one is treated as a misconfiguration and refuses to start.
+
+Logging in sets a session cookie, so the credentials are sent only once (not on
+every request like HTTP Basic Auth), and you can log out again from the header.
+The cookie is a signed token — nothing is stored server-side — valid for 30 days,
+and it survives restarts and upgrades, so you stay logged in. The signature uses
+a random secret generated once and kept in the database; delete the database (or
+its `meta` row) to invalidate all sessions.
+
+Behind a TLS-terminating reverse proxy, also set `--cookie-secure` /
+`DOCKDOE_COOKIE_SECURE=true` so the cookie is only ever sent over HTTPS. Leave it
+off for plain-http access on a trusted LAN, where it would otherwise stop the
+cookie from being sent at all.
 
 ### Notifications
 

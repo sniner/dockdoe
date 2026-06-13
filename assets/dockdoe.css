@@ -69,8 +69,68 @@ header.host .brand-name span { color: var(--accent); }
 
 .spacer { flex: 1; }
 .generated { color: var(--muted); font-size: 0.75rem; }
+/* Logout link in the header (only shown when authentication is enabled). */
+header.host .logout {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-left: 1rem;
+}
+header.host .logout:hover { color: var(--accent); }
 
 main { padding: 1.25rem; max-width: 1100px; margin: 0 auto; }
+
+/* Login page: a single centred card, no header or live machinery. */
+.login-body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.25rem;
+}
+.login {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  width: 100%;
+  max-width: 20rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.75rem;
+}
+.login .brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  font-size: 1.25rem;
+  justify-content: center;
+  margin-bottom: 0.5rem;
+}
+.login .brand-icon { height: 1.8rem; width: auto; }
+.login .brand-name span { color: var(--accent); }
+.login input {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  color: var(--fg);
+  font-size: 0.95rem;
+}
+.login input:focus { outline: none; border-color: var(--accent); }
+.login button {
+  margin-top: 0.25rem;
+  padding: 0.6rem;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #0b1020;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.login button:hover { filter: brightness(1.08); }
+.login-error { color: var(--err); font-size: 0.85rem; margin: 0; text-align: center; }
 
 .stack {
   margin-bottom: 1.5rem;

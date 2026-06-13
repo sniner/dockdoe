@@ -213,6 +213,32 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The persistent session-signing secret, generated on first use and stored
+    /// in the `meta` table. Stable across restarts so login sessions survive
+    /// them; deleting the row rotates the secret (logs everyone out).
+    pub fn session_secret(&self) -> Result<Vec<u8>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.lock();
+        let existing: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'session_secret'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("reading session secret")?;
+        if let Some(secret) = existing {
+            return Ok(secret);
+        }
+        let secret = crate::auth::generate_secret();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('session_secret', ?1)",
+            rusqlite::params![secret],
+        )
+        .context("storing session secret")?;
+        Ok(secret)
+    }
+
     /// Persist one collection cycle: host sample plus all container samples,
     /// in a single transaction.
     pub fn insert_samples(
@@ -728,6 +754,11 @@ CREATE TABLE IF NOT EXISTS container_trend (
 );
 CREATE INDEX IF NOT EXISTS container_trend_ts ON container_trend(id, metric, bucket_start_ms);
 CREATE INDEX IF NOT EXISTS container_trend_name ON container_trend(name, metric, bucket_start_ms);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
 ";
 
 #[cfg(test)]
@@ -815,6 +846,15 @@ mod tests {
         let host = store.recent_host_samples(0).unwrap();
         assert_eq!(host[0].net_rx, None);
         assert_eq!(host[0].disk_write, None);
+    }
+
+    #[test]
+    fn session_secret_is_generated_once_and_stable() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.session_secret().unwrap();
+        assert_eq!(first.len(), 32);
+        // A second call returns the same persisted secret, not a fresh one.
+        assert_eq!(store.session_secret().unwrap(), first);
     }
 
     #[test]

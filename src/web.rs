@@ -18,13 +18,14 @@ use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Form, Json, Router};
 use futures_util::{Stream, StreamExt};
 use maud::{DOCTYPE, Markup, html};
 use rust_embed::RustEmbed;
 
+use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
 use crate::docker::{Action, DockerHandle};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
@@ -48,6 +49,8 @@ pub struct AppState {
     /// Hostnames the UI may be addressed as (normalized: lowercase, no port).
     /// Empty disables the Host check; localhost forms are always allowed.
     pub allowed_hosts: Arc<[String]>,
+    /// Login credentials and session signing. `None` leaves the UI open.
+    pub auth: Option<Auth>,
 }
 
 #[derive(RustEmbed)]
@@ -79,9 +82,46 @@ pub fn router(state: AppState) -> Router {
             "/api/stack/{name}/{action}",
             axum::routing::post(stack_action).layer(middleware::from_fn(require_htmx)),
         )
+        .route("/login", get(login_page).post(login_submit))
+        .route("/logout", get(logout))
         .route("/assets/{*path}", get(asset))
+        // Auth wraps everything (it allowlists /login and /assets internally);
+        // the host check sits outside it so rejected hosts never reach auth.
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(middleware::from_fn_with_state(state.clone(), check_host))
         .with_state(state)
+}
+
+/// Gate every request on a valid session when authentication is configured.
+/// The login page and static assets stay public (the login page needs its CSS
+/// and icon); everything else needs a valid session cookie. Unauthenticated
+/// requests get an `HX-Redirect` (for htmx) or a 303 to `/login`.
+async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return next.run(req).await; // authentication disabled
+    };
+    let path = req.uri().path();
+    if path == "/login" || path == "/logout" || path.starts_with("/assets/") {
+        return next.run(req).await;
+    }
+    if request_is_authenticated(auth, req.headers()) {
+        return next.run(req).await;
+    }
+    // htmx follows HX-Redirect with a client-side navigation; a plain browser
+    // request gets a normal redirect to the login page.
+    if is_htmx_request(req.headers()) {
+        return (StatusCode::UNAUTHORIZED, [("HX-Redirect", "/login")]).into_response();
+    }
+    Redirect::to("/login").into_response()
+}
+
+/// Whether the request carries a valid session cookie for `auth`.
+fn request_is_authenticated(auth: &Auth, headers: &HeaderMap) -> bool {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| auth::cookie_value(cookies, auth::COOKIE_NAME))
+        .is_some_and(|token| auth.token_valid(token, now_unix_secs()))
 }
 
 /// CSRF guard for the state-changing POST endpoints: require the
@@ -356,6 +396,54 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
+/// Submitted login form.
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+/// The login page. With auth off there is nothing to log in to, so send callers
+/// home; with a valid session already present, likewise.
+async fn login_page(State(state): State<AppState>, req: Request) -> Response {
+    match state.auth.as_ref() {
+        None => Redirect::to("/").into_response(),
+        Some(auth) if request_is_authenticated(auth, req.headers()) => {
+            Redirect::to("/").into_response()
+        }
+        Some(_) => login_shell(false).into_response(),
+    }
+}
+
+/// Verify submitted credentials; on success set the session cookie and send the
+/// user to the dashboard, otherwise re-render the form with an error.
+async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return Redirect::to("/").into_response();
+    };
+    if auth.credentials_valid(&form.username, &form.password) {
+        let cookie = auth.issue_cookie(now_unix_secs());
+        let mut resp = Redirect::to("/").into_response();
+        if let Ok(value) = cookie.parse() {
+            resp.headers_mut().insert(header::SET_COOKIE, value);
+        }
+        resp
+    } else {
+        (StatusCode::UNAUTHORIZED, login_shell(true)).into_response()
+    }
+}
+
+/// Clear the session cookie and return to the login page.
+async fn logout(State(state): State<AppState>) -> Response {
+    let mut resp = Redirect::to("/login").into_response();
+    if let Some(auth) = state.auth.as_ref()
+        && let Ok(value) = auth.clear_cookie().parse()
+    {
+        resp.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    resp
+}
+
 /// Query for the chart backfill endpoints: return points at or after this
 /// Unix-ms timestamp (clamped to the seed window server-side).
 #[derive(serde::Deserialize)]
@@ -560,7 +648,7 @@ async fn dashboard(State(state): State<AppState>) -> Markup {
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
     let seed = fetch_points(move || store.recent_host_samples(since)).await;
-    dashboard_page(snapshot.as_ref(), &seed)
+    dashboard_page(snapshot.as_ref(), &seed, state.auth.is_some())
 }
 
 /// Detail page for a single container.
@@ -579,6 +667,7 @@ async fn container_detail(
             &[],
             "/events",
             "/api/metrics/host",
+            state.auth.is_some(),
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     };
@@ -596,6 +685,7 @@ async fn container_detail(
         &seed,
         &live_url,
         &backfill_url,
+        state.auth.is_some(),
     )
     .into_response()
 }
@@ -624,6 +714,7 @@ async fn stack_detail(
             &[],
             "/events",
             "/api/metrics/host",
+            state.auth.is_some(),
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     }
@@ -646,6 +737,7 @@ async fn stack_detail(
         &seed,
         &live_url,
         &backfill_url,
+        state.auth.is_some(),
     )
     .into_response()
 }
@@ -656,7 +748,8 @@ async fn stack_detail(
 async fn events_dashboard(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = dashboard_stream(&state).flat_map(|dash| {
+    let auth_enabled = state.auth.is_some();
+    let stream = dashboard_stream(&state).flat_map(move |dash| {
         let point = MetricPoint {
             ts_ms: dash.generated_at_unix_ms,
             cpu_percent: f64::from(dash.host.cpu_percent),
@@ -668,7 +761,7 @@ async fn events_dashboard(
             disk_write: None,
         };
         futures_util::stream::iter([
-            Ok(header_event(&dash)),
+            Ok(header_event(&dash, auth_enabled)),
             Ok(containers_event(&dash)),
             Ok(metrics_event(&point)),
         ])
@@ -682,8 +775,9 @@ async fn events_container(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let auth_enabled = state.auth.is_some();
     let stream = dashboard_stream(&state).flat_map(move |dash| {
-        let mut events = vec![Ok(header_event(&dash))];
+        let mut events = vec![Ok(header_event(&dash, auth_enabled))];
         if let Some(c) = dash.containers.iter().find(|c| c.id == id) {
             events.push(Ok(detail_event(c)));
             events.push(Ok(metrics_event(&MetricPoint {
@@ -707,6 +801,7 @@ async fn events_stack(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let auth_enabled = state.auth.is_some();
     let stream = dashboard_stream(&state).flat_map(move |dash| {
         let members: Vec<&ContainerMetrics> = dash
             .containers
@@ -725,7 +820,7 @@ async fn events_stack(
             .event("containers")
             .data(stack_members_table(&members, dash.host.cpu_count).into_string());
         futures_util::stream::iter([
-            Ok(header_event(&dash)),
+            Ok(header_event(&dash, auth_enabled)),
             Ok(members_event),
             Ok(metrics_event(&MetricPoint {
                 ts_ms: dash.generated_at_unix_ms,
@@ -749,10 +844,10 @@ fn detail_event(c: &ContainerMetrics) -> Event {
 }
 
 /// The `header` event: the host header's inner HTML.
-fn header_event(dash: &Dashboard) -> Event {
+fn header_event(dash: &Dashboard, auth_enabled: bool) -> Event {
     Event::default()
         .event("header")
-        .data(host_header_inner(dash).into_string())
+        .data(host_header_inner(dash, auth_enabled).into_string())
 }
 
 /// The `containers` event: the container table's HTML.
@@ -832,6 +927,7 @@ fn shell(
     seed: &[MetricPoint],
     live_url: &str,
     backfill_url: &str,
+    auth_enabled: bool,
 ) -> Markup {
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     // The history endpoints mirror the backfill endpoints by design — same
@@ -857,7 +953,7 @@ fn shell(
             body {
                 header.host id="host-header" {
                     @match snapshot {
-                        Some(d) => (host_header_inner(d)),
+                        Some(d) => (host_header_inner(d, auth_enabled)),
                         None => (brand()),
                     }
                 }
@@ -908,7 +1004,11 @@ fn shell(
 }
 
 /// The dashboard body: host charts plus the live container table.
-fn dashboard_page(snapshot: Option<&Dashboard>, seed: &[MetricPoint]) -> Markup {
+fn dashboard_page(
+    snapshot: Option<&Dashboard>,
+    seed: &[MetricPoint],
+    auth_enabled: bool,
+) -> Markup {
     let main = html! {
         (charts_section("Host CPU", "Host Memory"))
         div id="containers" {
@@ -918,7 +1018,14 @@ fn dashboard_page(snapshot: Option<&Dashboard>, seed: &[MetricPoint]) -> Markup 
             }
         }
     };
-    shell(snapshot, main, seed, "/events", "/api/metrics/host")
+    shell(
+        snapshot,
+        main,
+        seed,
+        "/events",
+        "/api/metrics/host",
+        auth_enabled,
+    )
 }
 
 /// Markup for a pair of live charts (CPU + memory). Data comes from `live.js`,
@@ -1146,8 +1253,42 @@ fn brand() -> Markup {
     }
 }
 
+/// The standalone login page — deliberately minimal: the brand, a username and
+/// password field, and a submit button. No header, charts, or live machinery,
+/// so it needs none of the page scripts. `error` shows the failed-login notice.
+fn login_shell(error: bool) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "DockDoe — Log in" }
+                link rel="icon" type="image/svg+xml" href="/assets/dockdoe.svg"
+                    media="(prefers-color-scheme: light)";
+                link rel="icon" type="image/svg+xml" href="/assets/dockdoe-white.svg"
+                    media="(prefers-color-scheme: dark)";
+                link rel="stylesheet" href="/assets/dockdoe.css";
+            }
+            body.login-body {
+                form.login method="post" action="/login" {
+                    (brand())
+                    @if error {
+                        p.login-error { "Invalid username or password." }
+                    }
+                    input type="text" name="username" placeholder="Username"
+                        autocomplete="username" autofocus required;
+                    input type="password" name="password" placeholder="Password"
+                        autocomplete="current-password" required;
+                    button type="submit" { "Log in" }
+                }
+            }
+        }
+    }
+}
+
 /// The inner content of the host header (everything HTMX swaps on each update).
-fn host_header_inner(dash: &Dashboard) -> Markup {
+fn host_header_inner(dash: &Dashboard, auth_enabled: bool) -> Markup {
     let host = &dash.host;
     html! {
         (brand())
@@ -1167,6 +1308,9 @@ fn host_header_inner(dash: &Dashboard) -> Markup {
         (container_counts_metric(&ContainerCounts::of(&dash.containers)))
         span.spacer {}
         span.generated { "updated " (fmt_age(dash.generated_at_unix_ms)) }
+        @if auth_enabled {
+            a.logout href="/logout" title="Log out" { "Logout" }
+        }
     }
 }
 
@@ -1528,6 +1672,10 @@ fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn now_unix_secs() -> u64 {
+    now_unix_ms() / 1000
 }
 
 fn duration_ms(d: Duration) -> u64 {

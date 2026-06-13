@@ -5,6 +5,14 @@ All notable, user-facing changes to DockDoe. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Authentication**: set `DOCKDOE_AUTH_USER` and `DOCKDOE_AUTH_PASSWORD` to put the web UI behind
+  a login (one credential pair, no user database). Credentials are sent once, not on every request:
+  a successful login sets a signed, stateless session cookie that survives restarts and upgrades, so
+  you stay logged in, with a logout link in the header. Set `DOCKDOE_COOKIE_SECURE=true` behind a
+  TLS proxy. Both unset keeps the UI open as before
+
 ### Fixed
 
 - **Graceful shutdown**: DockDoe now handles `SIGTERM` (what `docker stop` sends) and `SIGINT`,

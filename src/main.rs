@@ -7,6 +7,7 @@
 // - doc_markdown: "DockDoe" is the product name in prose, not a code item.
 #![allow(clippy::cast_precision_loss, clippy::doc_markdown)]
 
+mod auth;
 mod collector;
 mod docker;
 mod host;
@@ -83,6 +84,20 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_NOTIFY_DELAY", default_value_t = 30)]
     notify_delay_secs: u64,
 
+    /// Username for the web UI login. Set together with `--auth-password` to
+    /// require authentication; leave both unset to keep the UI open.
+    #[arg(long, env = "DOCKDOE_AUTH_USER")]
+    auth_user: Option<String>,
+
+    /// Password for the web UI login (see `--auth-user`).
+    #[arg(long, env = "DOCKDOE_AUTH_PASSWORD")]
+    auth_password: Option<String>,
+
+    /// Mark the session cookie `Secure` (sent only over HTTPS). Leave off for
+    /// plain-http access on a LAN; turn on when serving behind a TLS proxy.
+    #[arg(long, env = "DOCKDOE_COOKIE_SECURE", default_value_t = false)]
+    cookie_secure: bool,
+
     /// Tracing filter, e.g. "info" or "dockdoe=debug".
     #[arg(long, env = "DOCKDOE_LOG", default_value = "info")]
     log: String,
@@ -135,12 +150,31 @@ async fn main() -> Result<()> {
         info!(hosts = ?allowed_hosts, "Host allowlist enabled (plus localhost forms)");
     }
 
+    // Authentication is opt-in: both credentials must be set. Exactly one set is
+    // almost certainly a misconfiguration, so fail loudly rather than silently
+    // leaving the UI open.
+    let auth = match (cli.auth_user, cli.auth_password) {
+        (Some(user), Some(password)) => {
+            let secret = store.session_secret().context("loading session secret")?;
+            info!(
+                secure_cookie = cli.cookie_secure,
+                "web UI authentication enabled"
+            );
+            Some(auth::Auth::new(user, password, secret, cli.cookie_secure))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "set both DOCKDOE_AUTH_USER and DOCKDOE_AUTH_PASSWORD to enable authentication, or neither"
+        ),
+    };
+
     let app = web::router(web::AppState {
         shared,
         store,
         docker: docker_handle,
         seed_window,
         allowed_hosts,
+        auth,
     });
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await
