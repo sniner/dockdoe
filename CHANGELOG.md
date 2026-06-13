@@ -14,8 +14,8 @@ All notable, user-facing changes to DockDoe. The format is based on
 - **Network & disk I/O charts**: container and stack detail pages now show a Network chart (rx/tx)
   and a Disk I/O chart (read/write) alongside CPU and memory, as live byte-per-second rates
   derived from the Docker stats counters. Stack charts sum the rates across the stack's members.
-  These charts are live-only for now (no history overlay), but the underlying trends are recorded
-  so a history view can be added later without a data gap
+  Their expand buttons open the history overlay too, with each direction drawn as a median line
+  plus its own min–max band
 
 ## [0.4.1] — 2026-06-13
 

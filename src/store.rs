@@ -86,9 +86,11 @@ pub struct MetricPoint {
     pub disk_write: Option<f64>,
 }
 
-/// One bucket of the history view: median line plus min–max envelope for both
-/// metrics. A field is `None` when the bucket has no rows for that metric
-/// (e.g. a container the runtime reports no memory stats for).
+/// One bucket of the history view: median line plus min–max envelope per
+/// metric. A field is `None` when the bucket has no rows for that metric (e.g.
+/// the host, which has no per-container I/O, or a container the runtime reports
+/// no block-I/O for). The network and disk metrics are dual-line (rx/tx,
+/// read/write), so each direction has its own envelope.
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryPoint {
     pub ts_ms: u64,
@@ -98,6 +100,18 @@ pub struct HistoryPoint {
     pub mem_min: Option<f64>,
     pub mem_med: Option<f64>,
     pub mem_max: Option<f64>,
+    pub net_rx_min: Option<f64>,
+    pub net_rx_med: Option<f64>,
+    pub net_rx_max: Option<f64>,
+    pub net_tx_min: Option<f64>,
+    pub net_tx_med: Option<f64>,
+    pub net_tx_max: Option<f64>,
+    pub disk_read_min: Option<f64>,
+    pub disk_read_med: Option<f64>,
+    pub disk_read_max: Option<f64>,
+    pub disk_write_min: Option<f64>,
+    pub disk_write_med: Option<f64>,
+    pub disk_write_max: Option<f64>,
 }
 
 impl HistoryPoint {
@@ -107,6 +121,8 @@ impl HistoryPoint {
     pub fn from_raw(p: &MetricPoint) -> Self {
         #[allow(clippy::cast_precision_loss)] // chart data; precision is moot
         let mem = p.mem_used.map(|m| m as f64);
+        // A raw point's single value is its own min/med/max, so each envelope
+        // collapses to the point's value (`None` stays an empty envelope).
         Self {
             ts_ms: p.ts_ms,
             cpu_min: Some(p.cpu_percent),
@@ -115,6 +131,18 @@ impl HistoryPoint {
             mem_min: mem,
             mem_med: mem,
             mem_max: mem,
+            net_rx_min: p.net_rx,
+            net_rx_med: p.net_rx,
+            net_rx_max: p.net_rx,
+            net_tx_min: p.net_tx,
+            net_tx_med: p.net_tx,
+            net_tx_max: p.net_tx,
+            disk_read_min: p.disk_read,
+            disk_read_med: p.disk_read,
+            disk_read_max: p.disk_read,
+            disk_write_min: p.disk_write,
+            disk_write_med: p.disk_write,
+            disk_write_max: p.disk_write,
         }
     }
 }
@@ -429,18 +457,12 @@ impl Store {
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT (bucket_start_ms / ?3) * ?3 AS bucket,
-                        MIN(CASE WHEN metric = 'cpu' THEN min END),
-                        AVG(CASE WHEN metric = 'cpu' THEN median END),
-                        MAX(CASE WHEN metric = 'cpu' THEN max END),
-                        MIN(CASE WHEN metric = 'mem' THEN min END),
-                        AVG(CASE WHEN metric = 'mem' THEN median END),
-                        MAX(CASE WHEN metric = 'mem' THEN max END)
+            .prepare_cached(&format!(
+                "SELECT (bucket_start_ms / ?3) * ?3 AS bucket, {HISTORY_ENVELOPE}
                  FROM host_trend
                  WHERE bucket_start_ms >= ?1 AND bucket_start_ms <= ?2
-                 GROUP BY bucket ORDER BY bucket ASC",
-            )
+                 GROUP BY bucket ORDER BY bucket ASC"
+            ))
             .context("prepare host history query")?;
         let rows = stmt
             .query_map(
@@ -463,18 +485,12 @@ impl Store {
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT (bucket_start_ms / ?4) * ?4 AS bucket,
-                        MIN(CASE WHEN metric = 'cpu' THEN min END),
-                        AVG(CASE WHEN metric = 'cpu' THEN median END),
-                        MAX(CASE WHEN metric = 'cpu' THEN max END),
-                        MIN(CASE WHEN metric = 'mem' THEN min END),
-                        AVG(CASE WHEN metric = 'mem' THEN median END),
-                        MAX(CASE WHEN metric = 'mem' THEN max END)
+            .prepare_cached(&format!(
+                "SELECT (bucket_start_ms / ?4) * ?4 AS bucket, {HISTORY_ENVELOPE}
                  FROM container_trend
                  WHERE id = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms <= ?3
-                 GROUP BY bucket ORDER BY bucket ASC",
-            )
+                 GROUP BY bucket ORDER BY bucket ASC"
+            ))
             .context("prepare container history query")?;
         let rows = stmt
             .query_map(
@@ -499,25 +515,17 @@ impl Store {
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "WITH per_bucket AS (
-                     SELECT bucket_start_ms AS b,
-                            SUM(CASE WHEN metric = 'cpu' THEN min END) AS cpu_min,
-                            SUM(CASE WHEN metric = 'cpu' THEN median END) AS cpu_med,
-                            SUM(CASE WHEN metric = 'cpu' THEN max END) AS cpu_max,
-                            SUM(CASE WHEN metric = 'mem' THEN min END) AS mem_min,
-                            SUM(CASE WHEN metric = 'mem' THEN median END) AS mem_med,
-                            SUM(CASE WHEN metric = 'mem' THEN max END) AS mem_max
+                     SELECT bucket_start_ms AS b, {STACK_SUM_PER_BUCKET}
                      FROM container_trend
                      WHERE stack = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms <= ?3
                      GROUP BY b
                  )
-                 SELECT (b / ?4) * ?4 AS bucket,
-                        MIN(cpu_min), AVG(cpu_med), MAX(cpu_max),
-                        MIN(mem_min), AVG(mem_med), MAX(mem_max)
+                 SELECT (b / ?4) * ?4 AS bucket, {STACK_OUTER_ENVELOPE}
                  FROM per_bucket
-                 GROUP BY bucket ORDER BY bucket ASC",
-            )
+                 GROUP BY bucket ORDER BY bucket ASC"
+            ))
             .context("prepare stack history query")?;
         let rows = stmt
             .query_map(
@@ -621,8 +629,53 @@ fn history_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryPoint>
         mem_min: r.get(4)?,
         mem_med: r.get(5)?,
         mem_max: r.get(6)?,
+        net_rx_min: r.get(7)?,
+        net_rx_med: r.get(8)?,
+        net_rx_max: r.get(9)?,
+        net_tx_min: r.get(10)?,
+        net_tx_med: r.get(11)?,
+        net_tx_max: r.get(12)?,
+        disk_read_min: r.get(13)?,
+        disk_read_med: r.get(14)?,
+        disk_read_max: r.get(15)?,
+        disk_write_min: r.get(16)?,
+        disk_write_med: r.get(17)?,
+        disk_write_max: r.get(18)?,
     })
 }
+
+/// The per-metric envelope columns shared by the host and container history
+/// queries: for each metric, `MIN(min) AVG(median) MAX(max)` over the
+/// downsampling group, in the column order [`history_row_to_point`] expects.
+/// Metrics a table never stores (net/disk for the host) come back as NULL.
+const HISTORY_ENVELOPE: &str = "\
+    MIN(CASE WHEN metric='cpu' THEN min END), AVG(CASE WHEN metric='cpu' THEN median END), MAX(CASE WHEN metric='cpu' THEN max END),
+    MIN(CASE WHEN metric='mem' THEN min END), AVG(CASE WHEN metric='mem' THEN median END), MAX(CASE WHEN metric='mem' THEN max END),
+    MIN(CASE WHEN metric='net_rx' THEN min END), AVG(CASE WHEN metric='net_rx' THEN median END), MAX(CASE WHEN metric='net_rx' THEN max END),
+    MIN(CASE WHEN metric='net_tx' THEN min END), AVG(CASE WHEN metric='net_tx' THEN median END), MAX(CASE WHEN metric='net_tx' THEN max END),
+    MIN(CASE WHEN metric='disk_read' THEN min END), AVG(CASE WHEN metric='disk_read' THEN median END), MAX(CASE WHEN metric='disk_read' THEN max END),
+    MIN(CASE WHEN metric='disk_write' THEN min END), AVG(CASE WHEN metric='disk_write' THEN median END), MAX(CASE WHEN metric='disk_write' THEN max END)";
+
+/// Stack history sums members per bucket before downsampling. These are the
+/// per-bucket sums (the CTE body): each metric's min/median/max summed across
+/// the stack's members, aliased for the outer envelope below.
+const STACK_SUM_PER_BUCKET: &str = "\
+    SUM(CASE WHEN metric='cpu' THEN min END) AS cpu_min, SUM(CASE WHEN metric='cpu' THEN median END) AS cpu_med, SUM(CASE WHEN metric='cpu' THEN max END) AS cpu_max,
+    SUM(CASE WHEN metric='mem' THEN min END) AS mem_min, SUM(CASE WHEN metric='mem' THEN median END) AS mem_med, SUM(CASE WHEN metric='mem' THEN max END) AS mem_max,
+    SUM(CASE WHEN metric='net_rx' THEN min END) AS net_rx_min, SUM(CASE WHEN metric='net_rx' THEN median END) AS net_rx_med, SUM(CASE WHEN metric='net_rx' THEN max END) AS net_rx_max,
+    SUM(CASE WHEN metric='net_tx' THEN min END) AS net_tx_min, SUM(CASE WHEN metric='net_tx' THEN median END) AS net_tx_med, SUM(CASE WHEN metric='net_tx' THEN max END) AS net_tx_max,
+    SUM(CASE WHEN metric='disk_read' THEN min END) AS disk_read_min, SUM(CASE WHEN metric='disk_read' THEN median END) AS disk_read_med, SUM(CASE WHEN metric='disk_read' THEN max END) AS disk_read_max,
+    SUM(CASE WHEN metric='disk_write' THEN min END) AS disk_write_min, SUM(CASE WHEN metric='disk_write' THEN median END) AS disk_write_med, SUM(CASE WHEN metric='disk_write' THEN max END) AS disk_write_max";
+
+/// The outer envelope over the summed per-bucket columns above, in the column
+/// order [`history_row_to_point`] expects.
+const STACK_OUTER_ENVELOPE: &str = "\
+    MIN(cpu_min), AVG(cpu_med), MAX(cpu_max),
+    MIN(mem_min), AVG(mem_med), MAX(mem_max),
+    MIN(net_rx_min), AVG(net_rx_med), MAX(net_rx_max),
+    MIN(net_tx_min), AVG(net_tx_med), MAX(net_tx_max),
+    MIN(disk_read_min), AVG(disk_read_med), MAX(disk_read_max),
+    MIN(disk_write_min), AVG(disk_write_med), MAX(disk_write_max)";
 
 const MIGRATIONS: &str = "
 CREATE TABLE IF NOT EXISTS host_sample (
@@ -898,6 +951,49 @@ mod tests {
         let middle = store.history_host(60_000, 60_000, 60_000).unwrap();
         assert_eq!(middle.len(), 1);
         assert_eq!(middle[0].ts_ms, 60_000);
+    }
+
+    #[test]
+    fn history_container_carries_io_envelope() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_container_trends(&[
+                ContainerTrend {
+                    bucket_start_ms: 0,
+                    bucket_secs: 60,
+                    id: "a".to_string(),
+                    name: "c-a".to_string(),
+                    stack: None,
+                    metric: Metric::NetRx.as_str(),
+                    min: 100.0,
+                    max: 900.0,
+                    median: 400.0,
+                    samples: 20,
+                },
+                ContainerTrend {
+                    bucket_start_ms: 0,
+                    bucket_secs: 60,
+                    id: "a".to_string(),
+                    name: "c-a".to_string(),
+                    stack: None,
+                    metric: Metric::DiskWrite.as_str(),
+                    min: 1.0,
+                    max: 3.0,
+                    median: 2.0,
+                    samples: 20,
+                },
+            ])
+            .unwrap();
+
+        let h = store.history_container("a", 0, u64::MAX, 60_000).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].net_rx_min, Some(100.0));
+        assert_eq!(h[0].net_rx_med, Some(400.0));
+        assert_eq!(h[0].net_rx_max, Some(900.0));
+        assert_eq!(h[0].disk_write_med, Some(2.0));
+        // Metrics with no rows in the bucket stay None.
+        assert_eq!(h[0].net_tx_med, None);
+        assert_eq!(h[0].cpu_med, None);
     }
 
     #[test]

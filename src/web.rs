@@ -951,8 +951,8 @@ fn charts_section(cpu_title: &str, mem_title: &str) -> Markup {
 
 /// Network and disk-I/O charts: two dual-line cards (rx/read in blue,
 /// tx/write in green), fed by `live.js` from the same SSE point stream as the
-/// CPU/memory charts. Deliberately live-only — no history-expand button yet, so
-/// the underlying I/O trends accumulate for a future history view without one.
+/// CPU/memory charts. The expand button opens the same history overlay, which
+/// renders both directions with their own min–max bands.
 fn io_charts_section() -> Markup {
     html! {
         section.charts {
@@ -963,7 +963,8 @@ fn io_charts_section() -> Markup {
 }
 
 /// One dual-line I/O chart card: a title, a two-key colour legend, a hover
-/// readout, and the uPlot mount point (`chart-net` / `chart-disk`).
+/// readout, the history-expand button, and the uPlot mount point
+/// (`chart-net` / `chart-disk`).
 fn io_chart_card(title: &str, key: &str, in_label: &str, out_label: &str) -> Markup {
     html! {
         div.chart-card {
@@ -974,6 +975,8 @@ fn io_chart_card(title: &str, key: &str, in_label: &str, out_label: &str) -> Mar
                     span.k.out { (out_label) }
                 }
                 span.chart-readout id=(format!("readout-{key}")) {}
+                button.chart-zoom type="button" data-metric=(key)
+                    title="Show history" aria-label="Show history" { "⤢" }
             }
             div id=(format!("chart-{key}")) {}
         }

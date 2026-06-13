@@ -24,6 +24,10 @@
   var stroke = "#4f9cf9";
   var band = "rgba(79,156,249,0.18)";
   var edge = "rgba(79,156,249,0.35)";
+  // Second series (tx / write) on the dual-line I/O charts, in green.
+  var strokeOut = "#3fb950";
+  var bandOut = "rgba(63,185,80,0.18)";
+  var edgeOut = "rgba(63,185,80,0.35)";
   var grid = { stroke: "#2c313c", width: 1 };
   var axisStyle = { stroke: "#8b93a1", grid: grid, ticks: grid };
 
@@ -52,6 +56,32 @@
   function cpuTicks(vals) {
     return vals.map(function (v) { return v.toFixed(1) + "%"; });
   }
+  // Bytes/second, for the network and disk-I/O history charts.
+  function rateFmt(v) {
+    if (v == null) return "--";
+    if (v >= 1048576) return (v / 1048576).toFixed(2) + " MB/s";
+    if (v >= 1024) return (v / 1024).toFixed(1) + " KB/s";
+    return Math.round(v) + " B/s";
+  }
+  function rateTicks(vals) {
+    return vals.map(rateFmt);
+  }
+
+  // Per-metric rendering config. `keys` are the HistoryPoint field prefixes
+  // (each has _min/_med/_max); a second key makes the chart dual-line. `scale`
+  // converts stored units to chart units (memory bytes -> MiB). `labels`
+  // prefix the dual-line readout ("rx 1.2 MB/s · tx …").
+  var METRICS = {
+    cpu: { keys: ["cpu"], fmt: cpuFmt, ticks: cpuTicks, scale: 1 },
+    mem: { keys: ["mem"], fmt: memFmt, ticks: memTicks, scale: 1 / 1048576 },
+    net: { keys: ["net_rx", "net_tx"], fmt: rateFmt, ticks: rateTicks, scale: 1, labels: ["rx", "tx"] },
+    disk: { keys: ["disk_read", "disk_write"], fmt: rateFmt, ticks: rateTicks, scale: 1, labels: ["read", "write"] },
+  };
+  // Per-series colours, indexed by key position: rx/read blue, tx/write green.
+  var SERIES_COLORS = [
+    { line: stroke, edge: edge, band: band },
+    { line: strokeOut, edge: edgeOut, band: bandOut },
+  ];
 
   var metric = "cpu"; // which metric the open dialog shows
   var baseTitle = "";
@@ -91,7 +121,25 @@
     return Math.max(15, deltas[Math.floor(deltas.length / 2)] * 4);
   }
 
-  function chartOpts(fmt, ticks) {
+  // Build uPlot series + bands for the active metric's config. Each key adds a
+  // median line plus its two band edges (max, min); the band fills between them.
+  // Data layout: [ts, med0, max0, min0, (med1, max1, min1)].
+  function seriesAndBands(cfg) {
+    var series = [{}];
+    var bands = [];
+    cfg.keys.forEach(function (key, k) {
+      var c = SERIES_COLORS[k];
+      var medIdx = series.length;
+      series.push({ stroke: c.line, width: 1.5 });
+      series.push({ stroke: c.edge, width: 1 });
+      series.push({ stroke: c.edge, width: 1 });
+      bands.push({ series: [medIdx + 1, medIdx + 2], fill: c.band });
+    });
+    return { series: series, bands: bands };
+  }
+
+  function chartOpts(cfg) {
+    var sb = seriesAndBands(cfg);
     return {
       width: chartEl.clientWidth || 800,
       height: 420,
@@ -100,15 +148,8 @@
       cursor: { y: false, drag: { x: true, y: false, setScale: false } },
       legend: { show: false },
       scales: { x: { time: true } },
-      // Data layout: [ts, median, max, min]. The band fills from series 2
-      // (upper edge, max) down to series 3 (lower edge, min).
-      series: [
-        {},
-        { stroke: stroke, width: 1.5 },
-        { stroke: edge, width: 1 },
-        { stroke: edge, width: 1 },
-      ],
-      bands: [{ series: [2, 3], fill: band }],
+      series: sb.series,
+      bands: sb.bands,
       axes: [
         Object.assign({}, axisStyle, {
           size: 30,
@@ -126,7 +167,7 @@
             }, "");
             return Math.max(56, 16 + longest.length * 8);
           },
-          values: function (u, vals) { return ticks(vals); },
+          values: function (u, vals) { return cfg.ticks(vals); },
         }),
       ],
       hooks: {
@@ -136,14 +177,17 @@
             readoutEl.textContent = "";
             return;
           }
-          var med = u.data[1][i];
-          var hi = u.data[2][i];
-          var lo = u.data[3][i];
-          var spread = lo != null && hi != null && hi - lo > 1e-9
-            ? "  (" + fmt(lo) + " – " + fmt(hi) + ")"
-            : "";
+          var parts = cfg.keys.map(function (key, k) {
+            var base = 1 + k * 3;
+            var med = u.data[base][i], hi = u.data[base + 1][i], lo = u.data[base + 2][i];
+            var spread = lo != null && hi != null && hi - lo > 1e-9
+              ? " (" + cfg.fmt(lo) + " – " + cfg.fmt(hi) + ")"
+              : "";
+            var label = cfg.labels ? cfg.labels[k] + " " : "";
+            return label + cfg.fmt(med) + spread;
+          });
           readoutEl.textContent =
-            timeStr(u.data[0][i], needsDate(view)) + " · " + fmt(med) + spread;
+            timeStr(u.data[0][i], needsDate(view)) + " · " + parts.join(" · ");
         }],
         // A completed drag selection drills into that window.
         setSelect: [function (u) {
@@ -158,33 +202,33 @@
   }
 
   function render(points) {
-    var isCpu = metric === "cpu";
-    var fmt = isCpu ? cpuFmt : memFmt;
-    var ticks = isCpu ? cpuTicks : memTicks;
-    var val = function (p, part) {
-      var v = p[(isCpu ? "cpu_" : "mem_") + part];
-      if (v == null) return null;
-      return isCpu ? v : v / 1048576; // bytes -> MiB
-    };
-
+    var cfg = METRICS[metric] || METRICS.cpu;
     var rawTs = points.map(function (p) { return Math.floor(p.ts_ms / 1000); });
     var gapSecs = gapFromSpacing(rawTs);
-    var ts = [], med = [], hi = [], lo = [];
+    // One column triple (med/max/min) per key, sharing the timeline.
+    var ts = [];
+    var cols = cfg.keys.map(function () { return { med: [], hi: [], lo: [] }; });
     for (var i = 0; i < points.length; i++) {
       if (ts.length && rawTs[i] - ts[ts.length - 1] > gapSecs) {
         ts.push(ts[ts.length - 1] + 1);
-        med.push(null); hi.push(null); lo.push(null);
+        cols.forEach(function (c) { c.med.push(null); c.hi.push(null); c.lo.push(null); });
       }
       ts.push(rawTs[i]);
-      med.push(val(points[i], "med"));
-      hi.push(val(points[i], "max"));
-      lo.push(val(points[i], "min"));
+      var p = points[i];
+      cfg.keys.forEach(function (key, k) {
+        var scaled = function (v) { return v == null ? null : v * cfg.scale; };
+        cols[k].med.push(scaled(p[key + "_med"]));
+        cols[k].hi.push(scaled(p[key + "_max"]));
+        cols[k].lo.push(scaled(p[key + "_min"]));
+      });
     }
+    var data = [ts];
+    cols.forEach(function (c) { data.push(c.med, c.hi, c.lo); });
 
     if (chart) { chart.destroy(); chart = null; }
     chartEl.textContent = points.length ? "" : "No data for this range.";
     if (points.length) {
-      chart = new uPlot(chartOpts(fmt, ticks), [ts, med, hi, lo], chartEl);
+      chart = new uPlot(chartOpts(cfg), data, chartEl);
     }
   }
 
@@ -286,7 +330,7 @@
 
   // Deep link: #history-cpu / #history-mem-7d opens the overlay on load, so a
   // view can be bookmarked or shared (and exercised by headless UI checks).
-  var hash = /^#history-(cpu|mem)(?:-(1h|6h|24h|7d|30d))?$/.exec(location.hash);
+  var hash = /^#history-(cpu|mem|net|disk)(?:-(1h|6h|24h|7d|30d))?$/.exec(location.hash);
   if (hash) {
     openFor(hash[1]);
     show({ range: hash[2] || lastRange });
