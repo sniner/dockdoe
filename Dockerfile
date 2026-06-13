@@ -4,9 +4,10 @@
 FROM rust:1-alpine AS builder
 
 # build-base pulls in gcc/make for the bundled SQLite (the cc crate compiles
-# sqlite3.c); musl headers come with it. No OpenSSL/TLS in the tree, so this is
-# all we need for a fully static binary.
-RUN apk add --no-cache build-base
+# sqlite3.c); musl headers come with it. cmake is for aws-lc-rs, the rustls
+# crypto provider behind reqwest's HTTPS (Apprise notifications). TLS uses
+# rustls, not OpenSSL, so the binary stays fully static.
+RUN apk add --no-cache build-base cmake
 
 WORKDIR /src
 COPY . .
