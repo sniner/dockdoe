@@ -8,14 +8,15 @@
 > and bug reports are very welcome.
 
 A single-binary Docker host monitor with an embedded web UI. Shows the vital
-metrics of your containers — state, CPU, memory — grouped by compose stack,
-with htop-style host stats on top. The dashboard updates live (no full reload):
-HTMX swaps server-rendered fragments over SSE, and uPlot draws live charts
-seeded from history.
+metrics of your containers — state, CPU, memory, network and disk I/O — grouped
+by compose stack. The dashboard updates live (no full reload): HTMX swaps
+server-rendered fragments over SSE, and uPlot draws live charts seeded from
+history.
 
 Drill into a container (live CPU/memory charts, facts, logs) or a whole stack
 (aggregate charts, the compose.yml, start/stop/restart-all), and start, stop or
-restart containers right from the UI.
+restart containers right from the UI. Point it at one Docker host or
+[several](#multiple-hosts) — local socket or remote socket proxies.
 
 ## Run
 
@@ -28,9 +29,7 @@ dockdoe --bind 0.0.0.0:8080
 ```
 
 Requires access to the Docker socket (`/var/run/docker.sock`, or `DOCKER_HOST`).
-Host CPU/load/memory are read from `/proc`. Those files (`/proc/meminfo`,
-`/proc/stat`, `/proc/loadavg`) are not namespaced, so a container sees the real
-host values out of the box — no `/proc` mount or `pid: host` needed.
+To watch several hosts, or a remote one, see [Multiple hosts](#multiple-hosts).
 
 ### With Docker
 
@@ -72,6 +71,7 @@ also reads from an environment variable; the flag wins when both are set.
 
 | Flag                      | Env var                        | Default          | Meaning                                         |
 | ------------------------- | ------------------------------ | ---------------- | ----------------------------------------------- |
+| `--config`                | `DOCKDOE_CONFIG`               | *(unset)*        | Path to a multi-host `config.toml`, see below   |
 | `--bind`                  | `DOCKDOE_BIND`                 | `127.0.0.1:8080` | Web UI bind address (`0.0.0.0:8080` to expose)  |
 | `--interval-secs`         | `DOCKDOE_INTERVAL_SECS`        | `3`              | Seconds between metric samples                  |
 | `--db-path`               | `DOCKDOE_DB_PATH`              | `dockdoe.sqlite` | SQLite database file                            |
@@ -86,6 +86,52 @@ also reads from an environment variable; the flag wins when both are set.
 | `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
 | `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
+
+### Multiple hosts
+
+Without a config file DockDoe monitors a single local host (the socket above).
+To watch several hosts — or a remote one — point `--config` / `DOCKDOE_CONFIG`
+at a `config.toml` whose `[[host]]` entries each describe one Docker host:
+
+```toml
+# Global options (same names as the env vars, minus the DOCKDOE_ prefix) may go
+# here too; anything omitted falls back to the flags/environment.
+bind = "0.0.0.0:8080"
+
+[[host]]
+name   = "local"                       # display name + URL slug, must be unique
+docker = "unix:///var/run/docker.sock" # the local socket
+
+[[host]]
+name        = "nas"
+docker      = "tcp://nas.lan:2375"     # a linuxserver/tecnativa socket proxy
+public_host = "nas.lan"                # where this host's published ports are reachable
+
+[[host]]
+name   = "prod"
+docker = "https://dockerproxy.example:2376"  # TLS-fronted proxy
+# tls_ca       = "/certs/ca.pem"        # trust a private CA (self-signed proxy)
+# tls_insecure = true                   # or skip verification entirely
+```
+
+Each host gets its own dashboard under `/host/<name>`; `/` lists them (and
+redirects straight through when there's only one). Per-host keys:
+
+- **`docker`** — the endpoint: `unix:///path` (local socket), `tcp://host:port`
+  or `http://host:port` (a plain socket proxy, e.g.
+  [`linuxserver/socket-proxy`](https://docs.linuxserver.io/images/docker-socket-proxy/),
+  best kept on a trusted network or behind Tailscale), or `https://host:port`
+  (TLS — verified against the built-in roots, plus `tls_ca`, or `tls_insecure`)
+- **`public_host`** — the host the published-port pills link to (see
+  [Port links](#port-links)); defaults to the endpoint's host for `tcp`/`https`
+- **`tls_ca`** — a PEM CA certificate to trust for an `https` endpoint
+- **`tls_insecure`** — skip TLS verification for an `https` endpoint (handy for a
+  self-signed reverse proxy; prefer `tls_ca` when you can)
+
+Remote hosts have two limits: the **compose.yml** tab only works for a host
+whose files are on the machine DockDoe runs on, and a proxy that denies actions
+or exec (returns 403) makes that host **read-only** — its action buttons and
+terminal are disabled automatically.
 
 ### Request hardening
 
@@ -150,7 +196,9 @@ Docker host.
 
 Behind a reverse proxy that breaks down: the browsing host is the proxy (on
 :443), where the container ports aren't open, so the links would point nowhere.
-Set `--port-host` / `DOCKDOE_PORT_HOST` to fix it:
+Set the host the ports are really reachable at — `--port-host` /
+`DOCKDOE_PORT_HOST` for the single local host, or a host's `public_host` in the
+[config](#multiple-hosts) — to:
 
 - **an IP or hostname** (e.g. `192.168.1.50`) — the links point there instead, so
   they still work when the Docker host is reachable directly even though the UI is
@@ -159,7 +207,9 @@ Set `--port-host` / `DOCKDOE_PORT_HOST` to fix it:
   only through the proxy where no direct `host:port` link would work from your
   browser.
 
-Leave it unset for the direct-access case.
+For a remote host, `public_host` defaults to the endpoint URL's host, so a
+`tcp://nas.lan:2375` host already links its ports to `nas.lan` without setting
+it. Leave it unset for the direct-access local case.
 
 ### Notifications
 

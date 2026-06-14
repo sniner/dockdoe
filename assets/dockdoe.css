@@ -77,6 +77,43 @@ header.host .logout {
 }
 header.host .logout:hover { color: var(--accent); }
 
+/* Host switcher: one tab per monitored host (shown only with several hosts). */
+.host-switch { display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+.host-tab {
+  padding: 0.2rem 0.6rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  border: 1px solid transparent;
+}
+.host-tab:hover { color: var(--accent); }
+.host-tab.current {
+  color: var(--fg);
+  background: var(--panel-2);
+  border-color: var(--border);
+  font-weight: 600;
+}
+
+/* Multi-host landing page: a simple list of hosts to choose from. */
+.host-list h2 { margin: 0 0 0.75rem; }
+.host-list ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  max-width: 22rem;
+}
+.host-list a {
+  display: block;
+  padding: 0.5rem 0.9rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.host-list a:hover { border-color: var(--accent); }
+
 main { padding: 1.25rem; max-width: 1100px; margin: 0 auto; }
 
 /* Login page: a single centred card, no header or live machinery. */
@@ -408,6 +445,9 @@ th.actions-col { text-align: right; }
 .act.restart:hover { color: var(--warn); border-color: var(--warn); }
 .act.stop:hover { color: var(--err); border-color: var(--err); }
 .act.htmx-request { opacity: 0.5; pointer-events: none; }
+/* Read-only host: actions are shown but disabled. */
+.act:disabled { opacity: 0.4; cursor: not-allowed; }
+.act:disabled:hover { background: var(--panel-2); color: var(--fg); border-color: var(--border); }
 
 h2 a.stack-link { color: var(--fg); }
 h2 a.stack-link:hover { color: var(--accent); }
