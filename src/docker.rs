@@ -1154,6 +1154,20 @@ fn local_cpu_count() -> usize {
     std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
+/// Whether `err` is a Docker `403 Forbidden` — what a socket proxy returns for
+/// an endpoint it is configured to deny (e.g. POST or exec on a read-only
+/// proxy). The bollard error survives `anyhow` context wrapping, so we downcast.
+#[must_use]
+pub fn is_forbidden(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<BollardError>(),
+        Some(BollardError::DockerResponseServerError {
+            status_code: 403,
+            ..
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

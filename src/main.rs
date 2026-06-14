@@ -19,6 +19,7 @@ mod web;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -210,6 +211,7 @@ async fn main() -> Result<()> {
                 shared,
                 docker: docker_handle,
                 links,
+                read_only: Arc::new(AtomicBool::new(false)),
             },
         );
         host_order.push(name);

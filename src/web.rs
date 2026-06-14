@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -29,7 +30,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
-use crate::docker::{Action, DockerHandle, ExecSession};
+use crate::docker::{Action, DockerHandle, ExecSession, is_forbidden};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
 use crate::store::{HistoryPoint, MetricPoint, Store};
 
@@ -64,6 +65,16 @@ pub struct HostRuntime {
     pub docker: DockerHandle,
     /// How this host's published-port pills link out.
     pub links: PortLinks,
+    /// Set once a lifecycle/exec call returns `403 Forbidden` — the socket proxy
+    /// is read-only. The UI then disables this host's action buttons and
+    /// terminal. Latches on; cleared only by a restart.
+    pub read_only: Arc<AtomicBool>,
+}
+
+impl HostRuntime {
+    fn is_read_only(&self) -> bool {
+        self.read_only.load(Ordering::Relaxed)
+    }
 }
 
 /// How published-port pills link out, resolved per host from `public_host` and
@@ -121,6 +132,8 @@ fn endpoint_host(url: &str) -> Option<String> {
 struct Render<'a> {
     host: &'a str,
     links: &'a PortLinks,
+    /// Whether this host is read-only (action buttons + terminal disabled).
+    read_only: bool,
 }
 
 #[derive(RustEmbed)]
@@ -283,12 +296,25 @@ async fn container_action(
         Ok(()) => {
             tracing::info!(%host, %id, ?action, "applied container action");
             // The next collector cycle refreshes state; echo the buttons back.
-            action_buttons(&host, &id).into_response()
+            action_buttons(&host, &id, rt.is_read_only()).into_response()
+        }
+        Err(err) if is_forbidden(&err) => {
+            mark_read_only(rt, &host);
+            // Swap in disabled buttons so the UI reflects the read-only host.
+            action_buttons(&host, &id, true).into_response()
         }
         Err(err) => {
             tracing::warn!(%host, %id, ?action, %err, "container action failed");
             (StatusCode::BAD_GATEWAY, format!("action failed: {err}")).into_response()
         }
+    }
+}
+
+/// Latch a host into read-only after it returned `403 Forbidden` (a socket
+/// proxy denying POST/exec). Logged once per flip.
+fn mark_read_only(rt: &HostRuntime, host: &str) {
+    if !rt.read_only.swap(true, Ordering::Relaxed) {
+        tracing::warn!(%host, "host is read-only (proxy returned 403); disabling actions");
     }
 }
 
@@ -316,6 +342,10 @@ async fn stack_action(
                 "applied stack action"
             );
         }
+        Err(err) if is_forbidden(&err) => {
+            mark_read_only(rt, &host);
+            return stack_action_buttons(&host, &name, true).into_response();
+        }
         Err(err) => {
             tracing::warn!(%host, stack = %name, ?action, %err, "stack action failed");
             return (
@@ -325,7 +355,7 @@ async fn stack_action(
                 .into_response();
         }
     }
-    stack_action_buttons(&host, &name).into_response()
+    stack_action_buttons(&host, &name, rt.is_read_only()).into_response()
 }
 
 /// Look up a host's runtime by its slug, or a 404 response if there's no such
@@ -571,16 +601,29 @@ async fn ws_exec(
     };
     let cmd = q.cmd.unwrap_or_default();
     let docker = rt.docker.clone();
-    ws.on_upgrade(move |socket| exec_bridge(socket, docker, id, cmd))
+    let read_only = Arc::clone(&rt.read_only);
+    ws.on_upgrade(move |socket| exec_bridge(socket, docker, host, id, cmd, read_only))
 }
 
 /// Bridge a WebSocket to a container exec session: engine output → client
 /// (binary), client input → engine stdin (binary), client resize JSON →
 /// `resize_exec` (text). Ends — closing the exec — as soon as either side does.
-async fn exec_bridge(mut socket: WebSocket, docker: DockerHandle, id: String, cmd: String) {
+async fn exec_bridge(
+    mut socket: WebSocket,
+    docker: DockerHandle,
+    host: String,
+    id: String,
+    cmd: String,
+    read_only: Arc<AtomicBool>,
+) {
     let session = match docker.exec_start(&id, &cmd).await {
         Ok(session) => session,
         Err(err) => {
+            // A proxy denying exec (403) latches the host read-only, so the
+            // detail page disables the terminal on its next render.
+            if is_forbidden(&err) && !read_only.swap(true, Ordering::Relaxed) {
+                tracing::warn!(%host, "host is read-only (proxy denied exec); disabling terminal");
+            }
             // Surface the failure in the terminal itself, then close.
             let msg = format!("\r\n\x1b[31mfailed to start terminal: {err}\x1b[0m\r\n");
             let _ = socket.send(Message::Text(msg.into())).await;
@@ -831,7 +874,14 @@ async fn dashboard(
         Err(resp) => return resp,
     };
     let snapshot = current_snapshot(rt);
-    dashboard_page(&state, &host, snapshot.as_ref(), &rt.links).into_response()
+    dashboard_page(
+        &state,
+        &host,
+        snapshot.as_ref(),
+        &rt.links,
+        rt.is_read_only(),
+    )
+    .into_response()
 }
 
 /// Detail page for a single container.
@@ -847,6 +897,7 @@ async fn container_detail(
     let r = Render {
         host: &host,
         links: &rt.links,
+        read_only: rt.is_read_only(),
     };
     let live_url = format!("/host/{host}/events");
     let Some(container) = snapshot
@@ -900,6 +951,7 @@ async fn stack_detail(
     let r = Render {
         host: &host,
         links: &rt.links,
+        read_only: rt.is_read_only(),
     };
     let members: Vec<ContainerMetrics> = snapshot
         .as_ref()
@@ -964,10 +1016,12 @@ async fn events_dashboard(
     let auth = state.auth.is_some();
     let order = Arc::clone(&state.host_order);
     let links = rt.links.clone();
+    let read_only = Arc::clone(&rt.read_only);
     let stream = dashboard_stream(rt.shared.clone()).flat_map(move |dash| {
         let r = Render {
             host: &host,
             links: &links,
+            read_only: read_only.load(Ordering::Relaxed),
         };
         futures_util::stream::iter([
             Ok::<_, Infallible>(header_event(&dash, &host, &order, auth)),
@@ -1025,10 +1079,12 @@ async fn events_stack(
     let auth = state.auth.is_some();
     let order = Arc::clone(&state.host_order);
     let links = rt.links.clone();
+    let read_only = Arc::clone(&rt.read_only);
     let stream = dashboard_stream(rt.shared.clone()).flat_map(move |dash| {
         let r = Render {
             host: &host,
             links: &links,
+            read_only: read_only.load(Ordering::Relaxed),
         };
         let members: Vec<&ContainerMetrics> = dash
             .containers
@@ -1250,8 +1306,13 @@ fn dashboard_page(
     host: &str,
     snapshot: Option<&Dashboard>,
     links: &PortLinks,
+    read_only: bool,
 ) -> Markup {
-    let r = Render { host, links };
+    let r = Render {
+        host,
+        links,
+        read_only,
+    };
     let main = html! {
         div id="containers" {
             @match snapshot {
@@ -1340,7 +1401,7 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
                     a.stack-pill href=(format!("/host/{host}/stack/{stack}")) { (stack) }
                 }
             }
-            (action_buttons(host, &c.id))
+            (action_buttons(host, &c.id, r.read_only))
         }
         // Live region: swapped wholesale by the `detail` SSE event so state and
         // facts track reality. The charts below are left untouched.
@@ -1358,7 +1419,7 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
                 hx-get=(format!("/host/{host}/api/container/{}/logs", c.id))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
         }
-        (terminal_panel(c, host))
+        (terminal_panel(c, host, r.read_only))
     }
 }
 
@@ -1366,13 +1427,13 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
 /// so we don't spawn one on every page view) and only for running containers;
 /// `terminal.js` opens the WebSocket on "Connect". The `⛶` button toggles a
 /// fullscreen class on the panel. Stopped containers get a disabled note.
-fn terminal_panel(c: &ContainerMetrics, host: &str) -> Markup {
-    let running = c.state == ContainerState::Running;
+fn terminal_panel(c: &ContainerMetrics, host: &str, read_only: bool) -> Markup {
+    let interactive = c.state == ContainerState::Running && !read_only;
     html! {
         section.panel.terminal id="terminal" data-ws=(format!("/host/{host}/ws/container/{}/exec", c.id)) {
             div.panel-head {
                 h3 { "Terminal" }
-                @if running {
+                @if interactive {
                     div.term-controls {
                         input.term-cmd type="text" value="/bin/sh"
                             aria-label="Command" spellcheck="false" autocapitalize="off";
@@ -1382,8 +1443,10 @@ fn terminal_panel(c: &ContainerMetrics, host: &str) -> Markup {
                     }
                 }
             }
-            @if running {
+            @if interactive {
                 div.term-view id="term-view" {}
+            } @else if read_only {
+                p.empty { "This host is read-only — the terminal is disabled." }
             } @else {
                 p.empty { "Container is not running." }
             }
@@ -1460,7 +1523,7 @@ fn stack_detail_main(
                 h1 { (name) }
                 span.count { "(" (members.len()) ")" }
             }
-            (stack_action_buttons(host, name))
+            (stack_action_buttons(host, name, r.read_only))
         }
         (charts_section(
             &format!("{name} · CPU (sum)"),
@@ -1485,19 +1548,19 @@ fn stack_detail_main(
 }
 
 /// Start/stop/restart-all buttons for a whole stack.
-fn stack_action_buttons(host: &str, name: &str) -> Markup {
+fn stack_action_buttons(host: &str, name: &str, read_only: bool) -> Markup {
     html! {
-        span.actions {
-            button.act.start type="button"
+        span.actions title=[read_only.then_some("host is read-only")] {
+            button.act.start type="button" disabled[read_only]
                 hx-post=(format!("/host/{host}/api/stack/{name}/start"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 title="Start all" { "▶" }
-            button.act.restart type="button"
+            button.act.restart type="button" disabled[read_only]
                 hx-post=(format!("/host/{host}/api/stack/{name}/restart"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm=(format!("Restart all containers in {name}?"))
                 title="Restart all" { "⟳" }
-            button.act.stop type="button"
+            button.act.stop type="button" disabled[read_only]
                 hx-post=(format!("/host/{host}/api/stack/{name}/stop"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm=(format!("Stop all containers in {name}?"))
@@ -1781,7 +1844,7 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize, r: &Render) -> Markup {
                     None => span style="color:var(--muted)" { "–" }
                 }
             }
-            td.actions-cell { (action_buttons(r.host, &c.id)) }
+            td.actions-cell { (action_buttons(r.host, &c.id, r.read_only)) }
         }
     }
 }
@@ -1789,19 +1852,19 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize, r: &Render) -> Markup {
 /// Start/stop/restart buttons for one container. Stateless so it can be reused
 /// verbatim in the row and as the HTMX response after an action. Destructive
 /// actions ask for confirmation.
-fn action_buttons(host: &str, id: &str) -> Markup {
+fn action_buttons(host: &str, id: &str, read_only: bool) -> Markup {
     html! {
-        span.actions {
-            button.act.start type="button"
+        span.actions title=[read_only.then_some("host is read-only")] {
+            button.act.start type="button" disabled[read_only]
                 hx-post=(format!("/host/{host}/api/container/{id}/start"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 title="Start" { "▶" }
-            button.act.restart type="button"
+            button.act.restart type="button" disabled[read_only]
                 hx-post=(format!("/host/{host}/api/container/{id}/restart"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm="Restart this container?"
                 title="Restart" { "⟳" }
-            button.act.stop type="button"
+            button.act.stop type="button" disabled[read_only]
                 hx-post=(format!("/host/{host}/api/container/{id}/stop"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm="Stop this container?"
