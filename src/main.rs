@@ -9,6 +9,7 @@
 
 mod auth;
 mod collector;
+mod config;
 mod docker;
 mod host;
 mod model;
@@ -39,6 +40,12 @@ use crate::store::Store;
 #[derive(Parser)]
 #[command(name = "dockdoe", version, about, long_about = None)]
 struct Cli {
+    /// Path to a `config.toml` listing the Docker hosts to monitor (and,
+    /// optionally, the global options below). Without it, DockDoe monitors a
+    /// single local host configured from these flags/environment variables.
+    #[arg(long, env = "DOCKDOE_CONFIG")]
+    config: Option<PathBuf>,
+
     /// Address the web UI binds to. Use 0.0.0.0:8080 to expose it on the network.
     #[arg(long, env = "DOCKDOE_BIND", default_value = "127.0.0.1:8080")]
     bind: String,
@@ -114,18 +121,19 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(&cli.log);
+    let cfg = config::load(cli.config.as_deref(), &cli)?;
+    init_tracing(&cfg.log);
 
-    let config = Config {
-        interval: Duration::from_secs(cli.interval_secs),
-        raw_retention: Duration::from_secs(cli.raw_retention_secs),
-        trend_bucket_secs: cli.trend_bucket_secs,
-        trend_retention: Duration::from_secs(cli.trend_retention_secs),
+    let collector_config = Config {
+        interval: Duration::from_secs(cfg.interval_secs),
+        raw_retention: Duration::from_secs(cfg.raw_retention_secs),
+        trend_bucket_secs: cfg.trend_bucket_secs,
+        trend_retention: Duration::from_secs(cfg.trend_retention_secs),
     };
 
-    let store = Store::open(&cli.db_path)
-        .with_context(|| format!("opening store at {}", cli.db_path.display()))?;
-    info!(db = %cli.db_path.display(), "store ready");
+    let store = Store::open(&cfg.db_path)
+        .with_context(|| format!("opening store at {}", cfg.db_path.display()))?;
+    info!(db = %cfg.db_path.display(), "store ready");
 
     let docker = DockerClient::connect()?;
     let docker_handle = DockerHandle::connect()?;
@@ -134,26 +142,26 @@ async fn main() -> Result<()> {
 
     // The chart seed window matches raw retention — that's how much history we
     // can show before the live stream takes over.
-    let seed_window = config.raw_retention;
+    let seed_window = collector_config.raw_retention;
 
-    let notifier = cli.apprise_url.map(|url| {
+    let notifier = cfg.apprise_url.clone().map(|url| {
         info!(
-            delay_secs = cli.notify_delay_secs,
+            delay_secs = cfg.notify_delay_secs,
             "Apprise notifications enabled"
         );
-        Notifier::new(url, Duration::from_secs(cli.notify_delay_secs))
+        Notifier::new(url, Duration::from_secs(cfg.notify_delay_secs))
     });
 
     tokio::spawn(collector::run(
         docker,
         host,
         store.clone(),
-        config,
+        collector_config,
         Arc::clone(&shared),
         notifier,
     ));
 
-    let allowed_hosts = web::normalize_allowed_hosts(&cli.allowed_hosts);
+    let allowed_hosts = web::normalize_allowed_hosts(&cfg.allowed_hosts);
     if !allowed_hosts.is_empty() {
         info!(hosts = ?allowed_hosts, "Host allowlist enabled (plus localhost forms)");
     }
@@ -161,14 +169,14 @@ async fn main() -> Result<()> {
     // Authentication is opt-in: both credentials must be set. Exactly one set is
     // almost certainly a misconfiguration, so fail loudly rather than silently
     // leaving the UI open.
-    let auth = match (cli.auth_user, cli.auth_password) {
+    let auth = match (cfg.auth_user.clone(), cfg.auth_password.clone()) {
         (Some(user), Some(password)) => {
             let secret = store.session_secret().context("loading session secret")?;
             info!(
-                secure_cookie = cli.cookie_secure,
+                secure_cookie = cfg.cookie_secure,
                 "web UI authentication enabled"
             );
-            Some(auth::Auth::new(user, password, secret, cli.cookie_secure))
+            Some(auth::Auth::new(user, password, secret, cfg.cookie_secure))
         }
         (None, None) => None,
         _ => anyhow::bail!(
@@ -183,12 +191,12 @@ async fn main() -> Result<()> {
         seed_window,
         allowed_hosts,
         auth,
-        port_host: cli.port_host,
+        port_host: cfg.hosts.first().and_then(|h| h.public_host.clone()),
     });
-    let listener = tokio::net::TcpListener::bind(&cli.bind)
+    let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
-        .with_context(|| format!("binding to {}", cli.bind))?;
-    info!(bind = %cli.bind, "DockDoe listening");
+        .with_context(|| format!("binding to {}", cfg.bind))?;
+    info!(bind = %cfg.bind, "DockDoe listening");
 
     // Stop on SIGTERM (what `docker stop` sends) or SIGINT (Ctrl-C). Without a
     // handler this matters most in a container: as PID 1 the process gets no
