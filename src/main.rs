@@ -183,12 +183,15 @@ async fn main() -> Result<()> {
             trend_bucket_secs: cfg.trend_bucket_secs,
             trend_retention: Duration::from_secs(cfg.trend_retention_secs),
         };
-        // One notifier per host (its own fresh state tracker); the host label in
-        // the message body is added in a later step.
-        let notifier = cfg
-            .apprise_url
-            .as_ref()
-            .map(|url| Notifier::new(url.clone(), Duration::from_secs(cfg.notify_delay_secs)));
+        // One notifier per host: its own state tracker, and the host's name
+        // stamped onto every alert it sends.
+        let notifier = cfg.apprise_url.as_ref().map(|url| {
+            Notifier::new(
+                name.clone(),
+                url.clone(),
+                Duration::from_secs(cfg.notify_delay_secs),
+            )
+        });
 
         tokio::spawn(collector::run(
             name.clone(),
