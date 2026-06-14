@@ -154,7 +154,11 @@ async fn main() -> Result<()> {
         Notifier::new(url, Duration::from_secs(cfg.notify_delay_secs))
     });
 
+    // M2: a single collector still drives the one local host. The host key is
+    // hardcoded "local" to match the web layer's reads; M4 wires the real
+    // per-host names from the config and spawns one collector per host.
     tokio::spawn(collector::run(
+        "local".to_string(),
         docker,
         cpu_count,
         store.clone(),

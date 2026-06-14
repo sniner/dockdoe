@@ -33,8 +33,10 @@ pub struct Config {
     pub trend_retention: Duration,
 }
 
-/// Run the collection loop forever.
+/// Run the collection loop forever for one Docker host. `host` is the host's
+/// config `name`, stamped onto every sample and trend row.
 pub async fn run(
+    host: String,
     mut docker: DockerClient,
     cpu_count: usize,
     store: Store,
@@ -43,13 +45,14 @@ pub async fn run(
     mut notifier: Option<Notifier>,
 ) {
     info!(
+        host = %host,
         interval = ?config.interval,
         raw_retention = ?config.raw_retention,
         trend_bucket_secs = config.trend_bucket_secs,
         "starting metrics collector"
     );
     let mut ticker = tokio::time::interval(config.interval);
-    let mut bucketer = Bucketer::new(config.trend_bucket_secs);
+    let mut bucketer = Bucketer::new(config.trend_bucket_secs, host.clone());
     let raw_retention_ms = duration_ms(config.raw_retention);
     let trend_retention_ms = duration_ms(config.trend_retention);
     let mut primed = false;
@@ -104,6 +107,7 @@ pub async fn run(
 
         persist(
             &store,
+            host.clone(),
             ts_ms,
             Arc::new(dashboard),
             flushed,
@@ -126,6 +130,7 @@ fn publish(shared: &SharedDashboard, dashboard: Dashboard) {
 /// buckets, and retention pruning. Failures are logged, not fatal.
 async fn persist(
     store: &Store,
+    host: String,
     ts_ms: u64,
     dashboard: Arc<Dashboard>,
     flushed: crate::trend::Flushed,
@@ -134,7 +139,7 @@ async fn persist(
 ) {
     let store = store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        store.insert_samples(ts_ms, &dashboard.containers)?;
+        store.insert_samples(&host, ts_ms, &dashboard.containers)?;
         store.insert_container_trends(&flushed.containers)?;
         store.prune_raw(raw_cutoff_ms)?;
         store.prune_trends(trend_cutoff_ms)?;

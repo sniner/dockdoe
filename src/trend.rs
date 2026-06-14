@@ -24,9 +24,11 @@ impl Flushed {
     }
 }
 
-/// Accumulates samples and emits rollups at bucket boundaries.
+/// Accumulates samples and emits rollups at bucket boundaries. One bucketer per
+/// host; the host name is stamped onto every trend row it emits.
 pub struct Bucketer {
     bucket_ms: u64,
+    host: String,
     /// Start (Unix ms, bucket-aligned) of the bucket currently filling.
     current_start: Option<u64>,
     containers: HashMap<(String, Metric), ContainerAcc>,
@@ -40,9 +42,10 @@ struct ContainerAcc {
 
 impl Bucketer {
     #[must_use]
-    pub fn new(bucket_secs: u64) -> Self {
+    pub fn new(bucket_secs: u64, host: String) -> Self {
         Self {
             bucket_ms: bucket_secs.max(1) * 1000,
+            host,
             current_start: None,
             containers: HashMap::new(),
         }
@@ -112,6 +115,7 @@ impl Bucketer {
                 out.containers.push(ContainerTrend {
                     bucket_start_ms: start,
                     bucket_secs,
+                    host: self.host.clone(),
                     id,
                     name: acc.name,
                     stack: acc.stack,
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn no_flush_within_one_bucket() {
-        let mut b = Bucketer::new(60); // 60s buckets
+        let mut b = Bucketer::new(60, "local".into()); // 60s buckets
         assert!(b.push(60_000, &[]).is_empty());
         assert!(b.push(90_000, &[]).is_empty());
         assert!(b.push(119_000, &[]).is_empty());
@@ -218,7 +222,7 @@ mod tests {
 
     #[test]
     fn flush_on_bucket_boundary_emits_rollups() {
-        let mut b = Bucketer::new(60);
+        let mut b = Bucketer::new(60, "local".into());
         // Bucket [60_000, 120_000): two CPU samples 2/8 for container "x".
         b.push(60_000, &[container("x", Some(2.0))]);
         b.push(90_000, &[container("x", Some(8.0))]);
@@ -240,7 +244,7 @@ mod tests {
 
     #[test]
     fn missing_cpu_samples_are_skipped() {
-        let mut b = Bucketer::new(60);
+        let mut b = Bucketer::new(60, "local".into());
         // First sample has no CPU yet (None) — must not count.
         b.push(60_000, &[container("x", None)]);
         b.push(90_000, &[container("x", Some(4.0))]);

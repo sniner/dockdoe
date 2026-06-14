@@ -105,6 +105,11 @@ fn parse_port_links(port_host: Option<String>) -> PortLinks {
 #[folder = "assets/"]
 struct Assets;
 
+/// The host key used for every store read. M2 placeholder: a single local host
+/// named "local" (matching the collector). M4 replaces this with the `{host}`
+/// path segment once routing and `AppState` are host-aware.
+const HOST: &str = "local";
+
 /// Build the application router.
 pub fn router(state: AppState) -> Router {
     // Fix the port-link mode for the process; ignore a redundant second call.
@@ -625,7 +630,7 @@ async fn metrics_container(
 ) -> Json<Vec<MetricPoint>> {
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
-    Json(fetch_points(move || store.recent_container_samples(&id, since)).await)
+    Json(fetch_points(move || store.recent_container_samples(HOST, &id, since)).await)
 }
 
 /// JSON backfill for a stack detail page's charts (trend-based, like the seed).
@@ -636,7 +641,7 @@ async fn metrics_stack(
 ) -> Json<Vec<MetricPoint>> {
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
-    Json(fetch_points(move || store.recent_stack_trends(&name, since)).await)
+    Json(fetch_points(move || store.recent_stack_trends(HOST, &name, since)).await)
 }
 
 /// Selectable named history ranges: query value and lookback window.
@@ -716,12 +721,12 @@ async fn history_container(
     let store = state.store.clone();
     let points = if w.raw {
         fetch_points(move || {
-            let samples = store.recent_container_samples(&id, w.since)?;
+            let samples = store.recent_container_samples(HOST, &id, w.since)?;
             Ok(raw_history(&samples, w.until))
         })
         .await
     } else {
-        fetch_points(move || store.history_container(&id, w.since, w.until, w.group_ms)).await
+        fetch_points(move || store.history_container(HOST, &id, w.since, w.until, w.group_ms)).await
     };
     Json(points).into_response()
 }
@@ -737,7 +742,7 @@ async fn history_stack(
         return INVALID_RANGE.into_response();
     };
     let store = state.store.clone();
-    Json(fetch_points(move || store.history_stack(&name, w.since, w.until, w.group_ms)).await)
+    Json(fetch_points(move || store.history_stack(HOST, &name, w.since, w.until, w.group_ms)).await)
         .into_response()
 }
 
@@ -784,7 +789,7 @@ async fn container_detail(
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
     let seed_id = id.clone();
-    let seed = fetch_points(move || store.recent_container_samples(&seed_id, since)).await;
+    let seed = fetch_points(move || store.recent_container_samples(HOST, &seed_id, since)).await;
 
     let live_url = format!("/events/container/{id}");
     let backfill_url = format!("/api/metrics/container/{id}");
@@ -836,7 +841,7 @@ async fn stack_detail(
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
     let seed_name = name.clone();
-    let seed = fetch_points(move || store.recent_stack_trends(&seed_name, since)).await;
+    let seed = fetch_points(move || store.recent_stack_trends(HOST, &seed_name, since)).await;
 
     // Members are non-empty here, so a snapshot exists; 1 is just a fallback.
     let cpu_count = snapshot.as_ref().map_or(1, |d| d.cpu_count);
