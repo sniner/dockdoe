@@ -98,6 +98,14 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_COOKIE_SECURE", default_value_t = false)]
     cookie_secure: bool,
 
+    /// Host the published container ports are reachable at, used for the port
+    /// pills' links. Unset: link to the host the browser uses (right when
+    /// browsing DockDoe directly on the Docker host). Set to an IP/hostname when
+    /// a reverse proxy serves the UI but the ports live elsewhere. Set to "off"
+    /// to render ports as plain pills with no links (proxy-only setups).
+    #[arg(long, env = "DOCKDOE_PORT_HOST")]
+    port_host: Option<String>,
+
     /// Tracing filter, e.g. "info" or "dockdoe=debug".
     #[arg(long, env = "DOCKDOE_LOG", default_value = "info")]
     log: String,
@@ -175,6 +183,7 @@ async fn main() -> Result<()> {
         seed_window,
         allowed_hosts,
         auth,
+        port_host: cli.port_host,
     });
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await

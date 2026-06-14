@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -53,6 +54,54 @@ pub struct AppState {
     pub allowed_hosts: Arc<[String]>,
     /// Login credentials and session signing. `None` leaves the UI open.
     pub auth: Option<Auth>,
+    /// Where published-port pills should link. Unset = the browsing host (live.js
+    /// rewrites the pills); a host = that fixed address; `off` = no links. See
+    /// [`PortLinks`].
+    pub port_host: Option<String>,
+}
+
+/// How published-port pills link out. Decided once at startup from
+/// `DOCKDOE_PORT_HOST` and read process-wide while rendering, so it need not be
+/// threaded through every `maud` helper.
+#[derive(Debug, Clone)]
+enum PortLinks {
+    /// Unset: the pill carries `data-port` and a `localhost` fallback href, which
+    /// live.js rewrites to whatever host the browser is pointed at. The right
+    /// default for browsing DockDoe directly on the Docker host.
+    Browser,
+    /// A fixed host (IP or name) the published ports are reachable at — for when
+    /// the browsing host (e.g. a reverse proxy on :443) is not where the ports
+    /// live, but the Docker host is reachable directly at this address.
+    Host(String),
+    /// Render ports as plain, unlinked pills — for setups reachable only through
+    /// a proxy, where no direct `host:port` link works from the browser.
+    Off,
+}
+
+static PORT_LINKS: OnceLock<PortLinks> = OnceLock::new();
+static BROWSER_LINKS: PortLinks = PortLinks::Browser;
+
+/// The configured port-link mode (defaults to [`PortLinks::Browser`]).
+fn port_links() -> &'static PortLinks {
+    PORT_LINKS.get().unwrap_or(&BROWSER_LINKS)
+}
+
+/// Parse `DOCKDOE_PORT_HOST` into a [`PortLinks`]: unset = browsing host,
+/// `off`/`none`/`-` = no links, anything else = that fixed host.
+fn parse_port_links(port_host: Option<String>) -> PortLinks {
+    match port_host {
+        None => PortLinks::Browser,
+        Some(s) => match s.trim() {
+            "" => PortLinks::Browser,
+            v if v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("none")
+                || v == "-" =>
+            {
+                PortLinks::Off
+            }
+            v => PortLinks::Host(v.to_string()),
+        },
+    }
 }
 
 #[derive(RustEmbed)]
@@ -61,6 +110,8 @@ struct Assets;
 
 /// Build the application router.
 pub fn router(state: AppState) -> Router {
+    // Fix the port-link mode for the process; ignore a redundant second call.
+    let _ = PORT_LINKS.set(parse_port_links(state.port_host.clone()));
     Router::new()
         .route("/", get(dashboard))
         .route("/container/{id}", get(container_detail))
@@ -1696,21 +1747,37 @@ fn port_chips(ports: &[Port]) -> Markup {
     }
 }
 
-/// A blue, clickable pill for one published port. `full` adds the
-/// "→ container-port" detail used on the container page; the dense tables show
-/// only the host port. The href targets `localhost` as a sane default for the
-/// common "browsing from the Docker host" case and is rewritten to the actual
-/// browsing host by live.js, the only place the real hostname is known.
+/// A blue pill for one published port. `full` adds the "→ container-port" detail
+/// used on the container page; the dense tables show only the host port.
+///
+/// Whether it is a link, and to where, follows [`port_links`]:
+/// - [`PortLinks::Browser`]: a `localhost` href plus `data-port`, which live.js
+///   rewrites to the actual browsing host (the only place the real hostname is
+///   known).
+/// - [`PortLinks::Host`]: a link straight to the configured host — for when the
+///   browsing host is a proxy but the Docker host is reachable directly.
+/// - [`PortLinks::Off`]: an unlinked pill, for proxy-only setups where no direct
+///   `host:port` link works.
 fn port_link(p: &Port, full: bool) -> Markup {
     let public = p.public.expect("port_link called on an unpublished port");
-    html! {
-        a.port-pill data-port=(public) target="_blank" rel="noopener"
-            href=(format!("http://localhost:{public}"))
-            title=(format!("host {public} → container {}/{}", p.private, p.proto)) {
-            (public)
-            @if full { " → " (p.private) }
-            (proto_suffix(&p.proto))
-        }
+    let title = format!("host {public} → container {}/{}", p.private, p.proto);
+    let label = html! {
+        (public)
+        @if full { " → " (p.private) }
+        (proto_suffix(&p.proto))
+    };
+    match port_links() {
+        PortLinks::Off => html! {
+            span.port-pill title=(title) { (label) }
+        },
+        PortLinks::Host(host) => html! {
+            a.port-pill target="_blank" rel="noopener"
+                href=(format!("http://{host}:{public}")) title=(title) { (label) }
+        },
+        PortLinks::Browser => html! {
+            a.port-pill data-port=(public) target="_blank" rel="noopener"
+                href=(format!("http://localhost:{public}")) title=(title) { (label) }
+        },
     }
 }
 
@@ -1819,6 +1886,39 @@ fn duration_ms(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_port_links_maps_each_mode() {
+        assert!(matches!(parse_port_links(None), PortLinks::Browser));
+        assert!(matches!(
+            parse_port_links(Some(String::new())),
+            PortLinks::Browser
+        ));
+        assert!(matches!(
+            parse_port_links(Some("  ".to_string())),
+            PortLinks::Browser
+        ));
+        assert!(matches!(
+            parse_port_links(Some("off".to_string())),
+            PortLinks::Off
+        ));
+        assert!(matches!(
+            parse_port_links(Some("OFF".to_string())),
+            PortLinks::Off
+        ));
+        assert!(matches!(
+            parse_port_links(Some("none".to_string())),
+            PortLinks::Off
+        ));
+        assert!(matches!(
+            parse_port_links(Some("-".to_string())),
+            PortLinks::Off
+        ));
+        match parse_port_links(Some(" 192.168.1.50 ".to_string())) {
+            PortLinks::Host(h) => assert_eq!(h, "192.168.1.50"),
+            other => panic!("expected Host, got {other:?}"),
+        }
+    }
 
     #[test]
     fn fmt_bytes_uses_binary_units() {

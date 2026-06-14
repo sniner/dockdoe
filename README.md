@@ -82,6 +82,7 @@ also reads from an environment variable; the flag wins when both are set.
 | `--auth-user`             | `DOCKDOE_AUTH_USER`            | *(unset)*        | Web UI login username, see below                |
 | `--auth-password`         | `DOCKDOE_AUTH_PASSWORD`        | *(unset)*        | Web UI login password, see below                |
 | `--cookie-secure`         | `DOCKDOE_COOKIE_SECURE`        | `false`          | Mark the session cookie `Secure` (HTTPS only)   |
+| `--port-host`             | `DOCKDOE_PORT_HOST`            | *(unset)*        | Host the port pills link to, see below          |
 | `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
 | `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
@@ -139,6 +140,26 @@ location / {
     proxy_set_header Connection "upgrade";
 }
 ```
+
+### Port links
+
+Each published container port shows as a pill; the published ones are links that
+open `http://<host>:<port>` in a new tab. By default `<host>` is whatever host
+you're browsing DockDoe at — exactly right when you browse it directly on the
+Docker host.
+
+Behind a reverse proxy that breaks down: the browsing host is the proxy (on
+:443), where the container ports aren't open, so the links would point nowhere.
+Set `--port-host` / `DOCKDOE_PORT_HOST` to fix it:
+
+- **an IP or hostname** (e.g. `192.168.1.50`) — the links point there instead, so
+  they still work when the Docker host is reachable directly even though the UI is
+  served through a proxy.
+- **`off`** — render the ports as plain pills with no links, for setups reachable
+  only through the proxy where no direct `host:port` link would work from your
+  browser.
+
+Leave it unset for the direct-access case.
 
 ### Notifications
 
