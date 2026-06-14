@@ -133,14 +133,17 @@ async fn main() -> Result<()> {
         .with_context(|| format!("opening store at {}", cfg.db_path.display()))?;
     info!(db = %cfg.db_path.display(), "store ready");
 
-    let docker = DockerClient::connect()?;
-    let docker_handle = DockerHandle::connect()?;
+    // M3: a single host (the first configured one). M4 loops over all of them.
+    let host_cfg = &cfg.hosts[0];
+    let docker = DockerClient::connect_from(host_cfg)
+        .with_context(|| format!("connecting to host {:?}", host_cfg.name))?;
+    let docker_handle = DockerHandle::connect_from(host_cfg)
+        .with_context(|| format!("connecting to host {:?}", host_cfg.name))?;
     let shared = Arc::new(RwLock::new(None));
 
-    // CPU count scales the container CPU bars (a full bar is the whole host).
-    // For the local host the process' available parallelism is the host count;
-    // M3 sources it per host from the Docker daemon's `info` instead.
-    let cpu_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    // CPU count scales the container CPU bars (a full bar is the whole host);
+    // sourced from the daemon's `info` (NCPU), falling back to local parallelism.
+    let cpu_count = docker.cpu_count().await;
 
     // The chart seed window matches raw retention — that's how much history we
     // can show before the live stream takes over.
