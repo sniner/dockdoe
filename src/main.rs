@@ -17,6 +17,7 @@ mod store;
 mod trend;
 mod web;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -122,53 +123,13 @@ async fn main() -> Result<()> {
     let cfg = config::load(cli.config.as_deref(), &cli)?;
     init_tracing(&cfg.log);
 
-    let collector_config = Config {
-        interval: Duration::from_secs(cfg.interval_secs),
-        raw_retention: Duration::from_secs(cfg.raw_retention_secs),
-        trend_bucket_secs: cfg.trend_bucket_secs,
-        trend_retention: Duration::from_secs(cfg.trend_retention_secs),
-    };
-
     let store = Store::open(&cfg.db_path)
         .with_context(|| format!("opening store at {}", cfg.db_path.display()))?;
     info!(db = %cfg.db_path.display(), "store ready");
 
-    // M3: a single host (the first configured one). M4 loops over all of them.
-    let host_cfg = &cfg.hosts[0];
-    let docker = DockerClient::connect_from(host_cfg)
-        .with_context(|| format!("connecting to host {:?}", host_cfg.name))?;
-    let docker_handle = DockerHandle::connect_from(host_cfg)
-        .with_context(|| format!("connecting to host {:?}", host_cfg.name))?;
-    let shared = Arc::new(RwLock::new(None));
-
-    // CPU count scales the container CPU bars (a full bar is the whole host);
-    // sourced from the daemon's `info` (NCPU), falling back to local parallelism.
-    let cpu_count = docker.cpu_count().await;
-
     // The chart seed window matches raw retention — that's how much history we
     // can show before the live stream takes over.
-    let seed_window = collector_config.raw_retention;
-
-    let notifier = cfg.apprise_url.clone().map(|url| {
-        info!(
-            delay_secs = cfg.notify_delay_secs,
-            "Apprise notifications enabled"
-        );
-        Notifier::new(url, Duration::from_secs(cfg.notify_delay_secs))
-    });
-
-    // M2: a single collector still drives the one local host. The host key is
-    // hardcoded "local" to match the web layer's reads; M4 wires the real
-    // per-host names from the config and spawns one collector per host.
-    tokio::spawn(collector::run(
-        "local".to_string(),
-        docker,
-        cpu_count,
-        store.clone(),
-        collector_config,
-        Arc::clone(&shared),
-        notifier,
-    ));
+    let seed_window = Duration::from_secs(cfg.raw_retention_secs);
 
     let allowed_hosts = web::normalize_allowed_hosts(&cfg.allowed_hosts);
     if !allowed_hosts.is_empty() {
@@ -177,7 +138,8 @@ async fn main() -> Result<()> {
 
     // Authentication is opt-in: both credentials must be set. Exactly one set is
     // almost certainly a misconfiguration, so fail loudly rather than silently
-    // leaving the UI open.
+    // leaving the UI open. Resolved before the hosts so the session secret read
+    // happens while the store is still ours to borrow.
     let auth = match (cfg.auth_user.clone(), cfg.auth_password.clone()) {
         (Some(user), Some(password)) => {
             let secret = store.session_secret().context("loading session secret")?;
@@ -193,14 +155,71 @@ async fn main() -> Result<()> {
         ),
     };
 
+    if cfg.apprise_url.is_some() {
+        info!(
+            delay_secs = cfg.notify_delay_secs,
+            "Apprise notifications enabled"
+        );
+    }
+
+    // Connect each configured host, start its collector, and assemble the
+    // per-host runtime the web layer serves.
+    let mut hosts = HashMap::with_capacity(cfg.hosts.len());
+    let mut host_order = Vec::with_capacity(cfg.hosts.len());
+    for host_cfg in &cfg.hosts {
+        let name = host_cfg.name.clone();
+        let docker = DockerClient::connect_from(host_cfg)
+            .with_context(|| format!("connecting to host {name:?}"))?;
+        let docker_handle = DockerHandle::connect_from(host_cfg)
+            .with_context(|| format!("connecting to host {name:?}"))?;
+        // CPU count scales the container CPU bars (a full bar is the whole host);
+        // from the daemon's `info` (NCPU), falling back to local parallelism.
+        let cpu_count = docker.cpu_count().await;
+        let shared = Arc::new(RwLock::new(None));
+
+        let collector_config = Config {
+            interval: Duration::from_secs(cfg.interval_secs),
+            raw_retention: Duration::from_secs(cfg.raw_retention_secs),
+            trend_bucket_secs: cfg.trend_bucket_secs,
+            trend_retention: Duration::from_secs(cfg.trend_retention_secs),
+        };
+        // One notifier per host (its own fresh state tracker); the host label in
+        // the message body is added in a later step.
+        let notifier = cfg
+            .apprise_url
+            .as_ref()
+            .map(|url| Notifier::new(url.clone(), Duration::from_secs(cfg.notify_delay_secs)));
+
+        tokio::spawn(collector::run(
+            name.clone(),
+            docker,
+            cpu_count,
+            store.clone(),
+            collector_config,
+            Arc::clone(&shared),
+            notifier,
+        ));
+
+        let links = web::PortLinks::from_config(host_cfg.public_host.as_deref(), &host_cfg.docker);
+        hosts.insert(
+            name.clone(),
+            web::HostRuntime {
+                shared,
+                docker: docker_handle,
+                links,
+            },
+        );
+        host_order.push(name);
+    }
+    info!(hosts = ?host_order, "monitoring hosts");
+
     let app = web::router(web::AppState {
-        shared,
+        hosts: Arc::new(hosts),
+        host_order: host_order.into(),
         store,
-        docker: docker_handle,
         seed_window,
         allowed_hosts,
         auth,
-        port_host: cfg.hosts.first().and_then(|h| h.public_host.clone()),
     });
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await

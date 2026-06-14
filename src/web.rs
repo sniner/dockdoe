@@ -9,10 +9,9 @@
 //! the uPlot charts, seeded from the store on first load). One connection per
 //! page keeps us under the browser's per-host HTTP/1.1 connection limit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -40,13 +39,12 @@ const SNAPSHOT_POLL: Duration = Duration::from_secs(1);
 /// Shared state for the web layer.
 #[derive(Clone)]
 pub struct AppState {
-    /// The latest snapshot — single source of truth for both the initial render
-    /// and the live SSE streams.
-    pub shared: SharedDashboard,
+    /// The monitored Docker hosts, keyed by their config `name` (the URL slug).
+    pub hosts: Arc<HashMap<String, HostRuntime>>,
+    /// Host names in config order — drives the index page and host switcher.
+    pub host_order: Arc<[String]>,
     /// Store, for seeding charts with recent history.
     pub store: Store,
-    /// Docker handle for lifecycle actions and logs.
-    pub docker: DockerHandle,
     /// How far back to seed charts on first load.
     pub seed_window: Duration,
     /// Hostnames the UI may be addressed as (normalized: lowercase, no port).
@@ -54,90 +52,114 @@ pub struct AppState {
     pub allowed_hosts: Arc<[String]>,
     /// Login credentials and session signing. `None` leaves the UI open.
     pub auth: Option<Auth>,
-    /// Where published-port pills should link. Unset = the browsing host (live.js
-    /// rewrites the pills); a host = that fixed address; `off` = no links. See
-    /// [`PortLinks`].
-    pub port_host: Option<String>,
 }
 
-/// How published-port pills link out. Decided once at startup from
-/// `DOCKDOE_PORT_HOST` and read process-wide while rendering, so it need not be
-/// threaded through every `maud` helper.
+/// Everything the web layer needs for one monitored host.
+#[derive(Clone)]
+pub struct HostRuntime {
+    /// The latest snapshot for this host — single source of truth for both the
+    /// initial render and the live SSE streams.
+    pub shared: SharedDashboard,
+    /// Docker handle for this host's lifecycle actions and logs.
+    pub docker: DockerHandle,
+    /// How this host's published-port pills link out.
+    pub links: PortLinks,
+}
+
+/// How published-port pills link out, resolved per host from `public_host` and
+/// the endpoint URL.
 #[derive(Debug, Clone)]
-enum PortLinks {
-    /// Unset: the pill carries `data-port` and a `localhost` fallback href, which
+pub enum PortLinks {
+    /// The pill carries `data-port` and a `localhost` fallback href, which
     /// live.js rewrites to whatever host the browser is pointed at. The right
-    /// default for browsing DockDoe directly on the Docker host.
+    /// default for the local host browsed directly on the Docker machine.
     Browser,
-    /// A fixed host (IP or name) the published ports are reachable at — for when
-    /// the browsing host (e.g. a reverse proxy on :443) is not where the ports
-    /// live, but the Docker host is reachable directly at this address.
+    /// A fixed host (IP or name) the published ports are reachable at — a remote
+    /// host's address, or an override when the browsing host isn't where the
+    /// ports live.
     Host(String),
     /// Render ports as plain, unlinked pills — for setups reachable only through
     /// a proxy, where no direct `host:port` link works from the browser.
     Off,
 }
 
-static PORT_LINKS: OnceLock<PortLinks> = OnceLock::new();
-static BROWSER_LINKS: PortLinks = PortLinks::Browser;
-
-/// The configured port-link mode (defaults to [`PortLinks::Browser`]).
-fn port_links() -> &'static PortLinks {
-    PORT_LINKS.get().unwrap_or(&BROWSER_LINKS)
+impl PortLinks {
+    /// Resolve the port-link mode for a host: an explicit `public_host` wins
+    /// (`off`/`none`/`-` → no links, otherwise a fixed host); failing that, the
+    /// host parsed from a `tcp`/`http`/`https` endpoint URL; failing that (a unix
+    /// socket — the local host), the browsing host.
+    #[must_use]
+    pub fn from_config(public_host: Option<&str>, docker_url: &str) -> Self {
+        if let Some(s) = public_host.map(str::trim).filter(|s| !s.is_empty()) {
+            return if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") || s == "-" {
+                PortLinks::Off
+            } else {
+                PortLinks::Host(s.to_string())
+            };
+        }
+        endpoint_host(docker_url).map_or(PortLinks::Browser, PortLinks::Host)
+    }
 }
 
-/// Parse `DOCKDOE_PORT_HOST` into a [`PortLinks`]: unset = browsing host,
-/// `off`/`none`/`-` = no links, anything else = that fixed host.
-fn parse_port_links(port_host: Option<String>) -> PortLinks {
-    match port_host {
-        None => PortLinks::Browser,
-        Some(s) => match s.trim() {
-            "" => PortLinks::Browser,
-            v if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v == "-" => {
-                PortLinks::Off
-            }
-            v => PortLinks::Host(v.to_string()),
-        },
+/// The host part of a `tcp`/`http`/`https` Docker endpoint URL (for deriving the
+/// default port-link host). `None` for a unix socket or a bare path.
+fn endpoint_host(url: &str) -> Option<String> {
+    let rest = ["tcp://", "http://", "https://"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))?;
+    // IPv6 literal: keep everything inside the brackets.
+    if let Some(after) = rest.strip_prefix('[') {
+        return after.split(']').next().map(str::to_string);
     }
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Per-request render context: which host's pages we're building, and how its
+/// published-port pills link out. Threaded through the `maud` helpers so every
+/// in-page link is host-scoped (`/host/{host}/…`).
+struct Render<'a> {
+    host: &'a str,
+    links: &'a PortLinks,
 }
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
 struct Assets;
 
-/// The host key used for every store read. M2 placeholder: a single local host
-/// named "local" (matching the collector). M4 replaces this with the `{host}`
-/// path segment once routing and `AppState` are host-aware.
-const HOST: &str = "local";
-
 /// Build the application router.
 pub fn router(state: AppState) -> Router {
-    // Fix the port-link mode for the process; ignore a redundant second call.
-    let _ = PORT_LINKS.set(parse_port_links(state.port_host.clone()));
     Router::new()
-        .route("/", get(dashboard))
-        .route("/container/{id}", get(container_detail))
-        .route("/stack/{name}", get(stack_detail))
-        .route("/events", get(events_dashboard))
-        .route("/events/container/{id}", get(events_container))
-        .route("/events/stack/{name}", get(events_stack))
-        .route("/api/container/{id}/logs", get(container_logs))
-        .route("/api/stack/{name}/compose", get(stack_compose))
-        .route("/api/metrics/container/{id}", get(metrics_container))
-        .route("/api/metrics/stack/{name}", get(metrics_stack))
-        .route("/api/history/container/{id}", get(history_container))
-        .route("/api/history/stack/{name}", get(history_stack))
+        .route("/", get(host_index))
+        .route("/host/{host}", get(dashboard))
+        .route("/host/{host}/container/{id}", get(container_detail))
+        .route("/host/{host}/stack/{name}", get(stack_detail))
+        .route("/host/{host}/events", get(events_dashboard))
+        .route("/host/{host}/events/container/{id}", get(events_container))
+        .route("/host/{host}/events/stack/{name}", get(events_stack))
+        .route("/host/{host}/api/container/{id}/logs", get(container_logs))
+        .route("/host/{host}/api/stack/{name}/compose", get(stack_compose))
         .route(
-            "/api/container/{id}/{action}",
+            "/host/{host}/api/metrics/container/{id}",
+            get(metrics_container),
+        )
+        .route("/host/{host}/api/metrics/stack/{name}", get(metrics_stack))
+        .route(
+            "/host/{host}/api/history/container/{id}",
+            get(history_container),
+        )
+        .route("/host/{host}/api/history/stack/{name}", get(history_stack))
+        .route(
+            "/host/{host}/api/container/{id}/{action}",
             axum::routing::post(container_action).layer(middleware::from_fn(require_htmx)),
         )
         .route(
-            "/api/stack/{name}/{action}",
+            "/host/{host}/api/stack/{name}/{action}",
             axum::routing::post(stack_action).layer(middleware::from_fn(require_htmx)),
         )
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", get(logout))
-        .route("/ws/container/{id}/exec", get(ws_exec))
+        .route("/host/{host}/ws/container/{id}/exec", get(ws_exec))
         .route("/assets/{*path}", get(asset))
         // Auth wraps everything (it allowlists /login and /assets internally);
         // the host check sits outside it so rejected hosts never reach auth.
@@ -248,19 +270,23 @@ pub fn normalize_allowed_hosts(hosts: &[String]) -> Arc<[String]> {
 /// rendered action-button group so HTMX can swap it in place.
 async fn container_action(
     State(state): State<AppState>,
-    axum::extract::Path((id, action)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((host, id, action)): axum::extract::Path<(String, String, String)>,
 ) -> Response {
+    let rt = match host_rt(&state, &host) {
+        Ok(rt) => rt,
+        Err(resp) => return resp,
+    };
     let Some(action) = Action::parse(&action) else {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
-    match state.docker.apply(&id, action).await {
+    match rt.docker.apply(&id, action).await {
         Ok(()) => {
-            tracing::info!(%id, ?action, "applied container action");
+            tracing::info!(%host, %id, ?action, "applied container action");
             // The next collector cycle refreshes state; echo the buttons back.
-            action_buttons(&id).into_response()
+            action_buttons(&host, &id).into_response()
         }
         Err(err) => {
-            tracing::warn!(%id, ?action, %err, "container action failed");
+            tracing::warn!(%host, %id, ?action, %err, "container action failed");
             (StatusCode::BAD_GATEWAY, format!("action failed: {err}")).into_response()
         }
     }
@@ -270,24 +296,28 @@ async fn container_action(
 /// buttons back for HTMX to swap.
 async fn stack_action(
     State(state): State<AppState>,
-    axum::extract::Path((name, action)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((host, name, action)): axum::extract::Path<(String, String, String)>,
 ) -> Response {
+    let rt = match host_rt(&state, &host) {
+        Ok(rt) => rt,
+        Err(resp) => return resp,
+    };
     let Some(action) = Action::parse(&action) else {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
 
     // Orchestrate dependency-aware: the docker layer reads the compose
     // depends_on labels and starts/stops members in the right order.
-    match state.docker.stack_action(&name, action).await {
+    match rt.docker.stack_action(&name, action).await {
         Ok(outcome) => {
             tracing::info!(
-                stack = %name, ?action,
+                %host, stack = %name, ?action,
                 total = outcome.total, failed = outcome.failed,
                 "applied stack action"
             );
         }
         Err(err) => {
-            tracing::warn!(stack = %name, ?action, %err, "stack action failed");
+            tracing::warn!(%host, stack = %name, ?action, %err, "stack action failed");
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("stack action failed: {err}"),
@@ -295,12 +325,33 @@ async fn stack_action(
                 .into_response();
         }
     }
-    stack_action_buttons(&name).into_response()
+    stack_action_buttons(&host, &name).into_response()
 }
 
-/// The current snapshot, cloned out of the shared lock.
-fn current_snapshot(state: &AppState) -> Option<Dashboard> {
-    state.shared.read().ok().and_then(|guard| guard.clone())
+/// Look up a host's runtime by its slug, or a 404 response if there's no such
+/// configured host.
+// The `Err` is a ready-to-return `Response`, which is a large type — that's the
+// point here (callers `return` it directly), not a value to shrink.
+#[allow(clippy::result_large_err, reason = "Err is a ready Response to return")]
+fn host_rt<'a>(state: &'a AppState, host: &str) -> Result<&'a HostRuntime, Response> {
+    state
+        .hosts
+        .get(host)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown host").into_response())
+}
+
+/// The landing page at `/`. With a single host it redirects straight to that
+/// host; with several it shows a chooser.
+async fn host_index(State(state): State<AppState>) -> Response {
+    if let [only] = state.host_order.as_ref() {
+        return Redirect::to(&format!("/host/{only}")).into_response();
+    }
+    host_index_page(&state.host_order, state.auth.is_some()).into_response()
+}
+
+/// The current snapshot for one host, cloned out of its shared lock.
+fn current_snapshot(rt: &HostRuntime) -> Option<Dashboard> {
+    rt.shared.read().ok().and_then(|guard| guard.clone())
 }
 
 /// Number of log lines to tail for the logs panel.
@@ -309,13 +360,16 @@ const LOG_TAIL_LINES: u32 = 200;
 /// Return the tail of a container's logs as an HTML fragment for the logs panel.
 async fn container_logs(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
 ) -> Markup {
-    match state.docker.logs_tail(&id, LOG_TAIL_LINES).await {
+    let Some(rt) = state.hosts.get(&host) else {
+        return html! { span.muted { "Unknown host." } };
+    };
+    match rt.docker.logs_tail(&id, LOG_TAIL_LINES).await {
         Ok(text) if text.trim().is_empty() => html! { span.muted { "(no logs)" } },
         Ok(text) => render_log_lines(&strip_ansi(&text)),
         Err(err) => {
-            tracing::warn!(%id, %err, "fetching logs failed");
+            tracing::warn!(%host, %id, %err, "fetching logs failed");
             html! { span.muted { "Could not read logs: " (err) } }
         }
     }
@@ -362,12 +416,15 @@ fn split_log_timestamp(line: &str) -> Option<(&str, &str)> {
 /// Return a stack's compose file(s) as an HTML fragment for the compose panel.
 async fn stack_compose(
     State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
 ) -> Markup {
-    let paths = match state.docker.compose_config_files(&name).await {
+    let Some(rt) = state.hosts.get(&host) else {
+        return html! { span.muted { "Unknown host." } };
+    };
+    let paths = match rt.docker.compose_config_files(&name).await {
         Ok(paths) => paths,
         Err(err) => {
-            tracing::warn!(stack = %name, %err, "resolving compose files failed");
+            tracing::warn!(%host, stack = %name, %err, "resolving compose files failed");
             return html! { span.muted { "Could not determine compose file: " (err) } };
         }
     };
@@ -505,12 +562,15 @@ struct ResizeMsg {
 /// the session cookie. Binary frames are stdin, text frames are resize JSON.
 async fn ws_exec(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
     Query(q): Query<ExecQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Some(rt) = state.hosts.get(&host) else {
+        return (StatusCode::NOT_FOUND, "unknown host").into_response();
+    };
     let cmd = q.cmd.unwrap_or_default();
-    let docker = state.docker.clone();
+    let docker = rt.docker.clone();
     ws.on_upgrade(move |socket| exec_bridge(socket, docker, id, cmd))
 }
 
@@ -625,23 +685,23 @@ where
 /// page was hidden, in the bfcache, or suspended.
 async fn metrics_container(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
     Query(q): Query<SinceQuery>,
 ) -> Json<Vec<MetricPoint>> {
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
-    Json(fetch_points(move || store.recent_container_samples(HOST, &id, since)).await)
+    Json(fetch_points(move || store.recent_container_samples(&host, &id, since)).await)
 }
 
 /// JSON backfill for a stack detail page's charts (trend-based, like the seed).
 async fn metrics_stack(
     State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
     Query(q): Query<SinceQuery>,
 ) -> Json<Vec<MetricPoint>> {
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
-    Json(fetch_points(move || store.recent_stack_trends(HOST, &name, since)).await)
+    Json(fetch_points(move || store.recent_stack_trends(&host, &name, since)).await)
 }
 
 /// Selectable named history ranges: query value and lookback window.
@@ -712,7 +772,7 @@ const INVALID_RANGE: (StatusCode, &str) = (
 /// window.
 async fn history_container(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
     Query(q): Query<HistoryQuery>,
 ) -> Response {
     let Some(w) = resolve_history(&q, state.seed_window) else {
@@ -721,12 +781,13 @@ async fn history_container(
     let store = state.store.clone();
     let points = if w.raw {
         fetch_points(move || {
-            let samples = store.recent_container_samples(HOST, &id, w.since)?;
+            let samples = store.recent_container_samples(&host, &id, w.since)?;
             Ok(raw_history(&samples, w.until))
         })
         .await
     } else {
-        fetch_points(move || store.history_container(HOST, &id, w.since, w.until, w.group_ms)).await
+        fetch_points(move || store.history_container(&host, &id, w.since, w.until, w.group_ms))
+            .await
     };
     Json(points).into_response()
 }
@@ -735,15 +796,17 @@ async fn history_container(
 /// windows come from the trend buckets.
 async fn history_stack(
     State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
     Query(q): Query<HistoryQuery>,
 ) -> Response {
     let Some(w) = resolve_history(&q, state.seed_window) else {
         return INVALID_RANGE.into_response();
     };
     let store = state.store.clone();
-    Json(fetch_points(move || store.history_stack(HOST, &name, w.since, w.until, w.group_ms)).await)
-        .into_response()
+    Json(
+        fetch_points(move || store.history_stack(&host, &name, w.since, w.until, w.group_ms)).await,
+    )
+    .into_response()
 }
 
 /// Lift raw samples into the history shape, dropping anything past the
@@ -759,28 +822,45 @@ fn raw_history(samples: &[MetricPoint], until_ms: u64) -> Vec<HistoryPoint> {
 /// Render the dashboard from the latest snapshot. The dashboard has no charts
 /// of its own (the host-metrics header was removed); it only lists containers
 /// and updates them live over SSE.
-async fn dashboard(State(state): State<AppState>) -> Markup {
-    let snapshot = current_snapshot(&state);
-    dashboard_page(snapshot.as_ref(), state.auth.is_some())
+async fn dashboard(
+    State(state): State<AppState>,
+    axum::extract::Path(host): axum::extract::Path<String>,
+) -> Response {
+    let rt = match host_rt(&state, &host) {
+        Ok(rt) => rt,
+        Err(resp) => return resp,
+    };
+    let snapshot = current_snapshot(rt);
+    dashboard_page(&state, &host, snapshot.as_ref(), &rt.links).into_response()
 }
 
 /// Detail page for a single container.
 async fn container_detail(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    let snapshot = current_snapshot(&state);
+    let rt = match host_rt(&state, &host) {
+        Ok(rt) => rt,
+        Err(resp) => return resp,
+    };
+    let snapshot = current_snapshot(rt);
+    let r = Render {
+        host: &host,
+        links: &rt.links,
+    };
+    let live_url = format!("/host/{host}/events");
     let Some(container) = snapshot
         .as_ref()
         .and_then(|d| d.containers.iter().find(|c| c.id == id).cloned())
     else {
         let body = shell(
+            &state,
+            &host,
             snapshot.as_ref(),
             html! { p.empty { "Container not found." } },
             &[],
-            "/events",
-            "/api/metrics/host",
-            state.auth.is_some(),
+            &live_url,
+            "",
             false,
         );
         return (StatusCode::NOT_FOUND, body).into_response();
@@ -788,18 +868,20 @@ async fn container_detail(
 
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
-    let seed_id = id.clone();
-    let seed = fetch_points(move || store.recent_container_samples(HOST, &seed_id, since)).await;
+    let (seed_host, seed_id) = (host.clone(), id.clone());
+    let seed =
+        fetch_points(move || store.recent_container_samples(&seed_host, &seed_id, since)).await;
 
-    let live_url = format!("/events/container/{id}");
-    let backfill_url = format!("/api/metrics/container/{id}");
+    let live_url = format!("/host/{host}/events/container/{id}");
+    let backfill_url = format!("/host/{host}/api/metrics/container/{id}");
     shell(
+        &state,
+        &host,
         snapshot.as_ref(),
-        container_detail_main(&container),
+        container_detail_main(&container, &r),
         &seed,
         &live_url,
         &backfill_url,
-        state.auth.is_some(),
         true,
     )
     .into_response()
@@ -808,9 +890,17 @@ async fn container_detail(
 /// Detail page for a compose stack.
 async fn stack_detail(
     State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    let snapshot = current_snapshot(&state);
+    let rt = match host_rt(&state, &host) {
+        Ok(rt) => rt,
+        Err(resp) => return resp,
+    };
+    let snapshot = current_snapshot(rt);
+    let r = Render {
+        host: &host,
+        links: &rt.links,
+    };
     let members: Vec<ContainerMetrics> = snapshot
         .as_ref()
         .map(|d| {
@@ -824,12 +914,13 @@ async fn stack_detail(
 
     if members.is_empty() {
         let body = shell(
+            &state,
+            &host,
             snapshot.as_ref(),
             html! { p.empty { "Stack not found." } },
             &[],
-            "/events",
-            "/api/metrics/host",
-            state.auth.is_some(),
+            &format!("/host/{host}/events"),
+            "",
             false,
         );
         return (StatusCode::NOT_FOUND, body).into_response();
@@ -840,20 +931,21 @@ async fn stack_detail(
     // up with the live aggregate (sum of current member values).
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let store = state.store.clone();
-    let seed_name = name.clone();
-    let seed = fetch_points(move || store.recent_stack_trends(HOST, &seed_name, since)).await;
+    let (seed_host, seed_name) = (host.clone(), name.clone());
+    let seed = fetch_points(move || store.recent_stack_trends(&seed_host, &seed_name, since)).await;
 
     // Members are non-empty here, so a snapshot exists; 1 is just a fallback.
     let cpu_count = snapshot.as_ref().map_or(1, |d| d.cpu_count);
-    let live_url = format!("/events/stack/{name}");
-    let backfill_url = format!("/api/metrics/stack/{name}");
+    let live_url = format!("/host/{host}/events/stack/{name}");
+    let backfill_url = format!("/host/{host}/api/metrics/stack/{name}");
     shell(
+        &state,
+        &host,
         snapshot.as_ref(),
-        stack_detail_main(&name, &members, cpu_count),
+        stack_detail_main(&name, &members, cpu_count, &r),
         &seed,
         &live_url,
         &backfill_url,
-        state.auth.is_some(),
         false,
     )
     .into_response()
@@ -864,28 +956,46 @@ async fn stack_detail(
 /// per-host connection limit. The dashboard has no charts, so no `metrics`.
 async fn events_dashboard(
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let auth_enabled = state.auth.is_some();
-    let stream = dashboard_stream(&state).flat_map(move |dash| {
+    axum::extract::Path(host): axum::extract::Path<String>,
+) -> Response {
+    let Some(rt) = state.hosts.get(&host) else {
+        return (StatusCode::NOT_FOUND, "unknown host").into_response();
+    };
+    let auth = state.auth.is_some();
+    let order = Arc::clone(&state.host_order);
+    let links = rt.links.clone();
+    let stream = dashboard_stream(rt.shared.clone()).flat_map(move |dash| {
+        let r = Render {
+            host: &host,
+            links: &links,
+        };
         futures_util::stream::iter([
-            Ok(header_event(&dash, auth_enabled)),
-            Ok(containers_event(&dash)),
+            Ok::<_, Infallible>(header_event(&dash, &host, &order, auth)),
+            Ok(containers_event(&dash, &r)),
         ])
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Single live stream for a container detail page: `header` plus the
 /// container's `metrics` point.
 async fn events_container(
     State(state): State<AppState>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let auth_enabled = state.auth.is_some();
-    let stream = dashboard_stream(&state).flat_map(move |dash| {
-        let mut events = vec![Ok(header_event(&dash, auth_enabled))];
+    axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(rt) = state.hosts.get(&host) else {
+        return (StatusCode::NOT_FOUND, "unknown host").into_response();
+    };
+    let auth = state.auth.is_some();
+    let order = Arc::clone(&state.host_order);
+    let links = rt.links.clone();
+    let stream = dashboard_stream(rt.shared.clone()).flat_map(move |dash| {
+        let mut events: Vec<Result<Event, Infallible>> =
+            vec![Ok(header_event(&dash, &host, &order, auth))];
         if let Some(c) = dash.containers.iter().find(|c| c.id == id) {
-            events.push(Ok(detail_event(c)));
+            events.push(Ok(detail_event(c, &links)));
             events.push(Ok(metrics_event(&MetricPoint {
                 ts_ms: dash.generated_at_unix_ms,
                 cpu_percent: c.cpu_percent.unwrap_or(0.0),
@@ -898,17 +1008,28 @@ async fn events_container(
         }
         futures_util::stream::iter(events)
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Single live stream for a stack detail page: `header` plus an aggregate
 /// `metrics` point (CPU and memory summed across the stack's containers).
 async fn events_stack(
     State(state): State<AppState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let auth_enabled = state.auth.is_some();
-    let stream = dashboard_stream(&state).flat_map(move |dash| {
+    axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(rt) = state.hosts.get(&host) else {
+        return (StatusCode::NOT_FOUND, "unknown host").into_response();
+    };
+    let auth = state.auth.is_some();
+    let order = Arc::clone(&state.host_order);
+    let links = rt.links.clone();
+    let stream = dashboard_stream(rt.shared.clone()).flat_map(move |dash| {
+        let r = Render {
+            host: &host,
+            links: &links,
+        };
         let members: Vec<&ContainerMetrics> = dash
             .containers
             .iter()
@@ -924,9 +1045,9 @@ async fn events_stack(
         }
         let members_event = Event::default()
             .event("containers")
-            .data(stack_members_table(&members, dash.cpu_count).into_string());
+            .data(stack_members_table(&members, dash.cpu_count, &r).into_string());
         futures_util::stream::iter([
-            Ok(header_event(&dash, auth_enabled)),
+            Ok::<_, Infallible>(header_event(&dash, &host, &order, auth)),
             Ok(members_event),
             Ok(metrics_event(&MetricPoint {
                 ts_ms: dash.generated_at_unix_ms,
@@ -939,28 +1060,30 @@ async fn events_stack(
             })),
         ])
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// The `detail` event: a container detail page's live region (state + facts).
-fn detail_event(c: &ContainerMetrics) -> Event {
+fn detail_event(c: &ContainerMetrics, links: &PortLinks) -> Event {
     Event::default()
         .event("detail")
-        .data(container_detail_live(c).into_string())
+        .data(container_detail_live(c, links).into_string())
 }
 
 /// The `header` event: the host header's inner HTML.
-fn header_event(dash: &Dashboard, auth_enabled: bool) -> Event {
+fn header_event(dash: &Dashboard, host: &str, hosts: &[String], auth_enabled: bool) -> Event {
     Event::default()
         .event("header")
-        .data(host_header_inner(dash, auth_enabled).into_string())
+        .data(host_header_inner(Some(dash), host, hosts, auth_enabled).into_string())
 }
 
 /// The `containers` event: the container table's HTML.
-fn containers_event(dash: &Dashboard) -> Event {
+fn containers_event(dash: &Dashboard, r: &Render) -> Event {
     Event::default()
         .event("containers")
-        .data(container_section(&dash.containers, dash.cpu_count).into_string())
+        .data(container_section(&dash.containers, dash.cpu_count, r).into_string())
 }
 
 /// Accumulates a stack's per-second I/O rates across its members. A category
@@ -1000,8 +1123,7 @@ fn metrics_event(point: &MetricPoint) -> Event {
 /// then the newest one whenever it changes (deduped by timestamp). It polls the
 /// shared snapshot — the same source the page render reads — so the live view
 /// can never drift from a plain reload.
-fn dashboard_stream(state: &AppState) -> impl Stream<Item = Arc<Dashboard>> + use<> {
-    let shared = Arc::clone(&state.shared);
+fn dashboard_stream(shared: SharedDashboard) -> impl Stream<Item = Arc<Dashboard>> + use<> {
     let ticker = tokio::time::interval(SNAPSHOT_POLL);
     futures_util::stream::unfold(
         (shared, 0u64, ticker),
@@ -1026,16 +1148,22 @@ fn dashboard_stream(state: &AppState) -> impl Stream<Item = Arc<Dashboard>> + us
 /// endpoint `live.js` uses to close chart gaps before reconnecting.
 // `main_content` is moved in by builder convention — callers hand off a
 // freshly-built fragment they no longer need.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    reason = "page assembly genuinely needs all of these inputs"
+)]
 fn shell(
+    state: &AppState,
+    host: &str,
     snapshot: Option<&Dashboard>,
     main_content: Markup,
     seed: &[MetricPoint],
     live_url: &str,
     backfill_url: &str,
-    auth_enabled: bool,
     terminal: bool,
 ) -> Markup {
+    let auth_enabled = state.auth.is_some();
     let seed_json = serde_json::to_string(seed).unwrap_or_else(|_| "[]".to_string());
     // The history endpoints mirror the backfill endpoints by design — same
     // entity, same path shape — so the URL is derived instead of threaded
@@ -1062,10 +1190,7 @@ fn shell(
             }
             body {
                 header.host id="host-header" {
-                    @match snapshot {
-                        Some(d) => (host_header_inner(d, auth_enabled)),
-                        None => (brand()),
-                    }
+                    (host_header_inner(snapshot, host, &state.host_order, auth_enabled))
                 }
                 main { (main_content) }
                 // Error toast: filled by live.js on htmx request failures.
@@ -1120,18 +1245,25 @@ fn shell(
 
 /// The dashboard body: the live container table. No charts — the host-metrics
 /// header that owned them was removed.
-fn dashboard_page(snapshot: Option<&Dashboard>, auth_enabled: bool) -> Markup {
+fn dashboard_page(
+    state: &AppState,
+    host: &str,
+    snapshot: Option<&Dashboard>,
+    links: &PortLinks,
+) -> Markup {
+    let r = Render { host, links };
     let main = html! {
         div id="containers" {
             @match snapshot {
-                Some(d) => (container_section(&d.containers, d.cpu_count)),
+                Some(d) => (container_section(&d.containers, d.cpu_count, &r)),
                 None => p.empty { "Collecting first metrics sample…" },
             }
         }
     };
     // No charts here, so no seed or backfill endpoint; the SSE stream still
     // drives the header and the container table.
-    shell(snapshot, main, &[], "/events", "", auth_enabled, false)
+    let live_url = format!("/host/{host}/events");
+    shell(state, host, snapshot, main, &[], &live_url, "", false)
 }
 
 /// Markup for a pair of live charts (CPU + memory). Data comes from `live.js`,
@@ -1197,35 +1329,36 @@ fn io_chart_card(title: &str, key: &str, in_label: &str, out_label: &str) -> Mar
 }
 
 /// Body of a single-container detail page.
-fn container_detail_main(c: &ContainerMetrics) -> Markup {
+fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
+    let host = r.host;
     html! {
         section.detail-head {
             div.detail-title {
-                a.back href="/" { "← Dashboard" }
+                a.back href=(format!("/host/{host}")) { "← Dashboard" }
                 h1 { (c.name) }
                 @if let Some(stack) = &c.stack {
-                    a.stack-pill href=(format!("/stack/{stack}")) { (stack) }
+                    a.stack-pill href=(format!("/host/{host}/stack/{stack}")) { (stack) }
                 }
             }
-            (action_buttons(&c.id))
+            (action_buttons(host, &c.id))
         }
         // Live region: swapped wholesale by the `detail` SSE event so state and
         // facts track reality. The charts below are left untouched.
-        div id="detail-live" { (container_detail_live(c)) }
+        div id="detail-live" { (container_detail_live(c, r.links)) }
         (charts_section(&format!("{} · CPU", c.name), &format!("{} · Memory", c.name)))
         (io_charts_section())
         section.panel {
             div.panel-head {
                 h3 { "Logs " span.count { "(last " (LOG_TAIL_LINES) " lines)" } }
                 button.refresh type="button"
-                    hx-get=(format!("/api/container/{}/logs", c.id))
+                    hx-get=(format!("/host/{host}/api/container/{}/logs", c.id))
                     hx-target="#logs" hx-swap="innerHTML" { "↻ Refresh" }
             }
             pre.logs id="logs"
-                hx-get=(format!("/api/container/{}/logs", c.id))
+                hx-get=(format!("/host/{host}/api/container/{}/logs", c.id))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
         }
-        (terminal_panel(c))
+        (terminal_panel(c, host))
     }
 }
 
@@ -1233,10 +1366,10 @@ fn container_detail_main(c: &ContainerMetrics) -> Markup {
 /// so we don't spawn one on every page view) and only for running containers;
 /// `terminal.js` opens the WebSocket on "Connect". The `⛶` button toggles a
 /// fullscreen class on the panel. Stopped containers get a disabled note.
-fn terminal_panel(c: &ContainerMetrics) -> Markup {
+fn terminal_panel(c: &ContainerMetrics, host: &str) -> Markup {
     let running = c.state == ContainerState::Running;
     html! {
-        section.panel.terminal id="terminal" data-ws=(format!("/ws/container/{}/exec", c.id)) {
+        section.panel.terminal id="terminal" data-ws=(format!("/host/{host}/ws/container/{}/exec", c.id)) {
             div.panel-head {
                 h3 { "Terminal" }
                 @if running {
@@ -1277,13 +1410,13 @@ fn container_table_head() -> Markup {
 }
 
 /// A stack's member containers as a table (live region on the stack page).
-fn stack_members_table(members: &[&ContainerMetrics], cpu_count: usize) -> Markup {
+fn stack_members_table(members: &[&ContainerMetrics], cpu_count: usize, r: &Render) -> Markup {
     html! {
         section.stack {
             table {
                 (container_table_head())
                 tbody {
-                    @for c in members { (container_row(c, cpu_count)) }
+                    @for c in members { (container_row(c, cpu_count, r)) }
                 }
             }
         }
@@ -1292,12 +1425,12 @@ fn stack_members_table(members: &[&ContainerMetrics], cpu_count: usize) -> Marku
 
 /// The live-updating part of a container detail page: state badge, health, and
 /// the facts grid. Re-rendered and pushed via the `detail` SSE event.
-fn container_detail_live(c: &ContainerMetrics) -> Markup {
+fn container_detail_live(c: &ContainerMetrics, links: &PortLinks) -> Markup {
     html! {
         div.status-line {
             span.badge.(state_class(c.state)) { (state_label(c.state)) }
             (health_marker(c.health))
-            (port_pills(&c.ports))
+            (port_pills(&c.ports, links))
         }
         section.facts {
             (fact("Image", short_image(&c.image)))
@@ -1313,15 +1446,21 @@ fn container_detail_live(c: &ContainerMetrics) -> Markup {
 
 /// Body of a stack detail page: aggregate charts, stack actions, and the
 /// stack's containers.
-fn stack_detail_main(name: &str, members: &[ContainerMetrics], cpu_count: usize) -> Markup {
+fn stack_detail_main(
+    name: &str,
+    members: &[ContainerMetrics],
+    cpu_count: usize,
+    r: &Render,
+) -> Markup {
+    let host = r.host;
     html! {
         section.detail-head {
             div.detail-title {
-                a.back href="/" { "← Dashboard" }
+                a.back href=(format!("/host/{host}")) { "← Dashboard" }
                 h1 { (name) }
                 span.count { "(" (members.len()) ")" }
             }
-            (stack_action_buttons(name))
+            (stack_action_buttons(host, name))
         }
         (charts_section(
             &format!("{name} · CPU (sum)"),
@@ -1330,36 +1469,36 @@ fn stack_detail_main(name: &str, members: &[ContainerMetrics], cpu_count: usize)
         (io_charts_section())
         // Live region: the `containers` SSE event swaps the member table so its
         // states/metrics track reality.
-        div id="containers" { (stack_members_table(&members.iter().collect::<Vec<_>>(), cpu_count)) }
+        div id="containers" { (stack_members_table(&members.iter().collect::<Vec<_>>(), cpu_count, r)) }
         section.panel {
             div.panel-head {
                 h3 { "compose.yml" }
                 button.refresh type="button"
-                    hx-get=(format!("/api/stack/{name}/compose"))
+                    hx-get=(format!("/host/{host}/api/stack/{name}/compose"))
                     hx-target="#compose" hx-swap="innerHTML" { "↻ Refresh" }
             }
             div id="compose"
-                hx-get=(format!("/api/stack/{name}/compose"))
+                hx-get=(format!("/host/{host}/api/stack/{name}/compose"))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading…" }
         }
     }
 }
 
 /// Start/stop/restart-all buttons for a whole stack.
-fn stack_action_buttons(name: &str) -> Markup {
+fn stack_action_buttons(host: &str, name: &str) -> Markup {
     html! {
         span.actions {
             button.act.start type="button"
-                hx-post=(format!("/api/stack/{name}/start"))
+                hx-post=(format!("/host/{host}/api/stack/{name}/start"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 title="Start all" { "▶" }
             button.act.restart type="button"
-                hx-post=(format!("/api/stack/{name}/restart"))
+                hx-post=(format!("/host/{host}/api/stack/{name}/restart"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm=(format!("Restart all containers in {name}?"))
                 title="Restart all" { "⟳" }
             button.act.stop type="button"
-                hx-post=(format!("/api/stack/{name}/stop"))
+                hx-post=(format!("/host/{host}/api/stack/{name}/stop"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm=(format!("Stop all containers in {name}?"))
                 title="Stop all" { "■" }
@@ -1424,14 +1563,84 @@ fn login_shell(error: bool) -> Markup {
 }
 
 /// The inner content of the host header (everything HTMX swaps on each update).
-fn host_header_inner(dash: &Dashboard, auth_enabled: bool) -> Markup {
+/// `dash` is `None` before the first snapshot arrives — then only the brand and
+/// host switcher show, no tally or timestamp.
+fn host_header_inner(
+    dash: Option<&Dashboard>,
+    host: &str,
+    hosts: &[String],
+    auth_enabled: bool,
+) -> Markup {
     html! {
         (brand())
-        (container_counts_metric(&ContainerCounts::of(&dash.containers)))
+        (host_switch(host, hosts))
+        @if let Some(d) = dash {
+            (container_counts_metric(&ContainerCounts::of(&d.containers)))
+        }
         span.spacer {}
-        span.generated { "updated " (fmt_age(dash.generated_at_unix_ms)) }
+        @if let Some(d) = dash {
+            span.generated { "updated " (fmt_age(d.generated_at_unix_ms)) }
+        }
         @if auth_enabled {
             a.logout href="/logout" title="Log out" { "Logout" }
+        }
+    }
+}
+
+/// The host switcher: one link per monitored host, the current one marked.
+/// Rendered only when more than one host is configured (single-host setups have
+/// nothing to switch between).
+fn host_switch(current: &str, hosts: &[String]) -> Markup {
+    html! {
+        @if hosts.len() > 1 {
+            nav.host-switch {
+                @for h in hosts {
+                    @if h == current {
+                        span.host-tab.current { (h) }
+                    } @else {
+                        a.host-tab href=(format!("/host/{h}")) { (h) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The multi-host landing page at `/`: a simple list of hosts to pick from.
+/// Single-host setups never reach this (they redirect straight to the host).
+fn host_index_page(hosts: &[String], auth_enabled: bool) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "DockDoe" }
+                link rel="icon" type="image/svg+xml" href="/assets/dockdoe.svg"
+                    media="(prefers-color-scheme: light)";
+                link rel="icon" type="image/svg+xml" href="/assets/dockdoe-white.svg"
+                    media="(prefers-color-scheme: dark)";
+                link rel="stylesheet" href="/assets/dockdoe.css";
+            }
+            body {
+                header.host id="host-header" {
+                    (brand())
+                    span.spacer {}
+                    @if auth_enabled {
+                        a.logout href="/logout" title="Log out" { "Logout" }
+                    }
+                }
+                main {
+                    section.host-list {
+                        h2 { "Hosts" }
+                        ul {
+                            @for h in hosts {
+                                li { a href=(format!("/host/{h}")) { (h) } }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1495,7 +1704,7 @@ fn container_counts_metric(counts: &ContainerCounts) -> Markup {
 
 /// Render all containers, grouped by compose stack. Standalone containers
 /// (no compose project) are grouped last under "Standalone".
-fn container_section(containers: &[ContainerMetrics], cpu_count: usize) -> Markup {
+fn container_section(containers: &[ContainerMetrics], cpu_count: usize, r: &Render) -> Markup {
     if containers.is_empty() {
         return html! { p.empty { "No containers found." } };
     }
@@ -1523,7 +1732,7 @@ fn container_section(containers: &[ContainerMetrics], cpu_count: usize) -> Marku
             section.stack {
                 h2 {
                     @match key {
-                        StackKey::Named(name) => a.stack-link href=(format!("/stack/{name}")) { (title) },
+                        StackKey::Named(name) => a.stack-link href=(format!("/host/{}/stack/{name}", r.host)) { (title) },
                         StackKey::Standalone => span { (title) },
                     }
                     " " span.count { "(" (members.len()) ")" }
@@ -1531,7 +1740,7 @@ fn container_section(containers: &[ContainerMetrics], cpu_count: usize) -> Marku
                 table {
                     (container_table_head())
                     tbody {
-                        @for c in members { (container_row(c, cpu_count)) }
+                        @for c in members { (container_row(c, cpu_count, r)) }
                     }
                 }
             }
@@ -1542,15 +1751,15 @@ fn container_section(containers: &[ContainerMetrics], cpu_count: usize) -> Marku
 /// One container table row. `cpu_count` scales the CPU bar: container CPU% is
 /// per-core cumulative (a busy 4-core container reads 400%), so full bar =
 /// the whole host, and the bar matches what the host CPU chart would show.
-fn container_row(c: &ContainerMetrics, cpu_count: usize) -> Markup {
+fn container_row(c: &ContainerMetrics, cpu_count: usize, r: &Render) -> Markup {
     html! {
         tr {
-            td.name { a href=(format!("/container/{}", c.id)) { (c.name) } }
+            td.name { a href=(format!("/host/{}/container/{}", r.host, c.id)) { (c.name) } }
             td.image { (short_image(&c.image)) }
             td {
                 span.badge.(state_class(c.state)) { (state_label(c.state)) }
                 (health_marker(c.health))
-                (port_chips(&c.ports))
+                (port_chips(&c.ports, r.links))
             }
             td.num {
                 @match c.cpu_percent {
@@ -1572,7 +1781,7 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize) -> Markup {
                     None => span style="color:var(--muted)" { "–" }
                 }
             }
-            td.actions-cell { (action_buttons(&c.id)) }
+            td.actions-cell { (action_buttons(r.host, &c.id)) }
         }
     }
 }
@@ -1580,20 +1789,20 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize) -> Markup {
 /// Start/stop/restart buttons for one container. Stateless so it can be reused
 /// verbatim in the row and as the HTMX response after an action. Destructive
 /// actions ask for confirmation.
-fn action_buttons(id: &str) -> Markup {
+fn action_buttons(host: &str, id: &str) -> Markup {
     html! {
         span.actions {
             button.act.start type="button"
-                hx-post=(format!("/api/container/{id}/start"))
+                hx-post=(format!("/host/{host}/api/container/{id}/start"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 title="Start" { "▶" }
             button.act.restart type="button"
-                hx-post=(format!("/api/container/{id}/restart"))
+                hx-post=(format!("/host/{host}/api/container/{id}/restart"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm="Restart this container?"
                 title="Restart" { "⟳" }
             button.act.stop type="button"
-                hx-post=(format!("/api/container/{id}/stop"))
+                hx-post=(format!("/host/{host}/api/container/{id}/stop"))
                 hx-target="closest .actions" hx-swap="outerHTML"
                 hx-confirm="Stop this container?"
                 title="Stop" { "■" }
@@ -1634,7 +1843,7 @@ fn health_marker(health: HealthState) -> Markup {
 /// All ports for the container detail page: every published port as a blue
 /// link to the browsing host, every internal-only port as a muted,
 /// non-clickable pill. Renders nothing when the container exposes no ports.
-fn port_pills(ports: &[Port]) -> Markup {
+fn port_pills(ports: &[Port], links: &PortLinks) -> Markup {
     if ports.is_empty() {
         return html! {};
     }
@@ -1642,7 +1851,7 @@ fn port_pills(ports: &[Port]) -> Markup {
         span.ports {
             @for p in ports {
                 @match p.public {
-                    Some(_) => (port_link(p, true)),
+                    Some(_) => (port_link(p, true, links)),
                     None => span.port-pill.muted
                         title="exposed inside Docker, not published to the host" {
                         (p.private) (proto_suffix(&p.proto))
@@ -1657,7 +1866,7 @@ fn port_pills(ports: &[Port]) -> Markup {
 /// as links, any remainder collapsed into a neutral "+N" chip (the rest are
 /// listed in its tooltip). Internal-only ports are omitted here — they show on
 /// the detail page. Renders nothing without any published port.
-fn port_chips(ports: &[Port]) -> Markup {
+fn port_chips(ports: &[Port], links: &PortLinks) -> Markup {
     const SHOWN: usize = 2;
     let published: Vec<&Port> = ports.iter().filter(|p| p.public.is_some()).collect();
     if published.is_empty() {
@@ -1665,7 +1874,7 @@ fn port_chips(ports: &[Port]) -> Markup {
     }
     html! {
         span.ports {
-            @for p in published.iter().take(SHOWN) { (port_link(p, false)) }
+            @for p in published.iter().take(SHOWN) { (port_link(p, false, links)) }
             @if published.len() > SHOWN {
                 span.port-more title=(overflow_list(&published[SHOWN..])) {
                     "+" (published.len() - SHOWN)
@@ -1678,7 +1887,7 @@ fn port_chips(ports: &[Port]) -> Markup {
 /// A blue pill for one published port. `full` adds the "→ container-port" detail
 /// used on the container page; the dense tables show only the host port.
 ///
-/// Whether it is a link, and to where, follows [`port_links`]:
+/// Whether it is a link, and to where, follows the host's [`PortLinks`]:
 /// - [`PortLinks::Browser`]: a `localhost` href plus `data-port`, which live.js
 ///   rewrites to the actual browsing host (the only place the real hostname is
 ///   known).
@@ -1686,7 +1895,7 @@ fn port_chips(ports: &[Port]) -> Markup {
 ///   browsing host is a proxy but the Docker host is reachable directly.
 /// - [`PortLinks::Off`]: an unlinked pill, for proxy-only setups where no direct
 ///   `host:port` link works.
-fn port_link(p: &Port, full: bool) -> Markup {
+fn port_link(p: &Port, full: bool, links: &PortLinks) -> Markup {
     let public = p.public.expect("port_link called on an unpublished port");
     let title = format!("host {public} → container {}/{}", p.private, p.proto);
     let label = html! {
@@ -1694,7 +1903,7 @@ fn port_link(p: &Port, full: bool) -> Markup {
         @if full { " → " (p.private) }
         (proto_suffix(&p.proto))
     };
-    match port_links() {
+    match links {
         PortLinks::Off => html! {
             span.port-pill title=(title) { (label) }
         },
@@ -1816,36 +2025,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_port_links_maps_each_mode() {
-        assert!(matches!(parse_port_links(None), PortLinks::Browser));
-        assert!(matches!(
-            parse_port_links(Some(String::new())),
-            PortLinks::Browser
-        ));
-        assert!(matches!(
-            parse_port_links(Some("  ".to_string())),
-            PortLinks::Browser
-        ));
-        assert!(matches!(
-            parse_port_links(Some("off".to_string())),
-            PortLinks::Off
-        ));
-        assert!(matches!(
-            parse_port_links(Some("OFF".to_string())),
-            PortLinks::Off
-        ));
-        assert!(matches!(
-            parse_port_links(Some("none".to_string())),
-            PortLinks::Off
-        ));
-        assert!(matches!(
-            parse_port_links(Some("-".to_string())),
-            PortLinks::Off
-        ));
-        match parse_port_links(Some(" 192.168.1.50 ".to_string())) {
-            PortLinks::Host(h) => assert_eq!(h, "192.168.1.50"),
+    fn port_links_from_config_resolves_each_case() {
+        let unix = "unix:///var/run/docker.sock";
+        let host = |pub_host, url| match PortLinks::from_config(pub_host, url) {
+            PortLinks::Host(h) => h,
             other => panic!("expected Host, got {other:?}"),
-        }
+        };
+
+        // An explicit public_host wins over the endpoint URL.
+        assert!(matches!(
+            PortLinks::from_config(Some("off"), unix),
+            PortLinks::Off
+        ));
+        assert!(matches!(
+            PortLinks::from_config(Some("OFF"), unix),
+            PortLinks::Off
+        ));
+        assert!(matches!(
+            PortLinks::from_config(Some("none"), unix),
+            PortLinks::Off
+        ));
+        assert!(matches!(
+            PortLinks::from_config(Some("-"), unix),
+            PortLinks::Off
+        ));
+        assert_eq!(host(Some(" 192.168.1.50 "), unix), "192.168.1.50");
+
+        // No usable public_host: a unix socket falls back to the browsing host.
+        assert!(matches!(
+            PortLinks::from_config(None, unix),
+            PortLinks::Browser
+        ));
+        assert!(matches!(
+            PortLinks::from_config(Some(""), unix),
+            PortLinks::Browser
+        ));
+        assert!(matches!(
+            PortLinks::from_config(Some("  "), unix),
+            PortLinks::Browser
+        ));
+
+        // No public_host: derive from a tcp/http/https endpoint's host.
+        assert_eq!(host(None, "tcp://nas.lan:2375"), "nas.lan");
+        assert_eq!(
+            host(None, "https://docker.example.com:2376/"),
+            "docker.example.com"
+        );
+        assert_eq!(host(None, "http://10.0.0.5:2375"), "10.0.0.5");
+        assert_eq!(host(None, "tcp://[::1]:2375"), "::1");
     }
 
     #[test]
