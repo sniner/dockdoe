@@ -3,6 +3,18 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [0.6.4] — 2026-06-14
+
+### Fixed
+
+- **Port links behind a reverse proxy**: the published-port pills linked to the
+  host the browser was pointed at — which, behind a proxy, is the proxy, where the
+  container ports aren't open, so the links went nowhere. The new `--port-host` /
+  `DOCKDOE_PORT_HOST` sets the host the ports are actually reachable at (e.g. the
+  Docker host's LAN address); set it to `off` to drop the links entirely for
+  proxy-only setups. Unset keeps the previous behaviour, right for browsing
+  DockDoe directly on the Docker host
+
 ## [0.6.3] — 2026-06-14
 
 ### Added
