@@ -93,10 +93,7 @@ fn parse_port_links(port_host: Option<String>) -> PortLinks {
         None => PortLinks::Browser,
         Some(s) => match s.trim() {
             "" => PortLinks::Browser,
-            v if v.eq_ignore_ascii_case("off")
-                || v.eq_ignore_ascii_case("none")
-                || v == "-" =>
-            {
+            v if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") || v == "-" => {
                 PortLinks::Off
             }
             v => PortLinks::Host(v.to_string()),
@@ -121,10 +118,8 @@ pub fn router(state: AppState) -> Router {
         .route("/events/stack/{name}", get(events_stack))
         .route("/api/container/{id}/logs", get(container_logs))
         .route("/api/stack/{name}/compose", get(stack_compose))
-        .route("/api/metrics/host", get(metrics_host))
         .route("/api/metrics/container/{id}", get(metrics_container))
         .route("/api/metrics/stack/{name}", get(metrics_stack))
-        .route("/api/history/host", get(history_host))
         .route("/api/history/container/{id}", get(history_container))
         .route("/api/history/stack/{name}", get(history_stack))
         .route(
@@ -620,19 +615,9 @@ where
     }
 }
 
-/// JSON backfill for the host charts: raw points since `since_ms`. `live.js`
-/// calls this before (re)opening the SSE stream to fill the gap that built up
-/// while the page was hidden, in the bfcache, or suspended.
-async fn metrics_host(
-    State(state): State<AppState>,
-    Query(q): Query<SinceQuery>,
-) -> Json<Vec<MetricPoint>> {
-    let since = clamp_since(q.since_ms, state.seed_window);
-    let store = state.store.clone();
-    Json(fetch_points(move || store.recent_host_samples(since)).await)
-}
-
-/// JSON backfill for a container detail page's charts.
+/// JSON backfill for a container detail page's charts. `live.js` calls this
+/// before (re)opening the SSE stream to fill the gap that built up while the
+/// page was hidden, in the bfcache, or suspended.
 async fn metrics_container(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -718,25 +703,8 @@ const INVALID_RANGE: (StatusCode, &str) = (
     "invalid range: pass ?range=1h|6h|24h|7d|30d or ?since_ms=&until_ms=",
 );
 
-/// History for the host charts: median plus min–max envelope over the window.
-async fn history_host(State(state): State<AppState>, Query(q): Query<HistoryQuery>) -> Response {
-    let Some(w) = resolve_history(&q, state.seed_window) else {
-        return INVALID_RANGE.into_response();
-    };
-    let store = state.store.clone();
-    let points = if w.raw {
-        fetch_points(move || {
-            let samples = store.recent_host_samples(w.since)?;
-            Ok(raw_history(&samples, w.until))
-        })
-        .await
-    } else {
-        fetch_points(move || store.history_host(w.since, w.until, w.group_ms)).await
-    };
-    Json(points).into_response()
-}
-
-/// History for one container's charts.
+/// History for one container's charts: median plus min–max envelope over the
+/// window.
 async fn history_container(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -783,13 +751,12 @@ fn raw_history(samples: &[MetricPoint], until_ms: u64) -> Vec<HistoryPoint> {
         .collect()
 }
 
-/// Render the dashboard from the latest snapshot, seeding charts from history.
+/// Render the dashboard from the latest snapshot. The dashboard has no charts
+/// of its own (the host-metrics header was removed); it only lists containers
+/// and updates them live over SSE.
 async fn dashboard(State(state): State<AppState>) -> Markup {
     let snapshot = current_snapshot(&state);
-    let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
-    let store = state.store.clone();
-    let seed = fetch_points(move || store.recent_host_samples(since)).await;
-    dashboard_page(snapshot.as_ref(), &seed, state.auth.is_some())
+    dashboard_page(snapshot.as_ref(), state.auth.is_some())
 }
 
 /// Detail page for a single container.
@@ -872,7 +839,7 @@ async fn stack_detail(
     let seed = fetch_points(move || store.recent_stack_trends(&seed_name, since)).await;
 
     // Members are non-empty here, so a snapshot exists; 1 is just a fallback.
-    let cpu_count = snapshot.as_ref().map_or(1, |d| d.host.cpu_count);
+    let cpu_count = snapshot.as_ref().map_or(1, |d| d.cpu_count);
     let live_url = format!("/events/stack/{name}");
     let backfill_url = format!("/api/metrics/stack/{name}");
     shell(
@@ -888,27 +855,16 @@ async fn stack_detail(
 }
 
 /// Single live stream for the dashboard: `header` + `containers` HTML fragments
-/// and a host `metrics` point per snapshot. One SSE connection per page keeps us
-/// well under the browser's per-host connection limit.
+/// per snapshot. One SSE connection per page keeps us well under the browser's
+/// per-host connection limit. The dashboard has no charts, so no `metrics`.
 async fn events_dashboard(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let auth_enabled = state.auth.is_some();
     let stream = dashboard_stream(&state).flat_map(move |dash| {
-        let point = MetricPoint {
-            ts_ms: dash.generated_at_unix_ms,
-            cpu_percent: f64::from(dash.host.cpu_percent),
-            mem_used: Some(dash.host.mem_used),
-            // The host series has no per-container I/O.
-            net_rx: None,
-            net_tx: None,
-            disk_read: None,
-            disk_write: None,
-        };
         futures_util::stream::iter([
             Ok(header_event(&dash, auth_enabled)),
             Ok(containers_event(&dash)),
-            Ok(metrics_event(&point)),
         ])
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -963,7 +919,7 @@ async fn events_stack(
         }
         let members_event = Event::default()
             .event("containers")
-            .data(stack_members_table(&members, dash.host.cpu_count).into_string());
+            .data(stack_members_table(&members, dash.cpu_count).into_string());
         futures_util::stream::iter([
             Ok(header_event(&dash, auth_enabled)),
             Ok(members_event),
@@ -999,7 +955,7 @@ fn header_event(dash: &Dashboard, auth_enabled: bool) -> Event {
 fn containers_event(dash: &Dashboard) -> Event {
     Event::default()
         .event("containers")
-        .data(container_section(&dash.containers, dash.host.cpu_count).into_string())
+        .data(container_section(&dash.containers, dash.cpu_count).into_string())
 }
 
 /// Accumulates a stack's per-second I/O rates across its members. A category
@@ -1157,30 +1113,20 @@ fn shell(
     }
 }
 
-/// The dashboard body: host charts plus the live container table.
-fn dashboard_page(
-    snapshot: Option<&Dashboard>,
-    seed: &[MetricPoint],
-    auth_enabled: bool,
-) -> Markup {
+/// The dashboard body: the live container table. No charts — the host-metrics
+/// header that owned them was removed.
+fn dashboard_page(snapshot: Option<&Dashboard>, auth_enabled: bool) -> Markup {
     let main = html! {
-        (charts_section("Host CPU", "Host Memory"))
         div id="containers" {
             @match snapshot {
-                Some(d) => (container_section(&d.containers, d.host.cpu_count)),
+                Some(d) => (container_section(&d.containers, d.cpu_count)),
                 None => p.empty { "Collecting first metrics sample…" },
             }
         }
     };
-    shell(
-        snapshot,
-        main,
-        seed,
-        "/events",
-        "/api/metrics/host",
-        auth_enabled,
-        false,
-    )
+    // No charts here, so no seed or backfill endpoint; the SSE stream still
+    // drives the header and the container table.
+    shell(snapshot, main, &[], "/events", "", auth_enabled, false)
 }
 
 /// Markup for a pair of live charts (CPU + memory). Data comes from `live.js`,
@@ -1474,22 +1420,8 @@ fn login_shell(error: bool) -> Markup {
 
 /// The inner content of the host header (everything HTMX swaps on each update).
 fn host_header_inner(dash: &Dashboard, auth_enabled: bool) -> Markup {
-    let host = &dash.host;
     html! {
         (brand())
-        (metric("CPU", &format!("{:.1}%", host.cpu_percent)))
-        (metric(
-            "Load 1/5/15",
-            &format!(
-                "{:.2} {:.2} {:.2}",
-                host.load_avg.one, host.load_avg.five, host.load_avg.fifteen
-            ),
-        ))
-        (metric(
-            "Memory",
-            &format!("{} / {}", fmt_bytes(host.mem_used), fmt_bytes(host.mem_total)),
-        ))
-        (metric("CPUs", &host.cpu_count.to_string()))
         (container_counts_metric(&ContainerCounts::of(&dash.containers)))
         span.spacer {}
         span.generated { "updated " (fmt_age(dash.generated_at_unix_ms)) }
@@ -1552,15 +1484,6 @@ fn container_counts_metric(counts: &ContainerCounts) -> Markup {
                     span.count-err { " · " (counts.unhealthy) " unhealthy" }
                 }
             }
-        }
-    }
-}
-
-fn metric(label: &str, value: &str) -> Markup {
-    html! {
-        div.metric {
-            span.label { (label) }
-            span.value { (value) }
         }
     }
 }

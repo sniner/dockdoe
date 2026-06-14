@@ -11,7 +11,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use crate::docker::DockerClient;
-use crate::host::HostSampler;
 use crate::model::Dashboard;
 use crate::notify::Notifier;
 use crate::store::Store;
@@ -37,7 +36,7 @@ pub struct Config {
 /// Run the collection loop forever.
 pub async fn run(
     mut docker: DockerClient,
-    mut host: HostSampler,
+    cpu_count: usize,
     store: Store,
     config: Config,
     shared: SharedDashboard,
@@ -58,7 +57,6 @@ pub async fn run(
     loop {
         ticker.tick().await;
 
-        let host_metrics = host.sample();
         let containers = match docker.collect().await {
             Ok(containers) => containers,
             Err(err) => {
@@ -68,10 +66,10 @@ pub async fn run(
         };
 
         // The first successful cycle only primes the delta-based readings:
-        // sysinfo's first CPU refresh reads ~0%, and container CPU% is None
-        // without a previous sample. Publishing or persisting it would put a
-        // bogus 0% dip at the start of every chart after a restart — discard
-        // it and let the next cycle deliver real values.
+        // container CPU% is None without a previous sample to delta against.
+        // Publishing or persisting it would put a bogus 0% dip at the start of
+        // every chart after a restart — discard it and let the next cycle
+        // deliver real values.
         if !primed {
             primed = true;
             debug!("priming cycle done; publishing starts next cycle");
@@ -87,10 +85,9 @@ pub async fn run(
             n.observe(ts_ms, &containers);
         }
 
-        let flushed = bucketer.push(ts_ms, &host_metrics, &containers);
+        let flushed = bucketer.push(ts_ms, &containers);
         if !flushed.is_empty() {
             debug!(
-                host_trends = flushed.host.len(),
                 container_trends = flushed.containers.len(),
                 "trend bucket closed"
             );
@@ -98,7 +95,7 @@ pub async fn run(
 
         let dashboard = Dashboard {
             generated_at_unix_ms: ts_ms,
-            host: host_metrics,
+            cpu_count,
             containers,
         };
         // Publish the latest snapshot; the web layer (page render and live SSE)
@@ -137,8 +134,7 @@ async fn persist(
 ) {
     let store = store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        store.insert_samples(ts_ms, &dashboard.host, &dashboard.containers)?;
-        store.insert_host_trends(&flushed.host)?;
+        store.insert_samples(ts_ms, &dashboard.containers)?;
         store.insert_container_trends(&flushed.containers)?;
         store.prune_raw(raw_cutoff_ms)?;
         store.prune_trends(trend_cutoff_ms)?;

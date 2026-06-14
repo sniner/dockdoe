@@ -11,7 +11,6 @@ mod auth;
 mod collector;
 mod config;
 mod docker;
-mod host;
 mod model;
 mod notify;
 mod store;
@@ -29,7 +28,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::collector::Config;
 use crate::docker::{DockerClient, DockerHandle};
-use crate::host::HostSampler;
 use crate::notify::Notifier;
 use crate::store::Store;
 
@@ -137,8 +135,12 @@ async fn main() -> Result<()> {
 
     let docker = DockerClient::connect()?;
     let docker_handle = DockerHandle::connect()?;
-    let host = HostSampler::new();
     let shared = Arc::new(RwLock::new(None));
+
+    // CPU count scales the container CPU bars (a full bar is the whole host).
+    // For the local host the process' available parallelism is the host count;
+    // M3 sources it per host from the Docker daemon's `info` instead.
+    let cpu_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
 
     // The chart seed window matches raw retention — that's how much history we
     // can show before the live stream takes over.
@@ -154,7 +156,7 @@ async fn main() -> Result<()> {
 
     tokio::spawn(collector::run(
         docker,
-        host,
+        cpu_count,
         store.clone(),
         collector_config,
         Arc::clone(&shared),

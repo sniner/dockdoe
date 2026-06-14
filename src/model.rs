@@ -6,34 +6,15 @@
 
 use serde::Serialize;
 
-/// A full snapshot of host + container metrics at one point in time.
+/// A full snapshot of a host's container metrics at one point in time.
 #[derive(Debug, Clone, Serialize)]
 pub struct Dashboard {
     /// When this snapshot was collected, as Unix milliseconds.
     pub generated_at_unix_ms: u64,
-    pub host: HostMetrics,
-    pub containers: Vec<ContainerMetrics>,
-}
-
-/// htop-style metrics for the whole host.
-#[derive(Debug, Clone, Serialize)]
-pub struct HostMetrics {
-    /// Overall CPU utilisation across all cores, in percent (0..=100).
-    pub cpu_percent: f32,
-    pub load_avg: LoadAverage,
-    /// Total physical memory in bytes.
-    pub mem_total: u64,
-    /// Used physical memory in bytes (total minus available).
-    pub mem_used: u64,
-    /// Number of logical CPUs.
+    /// Number of logical CPUs on this Docker host, used to scale the container
+    /// CPU bars (a full bar is the whole host). Reported by the daemon.
     pub cpu_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct LoadAverage {
-    pub one: f64,
-    pub five: f64,
-    pub fifteen: f64,
+    pub containers: Vec<ContainerMetrics>,
 }
 
 /// Per-container metrics and identity.
