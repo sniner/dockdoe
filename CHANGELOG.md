@@ -37,6 +37,12 @@ All notable, user-facing changes to DockDoe. The format is based on
 - **CPU bars** scale to the host's CPU count reported by the Docker daemon (`docker info`) rather
   than the machine DockDoe runs on
 
+### Fixed
+
+- **Login fields and password managers**: the login form's username and password fields now carry
+  `id` attributes and associated (visually hidden) labels, so password managers like Proton Pass
+  reliably detect and fill them
+
 ## [0.6.4] — 2026-06-14
 
 ### Fixed

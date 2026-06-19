@@ -1614,9 +1614,11 @@ fn login_shell(error: bool) -> Markup {
                     @if error {
                         p.login-error { "Invalid username or password." }
                     }
-                    input type="text" name="username" placeholder="Username"
+                    label."visually-hidden" for="username" { "Username" }
+                    input #username type="text" name="username" placeholder="Username"
                         autocomplete="username" autofocus required;
-                    input type="password" name="password" placeholder="Password"
+                    label."visually-hidden" for="password" { "Password" }
+                    input #password type="password" name="password" placeholder="Password"
                         autocomplete="current-password" required;
                     button type="submit" { "Log in" }
                 }
