@@ -665,10 +665,18 @@ CREATE TABLE IF NOT EXISTS meta (
 ";
 
 /// Indexes, created after the column backfill so the host-leading ones resolve.
+///
+/// The `host_id_ts` / `host_id` / `host_name` indexes back the per-container and
+/// per-stack history reads. The two `*_retention` indexes lead with the column
+/// the retention prunes filter on (`ts_ms` / `bucket_start_ms`) so those DELETEs
+/// can seek to the cutoff instead of scanning the whole table — without them a
+/// prune scans every row (millions, on a long-retained trend table) every time.
 const CREATE_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS container_sample_host_id_ts ON container_sample(host, id, ts_ms);
 CREATE INDEX IF NOT EXISTS container_trend_host_id ON container_trend(host, id, metric, bucket_start_ms);
 CREATE INDEX IF NOT EXISTS container_trend_host_name ON container_trend(host, name, metric, bucket_start_ms);
+CREATE INDEX IF NOT EXISTS container_sample_retention ON container_sample(ts_ms);
+CREATE INDEX IF NOT EXISTS container_trend_retention ON container_trend(bucket_start_ms);
 ";
 
 #[cfg(test)]
@@ -762,6 +770,37 @@ mod tests {
             .insert_samples("nas", 2_000, &[container_sample("z", Some(2.0))])
             .unwrap();
         assert_eq!(store.count("container_sample").unwrap(), 2);
+    }
+
+    #[test]
+    fn retention_prunes_seek_by_index_instead_of_scanning() {
+        // The prunes filter only on the time column, with no host/id, so they
+        // need a leading index on that column — otherwise they full-scan the
+        // whole table on every call. Guard the plan so the index can't be
+        // dropped or shadowed unnoticed.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.lock();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare explain");
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .expect("query plan")
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+
+        let sample = plan("DELETE FROM container_sample WHERE ts_ms < 1");
+        assert!(
+            sample.contains("container_sample_retention") && !sample.contains("SCAN"),
+            "sample prune should seek by index, got: {sample}"
+        );
+        let trend = plan("DELETE FROM container_trend WHERE bucket_start_ms < 1");
+        assert!(
+            trend.contains("container_trend_retention") && !trend.contains("SCAN"),
+            "trend prune should seek by index, got: {trend}"
+        );
     }
 
     #[test]

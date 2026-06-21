@@ -73,6 +73,12 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_TREND_RETENTION_SECS", default_value_t = 30 * 24 * 3600)]
     trend_retention_secs: u64,
 
+    /// How often to run retention pruning, in seconds (default 1 hour). Pruning
+    /// is batched onto this slower cadence rather than running every sample —
+    /// nothing ages out of an hours/days retention between two samples.
+    #[arg(long, env = "DOCKDOE_PRUNE_INTERVAL_SECS", default_value_t = 3600)]
+    prune_interval_secs: u64,
+
     /// Hostnames the web UI may be addressed as, comma-separated (e.g.
     /// "dockhost.lan"). When set, requests whose Host header matches neither
     /// this list nor a localhost form are rejected — a guard against DNS
@@ -183,6 +189,7 @@ async fn main() -> Result<()> {
             raw_retention: Duration::from_secs(cfg.raw_retention_secs),
             trend_bucket_secs: cfg.trend_bucket_secs,
             trend_retention: Duration::from_secs(cfg.trend_retention_secs),
+            prune_interval: Duration::from_secs(cfg.prune_interval_secs),
         };
         // One notifier per host: its own state tracker, and the host's name
         // stamped onto every alert it sends.

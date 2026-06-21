@@ -37,6 +37,14 @@ All notable, user-facing changes to DockDoe. The format is based on
 
 ### Fixed
 
+- **High idle CPU from retention pruning**: DockDoe pruned aged-out data on every sample cycle, and
+  each prune scanned its whole table — no index led with the time column the prune filters on. On a
+  long-retained trend table (millions of rows) this dominated CPU: an otherwise idle monitor sat at
+  ~10% of a core, almost all of it walking rows it deleted none of. The prune columns are now
+  indexed (so a prune seeks to the cutoff instead of scanning), and pruning is batched onto a
+  separate, slower cadence — configurable via `--prune-interval-secs` / `DOCKDOE_PRUNE_INTERVAL_SECS`
+  (default 1 hour) — instead of running every few seconds. Both apply to existing databases on the
+  next start
 - **In-place database upgrade**: the on-disk schema gained a host dimension, but a database from an
   earlier build was never migrated — opening it aborted at startup (`no such column: host`) once the
   host-aware indexes were added. The schema is now brought up to date in place: the `host` column is
