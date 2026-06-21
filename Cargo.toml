@@ -6,6 +6,11 @@ rust-version = "1.95"
 authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 license = "GPL-3.0-or-later"
 description = "A single-binary Docker host monitor with an embedded web UI"
+repository = "https://github.com/sniner/dockdoe"
+homepage = "https://github.com/sniner/dockdoe"
+readme = "README.md"
+keywords = ["docker", "monitoring", "containers", "metrics", "dashboard"]
+categories = ["command-line-utilities", "virtualization", "web-programming::http-server"]
 
 [dependencies]
 anyhow = "1.0.102"
