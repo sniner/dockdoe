@@ -10,8 +10,6 @@ All notable, user-facing changes to DockDoe. The format is based on
 - **Host metrics removed**: the htop-style CPU / load / memory bar in the header is gone, along
   with its two dashboard charts. They can't be shown meaningfully for a remote Docker host (they
   come from the local machine's `/proc`, not the Docker API), so they were dropped for every host
-- **Database**: the on-disk schema gained a host dimension. There is no migration — delete the old
-  `dockdoe.sqlite` (it holds only regenerating monitoring samples) and DockDoe recreates it
 - **URLs are host-scoped**: every page now lives under `/host/{host}/…` (e.g.
   `/host/local/container/abc`); `/` is a host chooser that redirects straight to the only host when
   just one is configured. Old bookmarks to `/container/…` / `/stack/…` need the `/host/{host}` prefix
@@ -39,6 +37,11 @@ All notable, user-facing changes to DockDoe. The format is based on
 
 ### Fixed
 
+- **In-place database upgrade**: the on-disk schema gained a host dimension, but a database from an
+  earlier build was never migrated — opening it aborted at startup (`no such column: host`) once the
+  host-aware indexes were added. The schema is now brought up to date in place: the `host` column is
+  backfilled (existing samples are attributed to the synthesised `local` host) before the indexes
+  are built, so upgrades keep their history instead of needing the old `dockdoe.sqlite` deleted
 - **Login fields and password managers**: the login form's username and password fields now carry
   `id` attributes and associated (visually hidden) labels, so password managers like Proton Pass
   reliably detect and fill them

@@ -177,18 +177,33 @@ impl Store {
         // earlier build, cleaning up its stale `-wal`/`-shm`.
         conn.pragma_update(None, "journal_mode", "DELETE")
             .context("setting rollback journal mode")?;
-        conn.execute_batch(MIGRATIONS)
-            .context("running migrations")?;
-        // Columns added after the first release: present in the CREATE above for
-        // fresh databases, added here for ones created by an earlier build.
-        for (col, decl) in [
-            ("net_rx", "REAL"),
-            ("net_tx", "REAL"),
-            ("disk_read", "REAL"),
-            ("disk_write", "REAL"),
+        // Migrate in three ordered steps so a database from an earlier build can
+        // be brought up to the current schema in place. Tables come first, then
+        // columns added in later releases are backfilled, and only then the
+        // indexes — several of which lead with `host`, a column the backfill
+        // step adds. Creating those indexes before the column exists is exactly
+        // what broke the in-place upgrade: SQLite rejects them with "no such
+        // column: host" and the whole migration (and startup) fails.
+        conn.execute_batch(CREATE_TABLES)
+            .context("creating tables")?;
+        // Columns added after an earlier release: present in the CREATE above
+        // for fresh databases, added here for ones created by an earlier build.
+        // `host` is NOT NULL, so existing rows are backfilled with the default
+        // single-host name ("local") — the same name the config layer
+        // synthesises for a pre-multi-host single-host setup, so old data stays
+        // attributed to the host that produced it.
+        for (table, col, decl) in [
+            ("container_sample", "host", "TEXT NOT NULL DEFAULT 'local'"),
+            ("container_trend", "host", "TEXT NOT NULL DEFAULT 'local'"),
+            ("container_sample", "net_rx", "REAL"),
+            ("container_sample", "net_tx", "REAL"),
+            ("container_sample", "disk_read", "REAL"),
+            ("container_sample", "disk_write", "REAL"),
         ] {
-            add_column_if_missing(&conn, "container_sample", col, decl)?;
+            add_column_if_missing(&conn, table, col, decl)?;
         }
+        conn.execute_batch(CREATE_INDEXES)
+            .context("creating indexes")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -610,7 +625,11 @@ const STACK_OUTER_ENVELOPE: &str = "\
     MIN(disk_read_min), AVG(disk_read_med), MAX(disk_read_max),
     MIN(disk_write_min), AVG(disk_write_med), MAX(disk_write_max)";
 
-const MIGRATIONS: &str = "
+/// Table definitions, created first so the column backfill and index steps in
+/// [`Store::from_connection`] have something to operate on. Splitting tables
+/// from indexes is what lets an in-place upgrade add the `host` column before
+/// the host-leading indexes below reference it.
+const CREATE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS container_sample (
     ts_ms       INTEGER NOT NULL,
     host        TEXT    NOT NULL,
@@ -624,7 +643,6 @@ CREATE TABLE IF NOT EXISTS container_sample (
     disk_read   REAL,
     disk_write  REAL
 );
-CREATE INDEX IF NOT EXISTS container_sample_host_id_ts ON container_sample(host, id, ts_ms);
 
 CREATE TABLE IF NOT EXISTS container_trend (
     bucket_start_ms INTEGER NOT NULL,
@@ -639,13 +657,18 @@ CREATE TABLE IF NOT EXISTS container_trend (
     median          REAL    NOT NULL,
     samples         INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS container_trend_host_id ON container_trend(host, id, metric, bucket_start_ms);
-CREATE INDEX IF NOT EXISTS container_trend_host_name ON container_trend(host, name, metric, bucket_start_ms);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
+";
+
+/// Indexes, created after the column backfill so the host-leading ones resolve.
+const CREATE_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS container_sample_host_id_ts ON container_sample(host, id, ts_ms);
+CREATE INDEX IF NOT EXISTS container_trend_host_id ON container_trend(host, id, metric, bucket_start_ms);
+CREATE INDEX IF NOT EXISTS container_trend_host_name ON container_trend(host, name, metric, bucket_start_ms);
 ";
 
 #[cfg(test)]
@@ -691,6 +714,53 @@ mod tests {
         // Prune everything strictly before ts 5000 → first cycle dropped.
         let removed = store.prune_raw(5_000).unwrap();
         assert_eq!(removed, 2);
+        assert_eq!(store.count("container_sample").unwrap(), 2);
+    }
+
+    #[test]
+    fn migrates_pre_multi_host_database_in_place() {
+        // A database from before the `host` column existed: the old host-less
+        // tables and indexes, with a row already present so the NOT NULL `host`
+        // backfill is exercised. Opening it used to fail at index creation
+        // ("no such column: host"); it must now upgrade in place.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE container_sample (
+                 ts_ms INTEGER NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL,
+                 cpu_percent REAL, mem_used INTEGER, mem_limit INTEGER,
+                 net_rx REAL, net_tx REAL, disk_read REAL, disk_write REAL);
+             CREATE INDEX container_sample_id_ts ON container_sample(id, ts_ms);
+             CREATE TABLE container_trend (
+                 bucket_start_ms INTEGER NOT NULL, bucket_secs INTEGER NOT NULL,
+                 id TEXT NOT NULL, name TEXT NOT NULL, stack TEXT, metric TEXT NOT NULL,
+                 min REAL NOT NULL, max REAL NOT NULL, median REAL NOT NULL, samples INTEGER NOT NULL);
+             CREATE INDEX container_trend_ts ON container_trend(id, metric, bucket_start_ms);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             INSERT INTO container_sample (ts_ms, id, name) VALUES (1000, 'abc', 'c1');",
+        )
+        .unwrap();
+
+        // Opening must succeed — this is the upgrade that used to abort startup.
+        let store = Store::from_connection(conn).unwrap();
+
+        // The existing row is backfilled with the synthesised single-host name,
+        // so pre-multi-host data stays attributed to the host that produced it.
+        let backfilled = {
+            let conn = store.lock();
+            conn.query_row(
+                "SELECT host FROM container_sample WHERE id = 'abc'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(backfilled, "local");
+
+        // New host-aware inserts (the path that logged "insert container sample"
+        // failures against an un-migrated database) now work.
+        store
+            .insert_samples("nas", 2_000, &[container_sample("z", Some(2.0))])
+            .unwrap();
         assert_eq!(store.count("container_sample").unwrap(), 2);
     }
 
