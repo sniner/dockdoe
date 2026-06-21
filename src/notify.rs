@@ -52,11 +52,12 @@ struct Notification {
     body: String,
 }
 
-/// Build the notification for a container that has settled into `to`.
-fn notification_for(c: &ContainerMetrics, to: Status) -> Notification {
+/// Build the notification for a container that has settled into `to`. `host` is
+/// the monitored host's name, so alerts say which host a container is on.
+fn notification_for(c: &ContainerMetrics, to: Status, host: &str) -> Notification {
     let who = match &c.stack {
-        Some(stack) => format!("Container '{}' (stack {stack})", c.name),
-        None => format!("Container '{}'", c.name),
+        Some(stack) => format!("Container '{}' (stack {stack}) on host '{host}'", c.name),
+        None => format!("Container '{}' on host '{host}'", c.name),
     };
     let (kind, body) = match to {
         Status::Down => ("failure", format!("{who} is down — {}", c.status)),
@@ -78,6 +79,8 @@ struct Tracked {
 /// The pure state machine: given successive snapshots, decide which changes
 /// have settled long enough to notify about. Holds no I/O.
 struct Tracker {
+    /// The monitored host's name, stamped onto every notification.
+    host: String,
     /// How long a new status must persist before it is reported.
     delay_ms: u64,
     states: HashMap<String, Tracked>,
@@ -121,7 +124,7 @@ impl Tracker {
                         }
                     };
                     if ts_ms.saturating_sub(since) >= self.delay_ms {
-                        out.push(notification_for(c, cur));
+                        out.push(notification_for(c, cur, &self.host));
                         t.notified = cur;
                         t.pending = None;
                     }
@@ -145,14 +148,14 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    /// Build a notifier targeting `url`, requiring a new status to persist for
-    /// `delay` before it is reported.
+    /// Build a notifier for the host named `host`, targeting `url`, requiring a
+    /// new status to persist for `delay` before it is reported.
     ///
     /// The HTTP client trusts the Mozilla root set compiled into the binary
     /// (`webpki-root-certs`) rather than a system trust store — the scratch
     /// runtime image has none — so HTTPS Apprise endpoints work out of the box.
     #[must_use]
-    pub fn new(url: String, delay: Duration) -> Self {
+    pub fn new(host: String, url: String, delay: Duration) -> Self {
         let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
             .iter()
             .filter_map(|der| reqwest::Certificate::from_der(der.as_ref()).ok());
@@ -165,6 +168,7 @@ impl Notifier {
             url,
             client,
             tracker: Tracker {
+                host,
                 delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                 states: HashMap::new(),
             },
@@ -237,9 +241,23 @@ mod tests {
 
     fn tracker(delay_ms: u64) -> Tracker {
         Tracker {
+            host: "h1".to_string(),
             delay_ms,
             states: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn notification_body_names_the_host() {
+        let mut t = tracker(0);
+        t.evaluate(0, &[up("a")]); // baseline
+        let notes = t.evaluate(1_000, &[down("a")]);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].body.contains("on host 'h1'"),
+            "body missing host: {}",
+            notes[0].body
+        );
     }
 
     #[test]

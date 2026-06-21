@@ -8,11 +8,12 @@
 //! one collection interval.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
@@ -24,12 +25,22 @@ use bollard::query_parameters::{
     InspectContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
     StatsOptionsBuilder,
 };
+use bollard::{API_DEFAULT_VERSION, BollardRequest, Docker};
 use futures_util::future::join_all;
 use futures_util::{Stream, StreamExt};
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+use rustls::ClientConfig;
 use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
 
+use crate::config::HostConfig;
 use crate::model::{ContainerMetrics, ContainerState, HealthState, Port};
+
+/// Read/write timeout for every bollard connection, in seconds (bollard's own
+/// default; long enough for slow `docker stop` graceful periods).
+const CONNECT_TIMEOUT: u64 = 120;
 
 /// An attached interactive `exec` session: the engine's combined output stream
 /// (TTY merges stdout/stderr) and input sink, plus the exec id used to resize
@@ -71,11 +82,12 @@ pub struct DockerHandle {
 }
 
 impl DockerHandle {
-    /// Connect to the local Docker daemon (honouring `DOCKER_HOST` and the
-    /// default socket).
-    pub fn connect() -> Result<Self> {
-        let docker = Docker::connect_with_defaults().context("connecting to the Docker daemon")?;
-        Ok(Self { docker })
+    /// Connect to a configured Docker host (unix socket, plain tcp/http, or
+    /// server-auth TLS https).
+    pub fn connect_from(cfg: &HostConfig) -> Result<Self> {
+        Ok(Self {
+            docker: connect_endpoint(cfg)?,
+        })
     }
 
     /// Apply a lifecycle action to one container.
@@ -585,15 +597,32 @@ pub struct DockerClient {
 }
 
 impl DockerClient {
-    /// Connect to the local Docker daemon (honouring `DOCKER_HOST` and the
-    /// default socket).
-    pub fn connect() -> Result<Self> {
-        let docker = Docker::connect_with_defaults().context("connecting to the Docker daemon")?;
+    /// Connect to a configured Docker host (unix socket, plain tcp/http, or
+    /// server-auth TLS https).
+    pub fn connect_from(cfg: &HostConfig) -> Result<Self> {
         Ok(Self {
-            docker,
+            docker: connect_endpoint(cfg)?,
             prev_cpu: HashMap::new(),
             prev_io: HashMap::new(),
         })
+    }
+
+    /// The host's logical CPU count from `docker info` (`NCPU`), used to scale
+    /// the container CPU bars (a full bar is the whole host). Falls back to the
+    /// process' available parallelism when the daemon doesn't report it (e.g. a
+    /// socket proxy that blocks `/info`).
+    pub async fn cpu_count(&self) -> usize {
+        match self.docker.info().await {
+            Ok(info) => info
+                .ncpu
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .unwrap_or_else(local_cpu_count),
+            Err(err) => {
+                warn!(%err, "docker info failed; using local CPU count for bar scaling");
+                local_cpu_count()
+            }
+        }
     }
 
     /// Collect metrics for all containers (running and stopped).
@@ -970,6 +999,173 @@ fn parse_health(status: &str) -> HealthState {
     } else {
         HealthState::None
     }
+}
+
+/// Build a bollard connection for one host from its endpoint URL.
+///
+/// - `unix://…` (or a bare path) → the local Docker socket.
+/// - `tcp://…` / `http://…` → plain HTTP (e.g. a socket proxy on a trusted
+///   network or behind Tailscale).
+/// - `https://…` → TLS with server-certificate verification only (no client
+///   cert); see [`tls_client_config`].
+fn connect_endpoint(cfg: &HostConfig) -> Result<Docker> {
+    let url = cfg.docker.trim();
+    let docker = if url.starts_with("unix://") || url.starts_with('/') {
+        Docker::connect_with_unix(url, CONNECT_TIMEOUT, API_DEFAULT_VERSION)
+            .with_context(|| format!("connecting to Docker socket {url}"))?
+    } else if url.starts_with("tcp://") || url.starts_with("http://") {
+        Docker::connect_with_http(url, CONNECT_TIMEOUT, API_DEFAULT_VERSION)
+            .with_context(|| format!("connecting to Docker endpoint {url}"))?
+    } else if url.starts_with("https://") {
+        connect_https(url, cfg)?
+    } else {
+        anyhow::bail!(
+            "unsupported docker endpoint {url:?}: use unix://, tcp://, http:// or https://"
+        );
+    };
+    Ok(docker)
+}
+
+/// Connect to an `https://` endpoint over TLS, verifying the server certificate
+/// only (no client certificate — the socket proxy / reverse proxy front-ends
+/// don't do mutual TLS).
+fn connect_https(url: &str, cfg: &HostConfig) -> Result<Docker> {
+    let tls = tls_client_config(cfg.tls_ca.as_deref(), cfg.tls_insecure)
+        .with_context(|| format!("building TLS config for {url}"))?;
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder.pool_max_idle_per_host(0);
+    let client = Arc::new(builder.build(https));
+    Docker::connect_with_custom_transport(
+        move |req: BollardRequest| {
+            let client = Arc::clone(&client);
+            Box::pin(async move { client.request(req).await.map_err(BollardError::from) })
+        },
+        Some(url.to_string()),
+        CONNECT_TIMEOUT,
+        API_DEFAULT_VERSION,
+    )
+    .with_context(|| format!("connecting to Docker endpoint {url}"))
+}
+
+/// A rustls client config for an `https` Docker endpoint, built on the aws-lc-rs
+/// provider already linked into the binary (shared with the Apprise client).
+///
+/// Trust is server-auth only: the Mozilla root set compiled in via
+/// `webpki-root-certs`, optionally plus a private CA from `tls_ca`. `tls_insecure`
+/// swaps verification for a no-op verifier — convenient for self-signed reverse
+/// proxies, but it accepts any certificate, so prefer `tls_ca` when you can.
+fn tls_client_config(tls_ca: Option<&Path>, tls_insecure: bool) -> Result<ClientConfig> {
+    // Pin the crypto provider explicitly rather than relying on a process-wide
+    // default, which may or may not have been installed by another TLS user
+    // (reqwest) depending on link order.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .context("selecting TLS protocol versions")?;
+
+    if tls_insecure {
+        warn!("tls_insecure is set: TLS server-certificate verification is disabled");
+        return Ok(builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoServerVerification(provider)))
+            .with_no_client_auth());
+    }
+
+    let mut roots = rustls::RootCertStore::empty();
+    let (_added, _ignored) =
+        roots.add_parsable_certificates(webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned());
+    if let Some(ca) = tls_ca {
+        let pem = std::fs::read(ca).with_context(|| format!("reading tls_ca {}", ca.display()))?;
+        let certs = rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("parsing tls_ca {}", ca.display()))?;
+        if certs.is_empty() {
+            anyhow::bail!("tls_ca {} contained no certificates", ca.display());
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .with_context(|| format!("trusting tls_ca {}", ca.display()))?;
+        }
+    }
+    Ok(builder.with_root_certificates(roots).with_no_client_auth())
+}
+
+/// A rustls verifier that accepts any server certificate — installed only when
+/// `tls_insecure` is configured. Signature checks still run (via the crypto
+/// provider) so the handshake stays well-formed; only the certificate's
+/// identity/trust chain is not verified.
+#[derive(Debug)]
+struct NoServerVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The process' available parallelism, the fallback CPU count when the daemon
+/// doesn't report `NCPU`.
+fn local_cpu_count() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// Whether `err` is a Docker `403 Forbidden` — what a socket proxy returns for
+/// an endpoint it is configured to deny (e.g. POST or exec on a read-only
+/// proxy). The bollard error survives `anyhow` context wrapping, so we downcast.
+#[must_use]
+pub fn is_forbidden(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<BollardError>(),
+        Some(BollardError::DockerResponseServerError {
+            status_code: 403,
+            ..
+        })
+    )
 }
 
 #[cfg(test)]

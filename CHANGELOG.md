@@ -3,6 +3,49 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Breaking changes
+
+- **Host metrics removed**: the htop-style CPU / load / memory bar in the header is gone, along
+  with its two dashboard charts. They can't be shown meaningfully for a remote Docker host (they
+  come from the local machine's `/proc`, not the Docker API), so they were dropped for every host
+- **URLs are host-scoped**: every page now lives under `/host/{host}/…` (e.g.
+  `/host/local/container/abc`); `/` is a host chooser that redirects straight to the only host when
+  just one is configured. Old bookmarks to `/container/…` / `/stack/…` need the `/host/{host}` prefix
+
+### Added
+
+- **Multi-host monitoring**: a new `config.toml` (via `--config` / `DOCKDOE_CONFIG`) lists the
+  Docker hosts to watch in a `[[host]]` array, each with a `name`, a `docker` endpoint, and optional
+  `public_host` / `tls_ca` / `tls_insecure`. A header switcher moves between them. Without a config
+  file DockDoe still monitors a single local host configured from the existing flags
+- **Remote hosts via socket proxy**: connect over `tcp://` / `http://` (e.g. a `linuxserver/socket-
+  proxy`) or `https://` with server-certificate verification — trusting the built-in roots, plus an
+  optional private CA (`tls_ca`), or skipping verification (`tls_insecure`) for self-signed proxies
+- **Read-only hosts**: when a proxy denies an action or exec (HTTP 403), that host is marked
+  read-only — its action buttons disable and the terminal shows a notice, no configuration needed
+
+### Changed
+
+- **Port links** are now resolved per host: an explicit `public_host` wins, otherwise the host from
+  a `tcp`/`https` endpoint URL, otherwise the browsing host (the local socket). `--port-host` /
+  `DOCKDOE_PORT_HOST` still sets it for the single-host fallback
+- **Apprise notifications** now name the host a container is on (e.g. "… on host 'prod' is down")
+- **CPU bars** scale to the host's CPU count reported by the Docker daemon (`docker info`) rather
+  than the machine DockDoe runs on
+
+### Fixed
+
+- **In-place database upgrade**: the on-disk schema gained a host dimension, but a database from an
+  earlier build was never migrated — opening it aborted at startup (`no such column: host`) once the
+  host-aware indexes were added. The schema is now brought up to date in place: the `host` column is
+  backfilled (existing samples are attributed to the synthesised `local` host) before the indexes
+  are built, so upgrades keep their history instead of needing the old `dockdoe.sqlite` deleted
+- **Login fields and password managers**: the login form's username and password fields now carry
+  `id` attributes and associated (visually hidden) labels, so password managers like Proton Pass
+  reliably detect and fill them
+
 ## [0.6.4] — 2026-06-14
 
 ### Fixed

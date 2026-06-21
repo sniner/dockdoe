@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::model::{ContainerMetrics, HostMetrics};
+use crate::model::ContainerMetrics;
 
 /// Which metric a trend row describes. Stored as a short string so new metrics
 /// can be added without a trend-schema change (the `metric` column is text).
@@ -61,6 +61,8 @@ impl Metric {
 pub struct ContainerTrend {
     pub bucket_start_ms: u64,
     pub bucket_secs: u64,
+    /// Which Docker host this rollup belongs to (the host's config `name`).
+    pub host: String,
     pub id: String,
     pub name: String,
     pub stack: Option<String>,
@@ -72,9 +74,8 @@ pub struct ContainerTrend {
 }
 
 /// One raw metric point at a timestamp, used to seed the live charts on first
-/// page load and streamed live over SSE. Shared by host and per-container
-/// series; the I/O rates are `None` for the host (which has no per-container
-/// I/O) and bytes/second elsewhere.
+/// page load and streamed live over SSE. The I/O rates are `None` until a
+/// second sample gives a delta, or when the runtime reports no such stats.
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricPoint {
     pub ts_ms: u64,
@@ -147,18 +148,6 @@ impl HistoryPoint {
     }
 }
 
-/// A min/max/median rollup over one time bucket for the host.
-#[derive(Debug, Clone, Serialize)]
-pub struct HostTrend {
-    pub bucket_start_ms: u64,
-    pub bucket_secs: u64,
-    pub metric: &'static str,
-    pub min: f64,
-    pub max: f64,
-    pub median: f64,
-    pub samples: u32,
-}
-
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -188,18 +177,33 @@ impl Store {
         // earlier build, cleaning up its stale `-wal`/`-shm`.
         conn.pragma_update(None, "journal_mode", "DELETE")
             .context("setting rollback journal mode")?;
-        conn.execute_batch(MIGRATIONS)
-            .context("running migrations")?;
-        // Columns added after the first release: present in the CREATE above for
-        // fresh databases, added here for ones created by an earlier build.
-        for (col, decl) in [
-            ("net_rx", "REAL"),
-            ("net_tx", "REAL"),
-            ("disk_read", "REAL"),
-            ("disk_write", "REAL"),
+        // Migrate in three ordered steps so a database from an earlier build can
+        // be brought up to the current schema in place. Tables come first, then
+        // columns added in later releases are backfilled, and only then the
+        // indexes — several of which lead with `host`, a column the backfill
+        // step adds. Creating those indexes before the column exists is exactly
+        // what broke the in-place upgrade: SQLite rejects them with "no such
+        // column: host" and the whole migration (and startup) fails.
+        conn.execute_batch(CREATE_TABLES)
+            .context("creating tables")?;
+        // Columns added after an earlier release: present in the CREATE above
+        // for fresh databases, added here for ones created by an earlier build.
+        // `host` is NOT NULL, so existing rows are backfilled with the default
+        // single-host name ("local") — the same name the config layer
+        // synthesises for a pre-multi-host single-host setup, so old data stays
+        // attributed to the host that produced it.
+        for (table, col, decl) in [
+            ("container_sample", "host", "TEXT NOT NULL DEFAULT 'local'"),
+            ("container_trend", "host", "TEXT NOT NULL DEFAULT 'local'"),
+            ("container_sample", "net_rx", "REAL"),
+            ("container_sample", "net_tx", "REAL"),
+            ("container_sample", "disk_read", "REAL"),
+            ("container_sample", "disk_write", "REAL"),
         ] {
-            add_column_if_missing(&conn, "container_sample", col, decl)?;
+            add_column_if_missing(&conn, table, col, decl)?;
         }
+        conn.execute_batch(CREATE_INDEXES)
+            .context("creating indexes")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -239,43 +243,29 @@ impl Store {
         Ok(secret)
     }
 
-    /// Persist one collection cycle: host sample plus all container samples,
-    /// in a single transaction.
+    /// Persist one collection cycle for one host: all container samples, in a
+    /// single transaction.
     pub fn insert_samples(
         &self,
+        host: &str,
         ts_ms: u64,
-        host: &HostMetrics,
         containers: &[ContainerMetrics],
     ) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().context("begin sample transaction")?;
-        tx.execute(
-            "INSERT INTO host_sample (ts_ms, cpu_percent, load1, load5, load15, mem_used, mem_total)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                to_db(ts_ms),
-                f64::from(host.cpu_percent),
-                host.load_avg.one,
-                host.load_avg.five,
-                host.load_avg.fifteen,
-                to_db(host.mem_used),
-                to_db(host.mem_total),
-            ],
-        )
-        .context("insert host sample")?;
-
         {
             let mut stmt = tx
                 .prepare_cached(
                     "INSERT INTO container_sample
-                       (ts_ms, id, name, cpu_percent, mem_used, mem_limit,
+                       (ts_ms, host, id, name, cpu_percent, mem_used, mem_limit,
                         net_rx, net_tx, disk_read, disk_write)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .context("prepare container insert")?;
             for c in containers {
                 stmt.execute(rusqlite::params![
                     to_db(ts_ms),
+                    host,
                     c.id,
                     c.name,
                     c.cpu_percent,
@@ -304,14 +294,15 @@ impl Store {
             let mut stmt = tx
                 .prepare_cached(
                     "INSERT INTO container_trend
-                       (bucket_start_ms, bucket_secs, id, name, stack, metric, min, max, median, samples)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                       (bucket_start_ms, bucket_secs, host, id, name, stack, metric, min, max, median, samples)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .context("prepare container trend insert")?;
             for t in trends {
                 stmt.execute(rusqlite::params![
                     to_db(t.bucket_start_ms),
                     to_db(t.bucket_secs),
+                    t.host,
                     t.id,
                     t.name,
                     t.stack,
@@ -328,109 +319,52 @@ impl Store {
         Ok(())
     }
 
-    /// Persist a batch of host trend rollups.
-    pub fn insert_host_trends(&self, trends: &[HostTrend]) -> Result<()> {
-        if trends.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.lock();
-        let tx = conn.transaction().context("begin host trend transaction")?;
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO host_trend
-                       (bucket_start_ms, bucket_secs, metric, min, max, median, samples)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )
-                .context("prepare host trend insert")?;
-            for t in trends {
-                stmt.execute(rusqlite::params![
-                    to_db(t.bucket_start_ms),
-                    to_db(t.bucket_secs),
-                    t.metric,
-                    t.min,
-                    t.max,
-                    t.median,
-                    t.samples,
-                ])
-                .context("insert host trend")?;
-            }
-        }
-        tx.commit().context("commit host trend transaction")?;
-        Ok(())
-    }
-
-    /// Delete raw samples (host and container) older than `before_ms`. This is
-    /// "point A": trends survive, raw data is dropped. Returns the number of
-    /// rows removed.
+    /// Delete raw container samples older than `before_ms`. This is "point A":
+    /// trends survive, raw data is dropped. Returns the number of rows removed.
     pub fn prune_raw(&self, before_ms: u64) -> Result<usize> {
         let conn = self.lock();
-        let host = conn
-            .execute(
-                "DELETE FROM host_sample WHERE ts_ms < ?1",
-                [to_db(before_ms)],
-            )
-            .context("prune host samples")?;
         let containers = conn
             .execute(
                 "DELETE FROM container_sample WHERE ts_ms < ?1",
                 [to_db(before_ms)],
             )
             .context("prune container samples")?;
-        Ok(host + containers)
+        Ok(containers)
     }
 
-    /// Delete trend rollups (host and container) whose bucket starts before
-    /// `before_ms`. This is the separate, longer trend retention: trends from
-    /// long-gone containers age out here, independent of "point A" for raw
-    /// data. Returns the number of rows removed.
+    /// Delete container trend rollups whose bucket starts before `before_ms`.
+    /// This is the separate, longer trend retention: trends from long-gone
+    /// containers age out here, independent of "point A" for raw data. Returns
+    /// the number of rows removed.
     pub fn prune_trends(&self, before_ms: u64) -> Result<usize> {
         let conn = self.lock();
-        let host = conn
-            .execute(
-                "DELETE FROM host_trend WHERE bucket_start_ms < ?1",
-                [to_db(before_ms)],
-            )
-            .context("prune host trends")?;
         let containers = conn
             .execute(
                 "DELETE FROM container_trend WHERE bucket_start_ms < ?1",
                 [to_db(before_ms)],
             )
             .context("prune container trends")?;
-        Ok(host + containers)
-    }
-
-    /// Raw host samples collected at or after `since_ms`, oldest first. Used to
-    /// seed the host charts when a page first loads.
-    pub fn recent_host_samples(&self, since_ms: u64) -> Result<Vec<MetricPoint>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT ts_ms, cpu_percent, mem_used, NULL, NULL, NULL, NULL
-                 FROM host_sample WHERE ts_ms >= ?1 ORDER BY ts_ms ASC",
-            )
-            .context("prepare recent host query")?;
-        let rows = stmt
-            .query_map([to_db(since_ms)], row_to_point)
-            .context("query recent host samples")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("collect recent host samples")?;
-        Ok(rows)
+        Ok(containers)
     }
 
     /// Raw samples for one container at or after `since_ms`, oldest first. Used
     /// to seed a container detail page's charts.
-    pub fn recent_container_samples(&self, id: &str, since_ms: u64) -> Result<Vec<MetricPoint>> {
+    pub fn recent_container_samples(
+        &self,
+        host: &str,
+        id: &str,
+        since_ms: u64,
+    ) -> Result<Vec<MetricPoint>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT ts_ms, cpu_percent, mem_used, net_rx, net_tx, disk_read, disk_write
-                 FROM container_sample WHERE id = ?1 AND ts_ms >= ?2 ORDER BY ts_ms ASC",
+                 FROM container_sample
+                 WHERE host = ?1 AND id = ?2 AND ts_ms >= ?3 ORDER BY ts_ms ASC",
             )
             .context("prepare recent container query")?;
         let rows = stmt
-            .query_map(rusqlite::params![id, to_db(since_ms)], row_to_point)
+            .query_map(rusqlite::params![host, id, to_db(since_ms)], row_to_point)
             .context("query recent container samples")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("collect recent container samples")?;
@@ -442,7 +376,12 @@ impl Store {
     /// detail page seeds from trends: per bucket we sum the member medians
     /// (mirroring the live aggregate, which sums current member values). Trends
     /// are stored long (one row per metric), so we pivot cpu/mem into one point.
-    pub fn recent_stack_trends(&self, stack: &str, since_ms: u64) -> Result<Vec<MetricPoint>> {
+    pub fn recent_stack_trends(
+        &self,
+        host: &str,
+        stack: &str,
+        since_ms: u64,
+    ) -> Result<Vec<MetricPoint>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(
@@ -454,14 +393,14 @@ impl Store {
                         SUM(CASE WHEN metric = 'disk_read' THEN median END) AS disk_read,
                         SUM(CASE WHEN metric = 'disk_write' THEN median END) AS disk_write
                  FROM container_trend
-                 WHERE stack = ?1 AND bucket_start_ms >= ?2
+                 WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3
                  GROUP BY bucket_start_ms
                  ORDER BY bucket_start_ms ASC",
             )
             .context("prepare recent stack trend query")?;
         let rows = stmt
             .query_map(
-                rusqlite::params![stack, to_db(since_ms)],
+                rusqlite::params![host, stack, to_db(since_ms)],
                 trend_row_to_point,
             )
             .context("query recent stack trends")?
@@ -470,40 +409,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Host trend history between `since_ms` and `until_ms` (inclusive),
-    /// downsampled into `group_ms` windows, oldest first. Within a window the
-    /// envelope keeps the extremes (MIN of minima, MAX of maxima) while the
-    /// line averages the bucket medians — an approximation of the true median
-    /// that is fine for display.
-    pub fn history_host(
-        &self,
-        since_ms: u64,
-        until_ms: u64,
-        group_ms: u64,
-    ) -> Result<Vec<HistoryPoint>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare_cached(&format!(
-                "SELECT (bucket_start_ms / ?3) * ?3 AS bucket, {HISTORY_ENVELOPE}
-                 FROM host_trend
-                 WHERE bucket_start_ms >= ?1 AND bucket_start_ms <= ?2
-                 GROUP BY bucket ORDER BY bucket ASC"
-            ))
-            .context("prepare host history query")?;
-        let rows = stmt
-            .query_map(
-                [to_db(since_ms), to_db(until_ms), to_db(group_ms.max(1))],
-                history_row_to_point,
-            )
-            .context("query host history")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("collect host history")?;
-        Ok(rows)
-    }
-
-    /// Trend history for one container, downsampled like [`Self::history_host`].
+    /// Trend history for one container between `since_ms` and `until_ms`
+    /// (inclusive), downsampled into `group_ms` windows, oldest first. Within a
+    /// window the envelope keeps the extremes (MIN of minima, MAX of maxima)
+    /// while the line averages the bucket medians — an approximation of the true
+    /// median that is fine for display.
     pub fn history_container(
         &self,
+        host: &str,
         id: &str,
         since_ms: u64,
         until_ms: u64,
@@ -512,15 +425,21 @@ impl Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare_cached(&format!(
-                "SELECT (bucket_start_ms / ?4) * ?4 AS bucket, {HISTORY_ENVELOPE}
+                "SELECT (bucket_start_ms / ?5) * ?5 AS bucket, {HISTORY_ENVELOPE}
                  FROM container_trend
-                 WHERE id = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms <= ?3
+                 WHERE host = ?1 AND id = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
                  GROUP BY bucket ORDER BY bucket ASC"
             ))
             .context("prepare container history query")?;
         let rows = stmt
             .query_map(
-                rusqlite::params![id, to_db(since_ms), to_db(until_ms), to_db(group_ms.max(1))],
+                rusqlite::params![
+                    host,
+                    id,
+                    to_db(since_ms),
+                    to_db(until_ms),
+                    to_db(group_ms.max(1))
+                ],
                 history_row_to_point,
             )
             .context("query container history")?
@@ -531,9 +450,10 @@ impl Store {
 
     /// Trend history for a whole stack: per trend bucket the member values are
     /// summed (mirroring the live aggregate and [`Self::recent_stack_trends`]),
-    /// then the summed buckets are downsampled like [`Self::history_host`].
+    /// then the summed buckets are downsampled like [`Self::history_container`].
     pub fn history_stack(
         &self,
+        host: &str,
         stack: &str,
         since_ms: u64,
         until_ms: u64,
@@ -545,10 +465,10 @@ impl Store {
                 "WITH per_bucket AS (
                      SELECT bucket_start_ms AS b, {STACK_SUM_PER_BUCKET}
                      FROM container_trend
-                     WHERE stack = ?1 AND bucket_start_ms >= ?2 AND bucket_start_ms <= ?3
+                     WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
                      GROUP BY b
                  )
-                 SELECT (b / ?4) * ?4 AS bucket, {STACK_OUTER_ENVELOPE}
+                 SELECT (b / ?5) * ?5 AS bucket, {STACK_OUTER_ENVELOPE}
                  FROM per_bucket
                  GROUP BY bucket ORDER BY bucket ASC"
             ))
@@ -556,6 +476,7 @@ impl Store {
         let rows = stmt
             .query_map(
                 rusqlite::params![
+                    host,
                     stack,
                     to_db(since_ms),
                     to_db(until_ms),
@@ -613,7 +534,8 @@ fn from_db(v: i64) -> u64 {
 }
 
 /// Map a `(ts_ms, cpu_percent, mem_used, net_rx, net_tx, disk_read, disk_write)`
-/// row to a [`MetricPoint`]. The I/O columns are `NULL` for host samples.
+/// row to a [`MetricPoint`]. The I/O columns are `NULL` when the runtime
+/// reported no network/block-I/O stats for the container.
 fn row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
     Ok(MetricPoint {
         ts_ms: from_db(r.get::<_, i64>(0)?),
@@ -670,10 +592,10 @@ fn history_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryPoint>
     })
 }
 
-/// The per-metric envelope columns shared by the host and container history
-/// queries: for each metric, `MIN(min) AVG(median) MAX(max)` over the
-/// downsampling group, in the column order [`history_row_to_point`] expects.
-/// Metrics a table never stores (net/disk for the host) come back as NULL.
+/// The per-metric envelope columns for the container history query: for each
+/// metric, `MIN(min) AVG(median) MAX(max)` over the downsampling group, in the
+/// column order [`history_row_to_point`] expects. Metrics with no rows in a
+/// group (e.g. a container the runtime reports no block-I/O for) come back NULL.
 const HISTORY_ENVELOPE: &str = "\
     MIN(CASE WHEN metric='cpu' THEN min END), AVG(CASE WHEN metric='cpu' THEN median END), MAX(CASE WHEN metric='cpu' THEN max END),
     MIN(CASE WHEN metric='mem' THEN min END), AVG(CASE WHEN metric='mem' THEN median END), MAX(CASE WHEN metric='mem' THEN max END),
@@ -703,20 +625,14 @@ const STACK_OUTER_ENVELOPE: &str = "\
     MIN(disk_read_min), AVG(disk_read_med), MAX(disk_read_max),
     MIN(disk_write_min), AVG(disk_write_med), MAX(disk_write_max)";
 
-const MIGRATIONS: &str = "
-CREATE TABLE IF NOT EXISTS host_sample (
-    ts_ms       INTEGER NOT NULL,
-    cpu_percent REAL    NOT NULL,
-    load1       REAL,
-    load5       REAL,
-    load15      REAL,
-    mem_used    INTEGER,
-    mem_total   INTEGER
-);
-CREATE INDEX IF NOT EXISTS host_sample_ts ON host_sample(ts_ms);
-
+/// Table definitions, created first so the column backfill and index steps in
+/// [`Store::from_connection`] have something to operate on. Splitting tables
+/// from indexes is what lets an in-place upgrade add the `host` column before
+/// the host-leading indexes below reference it.
+const CREATE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS container_sample (
     ts_ms       INTEGER NOT NULL,
+    host        TEXT    NOT NULL,
     id          TEXT    NOT NULL,
     name        TEXT    NOT NULL,
     cpu_percent REAL,
@@ -727,22 +643,11 @@ CREATE TABLE IF NOT EXISTS container_sample (
     disk_read   REAL,
     disk_write  REAL
 );
-CREATE INDEX IF NOT EXISTS container_sample_id_ts ON container_sample(id, ts_ms);
-
-CREATE TABLE IF NOT EXISTS host_trend (
-    bucket_start_ms INTEGER NOT NULL,
-    bucket_secs     INTEGER NOT NULL,
-    metric          TEXT    NOT NULL,
-    min             REAL    NOT NULL,
-    max             REAL    NOT NULL,
-    median          REAL    NOT NULL,
-    samples         INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS host_trend_ts ON host_trend(metric, bucket_start_ms);
 
 CREATE TABLE IF NOT EXISTS container_trend (
     bucket_start_ms INTEGER NOT NULL,
     bucket_secs     INTEGER NOT NULL,
+    host            TEXT    NOT NULL,
     id              TEXT    NOT NULL,
     name            TEXT    NOT NULL,
     stack           TEXT,
@@ -752,8 +657,6 @@ CREATE TABLE IF NOT EXISTS container_trend (
     median          REAL    NOT NULL,
     samples         INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS container_trend_ts ON container_trend(id, metric, bucket_start_ms);
-CREATE INDEX IF NOT EXISTS container_trend_name ON container_trend(name, metric, bucket_start_ms);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -761,24 +664,19 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 ";
 
+/// Indexes, created after the column backfill so the host-leading ones resolve.
+const CREATE_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS container_sample_host_id_ts ON container_sample(host, id, ts_ms);
+CREATE INDEX IF NOT EXISTS container_trend_host_id ON container_trend(host, id, metric, bucket_start_ms);
+CREATE INDEX IF NOT EXISTS container_trend_host_name ON container_trend(host, name, metric, bucket_start_ms);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ContainerState, HealthState, LoadAverage};
+    use crate::model::{ContainerState, HealthState};
 
-    fn host_sample(cpu: f32) -> HostMetrics {
-        HostMetrics {
-            cpu_percent: cpu,
-            load_avg: LoadAverage {
-                one: 1.0,
-                five: 0.5,
-                fifteen: 0.25,
-            },
-            mem_total: 1000,
-            mem_used: 400,
-            cpu_count: 8,
-        }
-    }
+    const HOST: &str = "local";
 
     fn container_sample(id: &str, cpu: Option<f64>) -> ContainerMetrics {
         ContainerMetrics {
@@ -808,20 +706,61 @@ mod tests {
             container_sample("b", None),
         ];
 
-        store
-            .insert_samples(1_000, &host_sample(10.0), &containers)
-            .unwrap();
-        store
-            .insert_samples(5_000, &host_sample(20.0), &containers)
-            .unwrap();
+        store.insert_samples(HOST, 1_000, &containers).unwrap();
+        store.insert_samples(HOST, 5_000, &containers).unwrap();
 
-        assert_eq!(store.count("host_sample").unwrap(), 2);
         assert_eq!(store.count("container_sample").unwrap(), 4);
 
         // Prune everything strictly before ts 5000 → first cycle dropped.
         let removed = store.prune_raw(5_000).unwrap();
-        assert_eq!(removed, 1 + 2);
-        assert_eq!(store.count("host_sample").unwrap(), 1);
+        assert_eq!(removed, 2);
+        assert_eq!(store.count("container_sample").unwrap(), 2);
+    }
+
+    #[test]
+    fn migrates_pre_multi_host_database_in_place() {
+        // A database from before the `host` column existed: the old host-less
+        // tables and indexes, with a row already present so the NOT NULL `host`
+        // backfill is exercised. Opening it used to fail at index creation
+        // ("no such column: host"); it must now upgrade in place.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE container_sample (
+                 ts_ms INTEGER NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL,
+                 cpu_percent REAL, mem_used INTEGER, mem_limit INTEGER,
+                 net_rx REAL, net_tx REAL, disk_read REAL, disk_write REAL);
+             CREATE INDEX container_sample_id_ts ON container_sample(id, ts_ms);
+             CREATE TABLE container_trend (
+                 bucket_start_ms INTEGER NOT NULL, bucket_secs INTEGER NOT NULL,
+                 id TEXT NOT NULL, name TEXT NOT NULL, stack TEXT, metric TEXT NOT NULL,
+                 min REAL NOT NULL, max REAL NOT NULL, median REAL NOT NULL, samples INTEGER NOT NULL);
+             CREATE INDEX container_trend_ts ON container_trend(id, metric, bucket_start_ms);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+             INSERT INTO container_sample (ts_ms, id, name) VALUES (1000, 'abc', 'c1');",
+        )
+        .unwrap();
+
+        // Opening must succeed — this is the upgrade that used to abort startup.
+        let store = Store::from_connection(conn).unwrap();
+
+        // The existing row is backfilled with the synthesised single-host name,
+        // so pre-multi-host data stays attributed to the host that produced it.
+        let backfilled = {
+            let conn = store.lock();
+            conn.query_row(
+                "SELECT host FROM container_sample WHERE id = 'abc'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(backfilled, "local");
+
+        // New host-aware inserts (the path that logged "insert container sample"
+        // failures against an un-migrated database) now work.
+        store
+            .insert_samples("nas", 2_000, &[container_sample("z", Some(2.0))])
+            .unwrap();
         assert_eq!(store.count("container_sample").unwrap(), 2);
     }
 
@@ -829,23 +768,15 @@ mod tests {
     fn container_samples_roundtrip_io_rates() {
         let store = Store::open_in_memory().unwrap();
         store
-            .insert_samples(
-                1_000,
-                &host_sample(10.0),
-                &[container_sample("a", Some(1.0))],
-            )
+            .insert_samples(HOST, 1_000, &[container_sample("a", Some(1.0))])
             .unwrap();
-        let points = store.recent_container_samples("a", 0).unwrap();
+        let points = store.recent_container_samples(HOST, "a", 0).unwrap();
         assert_eq!(points.len(), 1);
         let p = &points[0];
         assert_eq!(p.net_rx, Some(10.0));
         assert_eq!(p.net_tx, Some(20.0));
         assert_eq!(p.disk_read, Some(30.0));
         assert_eq!(p.disk_write, Some(40.0));
-        // Host samples carry no per-container I/O.
-        let host = store.recent_host_samples(0).unwrap();
-        assert_eq!(host[0].net_rx, None);
-        assert_eq!(host[0].disk_write, None);
     }
 
     #[test]
@@ -864,6 +795,7 @@ mod tests {
             .insert_container_trends(&[ContainerTrend {
                 bucket_start_ms: 0,
                 bucket_secs: 60,
+                host: HOST.into(),
                 id: "a".to_string(),
                 name: "c-a".to_string(),
                 stack: Some("web".to_string()),
@@ -874,19 +806,7 @@ mod tests {
                 samples: 20,
             }])
             .unwrap();
-        store
-            .insert_host_trends(&[HostTrend {
-                bucket_start_ms: 0,
-                bucket_secs: 60,
-                metric: Metric::Mem.as_str(),
-                min: 100.0,
-                max: 900.0,
-                median: 400.0,
-                samples: 20,
-            }])
-            .unwrap();
         assert_eq!(store.count("container_trend").unwrap(), 1);
-        assert_eq!(store.count("host_trend").unwrap(), 1);
     }
 
     #[test]
@@ -895,6 +815,7 @@ mod tests {
         let ct = |bucket: u64, id: &str, stack: &str, metric, median: f64| ContainerTrend {
             bucket_start_ms: bucket,
             bucket_secs: 60,
+            host: HOST.into(),
             id: id.to_string(),
             name: format!("c-{id}"),
             stack: Some(stack.to_string()),
@@ -924,7 +845,7 @@ mod tests {
             ])
             .unwrap();
 
-        let points = store.recent_stack_trends("web", 0).unwrap();
+        let points = store.recent_stack_trends(HOST, "web", 0).unwrap();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].ts_ms, 0);
         assert!((points[0].cpu_percent - 10.0).abs() < 1e-9);
@@ -939,58 +860,9 @@ mod tests {
         assert_eq!(points[1].mem_used, Some(400));
 
         // since_ms filters out older buckets.
-        let recent = store.recent_stack_trends("web", 60_000).unwrap();
+        let recent = store.recent_stack_trends(HOST, "web", 60_000).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].ts_ms, 60_000);
-    }
-
-    #[test]
-    fn history_host_downsamples_into_groups() {
-        let store = Store::open_in_memory().unwrap();
-        let ht = |bucket: u64, metric, min: f64, median: f64, max: f64| HostTrend {
-            bucket_start_ms: bucket,
-            bucket_secs: 60,
-            metric,
-            min,
-            max,
-            median,
-            samples: 20,
-        };
-        store
-            .insert_host_trends(&[
-                ht(0, Metric::Cpu.as_str(), 1.0, 4.0, 9.0),
-                ht(60_000, Metric::Cpu.as_str(), 2.0, 6.0, 20.0),
-                ht(0, Metric::Mem.as_str(), 100.0, 400.0, 900.0),
-                ht(120_000, Metric::Cpu.as_str(), 3.0, 5.0, 7.0),
-            ])
-            .unwrap();
-
-        // Group = bucket size → buckets pass through unchanged.
-        let fine = store.history_host(0, u64::MAX, 60_000).unwrap();
-        assert_eq!(fine.len(), 3);
-        assert_eq!(fine[0].ts_ms, 0);
-        assert_eq!(fine[0].cpu_min, Some(1.0));
-        assert_eq!(fine[0].cpu_med, Some(4.0));
-        assert_eq!(fine[0].cpu_max, Some(9.0));
-        assert_eq!(fine[0].mem_med, Some(400.0));
-        // Bucket without mem rows yields None for the mem envelope.
-        assert_eq!(fine[1].mem_med, None);
-
-        // Coarser group: first two buckets merge — envelope keeps the
-        // extremes, the line averages the medians.
-        let coarse = store.history_host(0, u64::MAX, 120_000).unwrap();
-        assert_eq!(coarse.len(), 2);
-        assert_eq!(coarse[0].cpu_min, Some(1.0));
-        assert_eq!(coarse[0].cpu_med, Some(5.0)); // avg(4, 6)
-        assert_eq!(coarse[0].cpu_max, Some(20.0));
-        assert_eq!(coarse[1].ts_ms, 120_000);
-
-        // since_ms and until_ms bound the window at both ends.
-        let late = store.history_host(120_000, u64::MAX, 60_000).unwrap();
-        assert_eq!(late.len(), 1);
-        let middle = store.history_host(60_000, 60_000, 60_000).unwrap();
-        assert_eq!(middle.len(), 1);
-        assert_eq!(middle[0].ts_ms, 60_000);
     }
 
     #[test]
@@ -1001,6 +873,7 @@ mod tests {
                 ContainerTrend {
                     bucket_start_ms: 0,
                     bucket_secs: 60,
+                    host: HOST.into(),
                     id: "a".to_string(),
                     name: "c-a".to_string(),
                     stack: None,
@@ -1013,6 +886,7 @@ mod tests {
                 ContainerTrend {
                     bucket_start_ms: 0,
                     bucket_secs: 60,
+                    host: HOST.into(),
                     id: "a".to_string(),
                     name: "c-a".to_string(),
                     stack: None,
@@ -1025,7 +899,9 @@ mod tests {
             ])
             .unwrap();
 
-        let h = store.history_container("a", 0, u64::MAX, 60_000).unwrap();
+        let h = store
+            .history_container(HOST, "a", 0, u64::MAX, 60_000)
+            .unwrap();
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].net_rx_min, Some(100.0));
         assert_eq!(h[0].net_rx_med, Some(400.0));
@@ -1042,6 +918,7 @@ mod tests {
         let ct = |bucket: u64, id: &str, min: f64, median: f64, max: f64| ContainerTrend {
             bucket_start_ms: bucket,
             bucket_secs: 60,
+            host: HOST.into(),
             id: id.to_string(),
             name: format!("c-{id}"),
             stack: Some("web".to_string()),
@@ -1062,14 +939,18 @@ mod tests {
             ])
             .unwrap();
 
-        let fine = store.history_stack("web", 0, u64::MAX, 60_000).unwrap();
+        let fine = store
+            .history_stack(HOST, "web", 0, u64::MAX, 60_000)
+            .unwrap();
         assert_eq!(fine.len(), 2);
         assert_eq!(fine[0].cpu_min, Some(3.0));
         assert_eq!(fine[0].cpu_med, Some(10.0));
         assert_eq!(fine[0].cpu_max, Some(19.0));
 
         // Coarse group merges the summed buckets.
-        let coarse = store.history_stack("web", 0, u64::MAX, 120_000).unwrap();
+        let coarse = store
+            .history_stack(HOST, "web", 0, u64::MAX, 120_000)
+            .unwrap();
         assert_eq!(coarse.len(), 1);
         assert_eq!(coarse[0].cpu_min, Some(2.0));
         assert_eq!(coarse[0].cpu_med, Some(7.5)); // avg(10, 5)
@@ -1078,32 +959,27 @@ mod tests {
         // Unknown stack and container queries return empty, not errors.
         assert!(
             store
-                .history_stack("nope", 0, u64::MAX, 60_000)
+                .history_stack(HOST, "nope", 0, u64::MAX, 60_000)
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
-                .history_container("nope", 0, u64::MAX, 60_000)
+                .history_container(HOST, "nope", 0, u64::MAX, 60_000)
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
-    fn recent_host_samples_filters_and_orders() {
+    fn recent_container_samples_filters_and_orders() {
         let store = Store::open_in_memory().unwrap();
-        store
-            .insert_samples(5_000, &host_sample(20.0), &[])
-            .unwrap();
-        store
-            .insert_samples(1_000, &host_sample(10.0), &[])
-            .unwrap();
-        store
-            .insert_samples(9_000, &host_sample(30.0), &[])
-            .unwrap();
+        let c = |cpu| [container_sample("a", Some(cpu))];
+        store.insert_samples(HOST, 5_000, &c(20.0)).unwrap();
+        store.insert_samples(HOST, 1_000, &c(10.0)).unwrap();
+        store.insert_samples(HOST, 9_000, &c(30.0)).unwrap();
 
-        let points = store.recent_host_samples(5_000).unwrap();
+        let points = store.recent_container_samples(HOST, "a", 5_000).unwrap();
         assert_eq!(points.len(), 2);
         // Oldest first, only ts >= 5000.
         assert_eq!(points[0].ts_ms, 5_000);
@@ -1116,6 +992,7 @@ mod tests {
         let trend = |start: u64| ContainerTrend {
             bucket_start_ms: start,
             bucket_secs: 60,
+            host: HOST.into(),
             id: "a".to_string(),
             name: "c-a".to_string(),
             stack: None,
