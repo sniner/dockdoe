@@ -31,6 +31,10 @@ pub struct Config {
     pub trend_bucket_secs: u64,
     /// How long trend rollups are kept (separate, longer than raw).
     pub trend_retention: Duration,
+    /// How often to run retention pruning. Pruning every sample cycle is pure
+    /// overhead — retention is hours/days, so nothing ages out between two
+    /// 3-second samples. We batch it onto this slower cadence instead.
+    pub prune_interval: Duration,
 }
 
 /// Run the collection loop forever for one Docker host. `host` is the host's
@@ -49,12 +53,16 @@ pub async fn run(
         interval = ?config.interval,
         raw_retention = ?config.raw_retention,
         trend_bucket_secs = config.trend_bucket_secs,
+        prune_interval = ?config.prune_interval,
         "starting metrics collector"
     );
     let mut ticker = tokio::time::interval(config.interval);
     let mut bucketer = Bucketer::new(config.trend_bucket_secs, host.clone());
     let raw_retention_ms = duration_ms(config.raw_retention);
     let trend_retention_ms = duration_ms(config.trend_retention);
+    // Prune every Nth cycle rather than every cycle.
+    let prune_every_cycles = prune_cadence(config.prune_interval, config.interval);
+    let mut cycle: u64 = 0;
     let mut primed = false;
 
     loop {
@@ -105,14 +113,24 @@ pub async fn run(
         // reads it from here.
         publish(&shared, dashboard.clone());
 
+        // Prune on the first real cycle (clearing anything that aged out while
+        // we were down) and every `prune_every_cycles` after; otherwise just
+        // persist the samples. `Some(cutoffs)` requests the prune, `None` skips.
+        let prune_cutoffs = cycle.is_multiple_of(prune_every_cycles).then(|| {
+            (
+                ts_ms.saturating_sub(raw_retention_ms),
+                ts_ms.saturating_sub(trend_retention_ms),
+            )
+        });
+        cycle += 1;
+
         persist(
             &store,
             host.clone(),
             ts_ms,
             Arc::new(dashboard),
             flushed,
-            ts_ms.saturating_sub(raw_retention_ms),
-            ts_ms.saturating_sub(trend_retention_ms),
+            prune_cutoffs,
         )
         .await;
     }
@@ -127,22 +145,24 @@ fn publish(shared: &SharedDashboard, dashboard: Dashboard) {
 }
 
 /// Persist one cycle on the blocking pool: raw samples, any closed trend
-/// buckets, and retention pruning. Failures are logged, not fatal.
+/// buckets, and — when `prune_cutoffs` is `Some((raw, trend))` — retention
+/// pruning to those cutoffs. Failures are logged, not fatal.
 async fn persist(
     store: &Store,
     host: String,
     ts_ms: u64,
     dashboard: Arc<Dashboard>,
     flushed: crate::trend::Flushed,
-    raw_cutoff_ms: u64,
-    trend_cutoff_ms: u64,
+    prune_cutoffs: Option<(u64, u64)>,
 ) {
     let store = store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         store.insert_samples(&host, ts_ms, &dashboard.containers)?;
         store.insert_container_trends(&flushed.containers)?;
-        store.prune_raw(raw_cutoff_ms)?;
-        store.prune_trends(trend_cutoff_ms)?;
+        if let Some((raw_cutoff_ms, trend_cutoff_ms)) = prune_cutoffs {
+            store.prune_raw(raw_cutoff_ms)?;
+            store.prune_trends(trend_cutoff_ms)?;
+        }
         Ok(())
     })
     .await;
@@ -162,4 +182,31 @@ fn now_unix_ms() -> u64 {
 
 fn duration_ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How many sample cycles between retention prunes: prune roughly every
+/// `prune_interval`, given one sample every `interval`. Floors to at least 1 so
+/// a `prune_interval` at or below one sample cycle prunes every cycle rather
+/// than dividing to zero.
+fn prune_cadence(prune_interval: Duration, interval: Duration) -> u64 {
+    (prune_interval.as_secs() / interval.as_secs().max(1)).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_cadence_batches_by_interval() {
+        // Default: prune hourly, sample every 3s → every 1200 cycles.
+        let cad = |p, i| prune_cadence(Duration::from_secs(p), Duration::from_secs(i));
+        assert_eq!(cad(3600, 3), 1200);
+        // Sample every second → 3600 cycles.
+        assert_eq!(cad(3600, 1), 3600);
+        // Prune interval equal to the sample interval → every cycle.
+        assert_eq!(cad(5, 5), 1);
+        // Prune interval below one sample cycle → still prune every cycle,
+        // never zero (which would panic the `cycle % n` modulo).
+        assert_eq!(cad(1, 3), 1);
+    }
 }

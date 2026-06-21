@@ -59,6 +59,7 @@ pub struct AppConfig {
     pub raw_retention_secs: u64,
     pub trend_bucket_secs: u64,
     pub trend_retention_secs: u64,
+    pub prune_interval_secs: u64,
     pub allowed_hosts: Vec<String>,
     pub apprise_url: Option<String>,
     pub notify_delay_secs: u64,
@@ -80,6 +81,7 @@ struct FileConfig {
     raw_retention_secs: Option<u64>,
     trend_bucket_secs: Option<u64>,
     trend_retention_secs: Option<u64>,
+    prune_interval_secs: Option<u64>,
     allowed_hosts: Option<Vec<String>>,
     apprise_url: Option<String>,
     notify_delay_secs: Option<u64>,
@@ -130,6 +132,9 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
         trend_retention_secs: file
             .trend_retention_secs
             .unwrap_or(cli.trend_retention_secs),
+        prune_interval_secs: file
+            .prune_interval_secs
+            .unwrap_or(cli.prune_interval_secs),
         allowed_hosts: file
             .allowed_hosts
             .unwrap_or_else(|| cli.allowed_hosts.clone()),
