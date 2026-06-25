@@ -184,8 +184,12 @@ async fn main() -> Result<()> {
         let cpu_count = docker.cpu_count().await;
         let shared = Arc::new(RwLock::new(None));
 
+        // Per-host sampling interval: an explicit `interval_secs` wins, else a
+        // local endpoint uses the global default and a remote one the slower
+        // remote default (polling a socket proxy over the network is costly).
+        let interval_secs = host_cfg.effective_interval_secs(cfg.interval_secs);
         let collector_config = Config {
-            interval: Duration::from_secs(cfg.interval_secs),
+            interval: Duration::from_secs(interval_secs),
             raw_retention: Duration::from_secs(cfg.raw_retention_secs),
             trend_bucket_secs: cfg.trend_bucket_secs,
             trend_retention: Duration::from_secs(cfg.trend_retention_secs),

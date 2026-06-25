@@ -35,6 +35,14 @@ pub struct HostConfig {
     #[serde(default)]
     pub public_host: Option<String>,
 
+    /// Seconds between metric samples for this host, overriding the global
+    /// interval for this host alone. Unset: a local endpoint (`unix`/`npipe`)
+    /// inherits the global interval, a remote one (`tcp`/`http`/`https`) falls
+    /// back to the slower [`REMOTE_DEFAULT_INTERVAL_SECS`] — polling a socket
+    /// proxy over the network is far costlier than reading the local socket.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+
     /// Path to a private CA certificate (PEM) to trust for an `https` endpoint.
     // Consumed by the per-host TLS connection layer (M3); parsed already so the
     // config surface is stable.
@@ -47,6 +55,36 @@ pub struct HostConfig {
     #[allow(dead_code, reason = "wired up in the M3 connection layer")]
     #[serde(default)]
     pub tls_insecure: bool,
+}
+
+/// Default sampling interval (seconds) for a remote host that doesn't pin its
+/// own `interval_secs`. Remote endpoints are reached over a (HTTP/S) socket
+/// proxy, where the 3-second local cadence is needlessly chatty; 10 s eases the
+/// load while still leaving ~6 samples per 60-second trend bucket.
+const REMOTE_DEFAULT_INTERVAL_SECS: u64 = 10;
+
+impl HostConfig {
+    /// The effective sampling interval for this host, in seconds. An explicit
+    /// per-host `interval_secs` always wins. Otherwise a local endpoint
+    /// (`unix`/`npipe`) inherits `global_default`, while a remote one falls back
+    /// to the slower [`REMOTE_DEFAULT_INTERVAL_SECS`].
+    pub fn effective_interval_secs(&self, global_default: u64) -> u64 {
+        self.interval_secs.unwrap_or_else(|| {
+            if self.is_local_endpoint() {
+                global_default
+            } else {
+                REMOTE_DEFAULT_INTERVAL_SECS
+            }
+        })
+    }
+
+    /// Whether the Docker endpoint is local — a Unix socket or Windows named
+    /// pipe — as opposed to a remote `tcp`/`http`/`https` proxy.
+    fn is_local_endpoint(&self) -> bool {
+        let endpoint = self.docker.trim();
+        let scheme = endpoint.split_once("://").map_or(endpoint, |(s, _)| s);
+        scheme.eq_ignore_ascii_case("unix") || scheme.eq_ignore_ascii_case("npipe")
+    }
 }
 
 /// Fully resolved configuration: globals merged from file + CLI, plus the host
@@ -114,6 +152,7 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
             name: "local".to_string(),
             docker: default_docker_endpoint(),
             public_host: cli.port_host.clone(),
+            interval_secs: None,
             tls_ca: None,
             tls_insecure: false,
         }]
@@ -132,9 +171,7 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
         trend_retention_secs: file
             .trend_retention_secs
             .unwrap_or(cli.trend_retention_secs),
-        prune_interval_secs: file
-            .prune_interval_secs
-            .unwrap_or(cli.prune_interval_secs),
+        prune_interval_secs: file.prune_interval_secs.unwrap_or(cli.prune_interval_secs),
         allowed_hosts: file
             .allowed_hosts
             .unwrap_or_else(|| cli.allowed_hosts.clone()),
@@ -173,6 +210,14 @@ fn validate_hosts(hosts: &[HostConfig]) -> Result<()> {
         }
         if h.docker.trim().is_empty() {
             bail!("host {:?} has an empty docker endpoint", h.name);
+        }
+        // Zero would panic in `tokio::time::interval` inside the collector,
+        // mirroring the clap range guard on the global `--interval-secs`.
+        if h.interval_secs == Some(0) {
+            bail!(
+                "host {:?} has interval_secs = 0; it must be at least 1",
+                h.name
+            );
         }
     }
     Ok(())
@@ -218,6 +263,7 @@ mod tests {
             name = "nas"
             docker = "https://nas.lan:2375"
             public_host = "nas.lan"
+            interval_secs = 15
             tls_insecure = true
             "#,
         )
@@ -228,6 +274,47 @@ mod tests {
         assert_eq!(file.host.len(), 2);
         assert_eq!(file.host[1].docker, "https://nas.lan:2375");
         assert!(file.host[1].tls_insecure);
+        // The per-host interval is parsed; an omitted one stays None.
+        assert_eq!(file.host[1].interval_secs, Some(15));
+        assert_eq!(file.host[0].interval_secs, None);
+    }
+
+    fn host_with(docker: &str, interval_secs: Option<u64>) -> HostConfig {
+        HostConfig {
+            name: "h".into(),
+            docker: docker.into(),
+            public_host: None,
+            interval_secs,
+            tls_ca: None,
+            tls_insecure: false,
+        }
+    }
+
+    #[test]
+    fn per_host_interval_resolution() {
+        // An explicit per-host interval always wins, local or remote.
+        assert_eq!(
+            host_with("unix:///x", Some(5)).effective_interval_secs(3),
+            5
+        );
+        assert_eq!(
+            host_with("tcp://h:2375", Some(2)).effective_interval_secs(3),
+            2
+        );
+        // A local endpoint without an override inherits the global default.
+        assert_eq!(host_with("unix:///x", None).effective_interval_secs(3), 3);
+        // Remote endpoints fall back to the slower remote default.
+        for remote in ["tcp://h:2375", "http://h:2375", "https://h:2376"] {
+            assert_eq!(
+                host_with(remote, None).effective_interval_secs(3),
+                REMOTE_DEFAULT_INTERVAL_SECS
+            );
+        }
+    }
+
+    #[test]
+    fn zero_per_host_interval_is_rejected() {
+        assert!(validate_hosts(&[host_with("unix:///x", Some(0))]).is_err());
     }
 
     #[test]
@@ -246,6 +333,7 @@ mod tests {
                 name: "dup".into(),
                 docker: "unix:///x".into(),
                 public_host: None,
+                interval_secs: None,
                 tls_ca: None,
                 tls_insecure: false,
             },
@@ -253,6 +341,7 @@ mod tests {
                 name: "dup".into(),
                 docker: "tcp://y:2375".into(),
                 public_host: None,
+                interval_secs: None,
                 tls_ca: None,
                 tls_insecure: false,
             },
@@ -266,6 +355,7 @@ mod tests {
             name: "x".into(),
             docker: "   ".into(),
             public_host: None,
+            interval_secs: None,
             tls_ca: None,
             tls_insecure: false,
         }];
