@@ -104,9 +104,10 @@ name   = "local"                       # display name + URL slug, must be unique
 docker = "unix:///var/run/docker.sock" # the local socket
 
 [[host]]
-name        = "nas"
-docker      = "tcp://nas.lan:2375"     # a linuxserver/tecnativa socket proxy
-public_host = "nas.lan"                # where this host's published ports are reachable
+name          = "nas"
+docker        = "tcp://nas.lan:2375"   # a linuxserver/tecnativa socket proxy
+public_host   = "nas.lan"              # where this host's published ports are reachable
+# interval_secs = 10                   # sample interval; remote hosts default to 10s
 
 [[host]]
 name   = "prod"
@@ -125,6 +126,11 @@ redirects straight through when there's only one). Per-host keys:
   (TLS — verified against the built-in roots, plus `tls_ca`, or `tls_insecure`)
 - **`public_host`** — the host the published-port pills link to (see
   [Port links](#port-links)); defaults to the endpoint's host for `tcp`/`https`
+- **`interval_secs`** — seconds between samples for this host, overriding the
+  global `--interval-secs` for it alone. Unset, a local (`unix`) endpoint uses
+  the global interval (default `3`) while a remote (`tcp`/`http`/`https`) one
+  defaults to `10` — polling a socket proxy over the network is far costlier
+  than reading the local socket
 - **`tls_ca`** — a PEM CA certificate to trust for an `https` endpoint
 - **`tls_insecure`** — skip TLS verification for an `https` endpoint (handy for a
   self-signed reverse proxy; prefer `tls_ca` when you can)

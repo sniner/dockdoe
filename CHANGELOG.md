@@ -3,6 +3,15 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Per-host sample interval**: a `[[host]]` entry may set `interval_secs` to override the global
+  `--interval-secs` for that host alone. Hosts that don't set it keep the global interval when local
+  (`unix`), or default to a gentler 10 s when remote (`tcp`/`http`/`https`) — easing the load of
+  polling a socket proxy over the network
+
 ## [0.7.0] — 2026-06-21
 
 ### Breaking changes
