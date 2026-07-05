@@ -12,6 +12,22 @@ All notable, user-facing changes to DockDoe. The format is based on
   (`unix`), or default to a gentler 10 s when remote (`tcp`/`http`/`https`) — easing the load of
   polling a socket proxy over the network
 
+### Changed
+
+- **Stats collection is now capped at 8 concurrent requests** per sample cycle. Previously every
+  running container was queried at once, which meant a burst of 50+ parallel HTTP connections
+  against a remote socket proxy on every interval
+- **Header staleness hint scales to hours and days**: a collector stuck for days now reads
+  "3d ago" instead of "4320m ago"
+
+### Security
+
+- **Logout is now a POST** and requires a session: a cross-site `<img src=".../logout">` (or any
+  drive-by request) can no longer end your session. The header control looks unchanged; old
+  bookmarks to `GET /logout` just land on the login redirect
+- **Failed logins are delayed by 500 ms**, capping scripted credential guessing at ~2 attempts/s
+  per connection (the comparison itself was already constant-time)
+
 ### Fixed
 
 - **Slow history charts on long-retained databases**: the trend indexes couldn't narrow the chart
