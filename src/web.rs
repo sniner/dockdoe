@@ -171,7 +171,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(stack_action).layer(middleware::from_fn(require_htmx)),
         )
         .route("/login", get(login_page).post(login_submit))
-        .route("/logout", get(logout))
+        .route("/logout", axum::routing::post(logout))
         .route("/host/{host}/ws/container/{id}/exec", get(ws_exec))
         .route("/assets/{*path}", get(asset))
         // Auth wraps everything (it allowlists /login and /assets internally);
@@ -189,8 +189,12 @@ async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -
     let Some(auth) = state.auth.as_ref() else {
         return next.run(req).await; // authentication disabled
     };
+    // /logout deliberately requires a session: combined with SameSite=Lax
+    // (which withholds the cookie on cross-site POSTs), a page elsewhere
+    // can't log the user out — its POST arrives unauthenticated and bounces
+    // to /login without touching the victim's cookie.
     let path = req.uri().path();
-    if path == "/login" || path == "/logout" || path.starts_with("/assets/") {
+    if path == "/login" || path.starts_with("/assets/") {
         return next.run(req).await;
     }
     if request_is_authenticated(auth, req.headers()) {
@@ -570,6 +574,11 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
         }
         resp
     } else {
+        // Fixed delay on failure: the comparison itself is constant-time, but
+        // attempts were unlimited and instant. Half a second caps brute force
+        // at ~2 guesses/s per connection without any rate-limit state to keep;
+        // being async, it doesn't tie up a worker thread.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         (StatusCode::UNAUTHORIZED, login_shell(true)).into_response()
     }
 }
@@ -1279,12 +1288,14 @@ fn shell(
                     div.history-body {
                         div.history-head {
                             span.history-title id="history-title" {}
+                            // Rendered from HISTORY_RANGES so the buttons,
+                            // the server's accepted values and the deep-link
+                            // validation (history.js checks these buttons)
+                            // stay one list.
                             div.history-ranges id="history-ranges" {
-                                button type="button" data-range="1h" { "1h" }
-                                button type="button" data-range="6h" { "6h" }
-                                button type="button" data-range="24h" { "24h" }
-                                button type="button" data-range="7d" { "7d" }
-                                button type="button" data-range="30d" { "30d" }
+                                @for (name, _) in HISTORY_RANGES {
+                                    button type="button" data-range=(name) { (name) }
+                                }
                             }
                             // Shown by history.js while a drag-selected
                             // window is displayed.
@@ -1509,7 +1520,7 @@ fn stack_members_table(members: &[&ContainerMetrics], cpu_count: usize, r: &Rend
 fn container_detail_live(c: &ContainerMetrics, links: &PortLinks) -> Markup {
     html! {
         div.status-line {
-            span.badge.(state_class(c.state)) { (state_label(c.state)) }
+            span.badge.(state_name(c.state)) { (state_name(c.state)) }
             (health_marker(c.health))
             (port_pills(&c.ports, links))
         }
@@ -1665,7 +1676,19 @@ fn host_header_inner(
             span.generated { "updated " (fmt_age(d.generated_at_unix_ms)) }
         }
         @if auth_enabled {
-            a.logout href="/logout" title="Log out" { "Logout" }
+            (logout_button())
+        }
+    }
+}
+
+/// The header's logout control: a one-button POST form (styled as a link).
+/// A GET link would let any cross-site `<img src=".../logout">` end the
+/// session; a POST from elsewhere doesn't carry the SameSite=Lax cookie and
+/// is turned away by the auth middleware instead.
+fn logout_button() -> Markup {
+    html! {
+        form.logout-form method="post" action="/logout" {
+            button.logout type="submit" title="Log out" { "Logout" }
         }
     }
 }
@@ -1710,7 +1733,7 @@ fn host_index_page(hosts: &[String], auth_enabled: bool) -> Markup {
                     (brand())
                     span.spacer {}
                     @if auth_enabled {
-                        a.logout href="/logout" title="Log out" { "Logout" }
+                        (logout_button())
                     }
                 }
                 main {
@@ -1840,7 +1863,7 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize, r: &Render) -> Markup {
             td.name { a href=(format!("/host/{}/container/{}", r.host, c.id)) { (c.name) } }
             td.image { (short_image(&c.image)) }
             td {
-                span.badge.(state_class(c.state)) { (state_label(c.state)) }
+                span.badge.(state_name(c.state)) { (state_name(c.state)) }
                 (health_marker(c.health))
                 (port_chips(&c.ports, r.links))
             }
@@ -2029,21 +2052,9 @@ enum StackKey<'a> {
     Standalone,
 }
 
-fn state_class(state: ContainerState) -> &'static str {
-    match state {
-        ContainerState::Running => "running",
-        ContainerState::Exited => "exited",
-        ContainerState::Dead => "dead",
-        ContainerState::Paused => "paused",
-        ContainerState::Restarting => "restarting",
-        ContainerState::Stopping => "stopping",
-        ContainerState::Removing => "removing",
-        ContainerState::Created => "created",
-        ContainerState::Unknown => "unknown",
-    }
-}
-
-fn state_label(state: ContainerState) -> &'static str {
+/// A container state's name, used both as the badge's CSS class and as its
+/// visible label (they are the same word for every state).
+fn state_name(state: ContainerState) -> &'static str {
     match state {
         ContainerState::Running => "running",
         ContainerState::Exited => "exited",
@@ -2078,14 +2089,20 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-/// Render how long ago a Unix-ms timestamp was, relative to now.
+/// Render how long ago a Unix-ms timestamp was, relative to now. This backs
+/// the header's staleness hint, so the far end matters most: a collector that
+/// has been stuck for days must read as "3d ago", not "4320m ago".
 fn fmt_age(unix_ms: u64) -> String {
-    let secs = now_unix_ms().saturating_sub(unix_ms) / 1000;
+    fmt_age_secs(now_unix_ms().saturating_sub(unix_ms) / 1000)
+}
+
+fn fmt_age_secs(secs: u64) -> String {
     match secs {
         0 => "just now".to_string(),
-        1 => "1s ago".to_string(),
         s if s < 60 => format!("{s}s ago"),
-        s => format!("{}m ago", s / 60),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -2242,6 +2259,19 @@ mod tests {
         assert_eq!(group_for_window(30 * 86_400_000), 1_800_000);
         // Degenerate windows never yield a zero group.
         assert_eq!(group_for_window(0), 60_000);
+    }
+
+    #[test]
+    fn fmt_age_scales_units_up_to_days() {
+        assert_eq!(fmt_age_secs(0), "just now");
+        assert_eq!(fmt_age_secs(1), "1s ago");
+        assert_eq!(fmt_age_secs(59), "59s ago");
+        assert_eq!(fmt_age_secs(60), "1m ago");
+        assert_eq!(fmt_age_secs(3_599), "59m ago");
+        // The header hint for a long-stuck collector must not read "4320m ago".
+        assert_eq!(fmt_age_secs(3_600), "1h ago");
+        assert_eq!(fmt_age_secs(86_399), "23h ago");
+        assert_eq!(fmt_age_secs(3 * 86_400), "3d ago");
     }
 
     #[test]

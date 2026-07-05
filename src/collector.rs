@@ -160,8 +160,11 @@ async fn persist(
         store.insert_samples(&host, ts_ms, &dashboard.containers)?;
         store.insert_container_trends(&flushed.containers)?;
         if let Some((raw_cutoff_ms, trend_cutoff_ms)) = prune_cutoffs {
-            store.prune_raw(raw_cutoff_ms)?;
-            store.prune_trends(trend_cutoff_ms)?;
+            let removed_raw = store.prune_raw(raw_cutoff_ms)?;
+            let removed_trends = store.prune_trends(trend_cutoff_ms)?;
+            // Row counts make retention behaviour diagnosable from the log —
+            // "is pruning running, and how much does it chew per pass?"
+            debug!(%host, removed_raw, removed_trends, "pruned aged-out data");
         }
         Ok(())
     })

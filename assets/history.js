@@ -343,9 +343,14 @@
 
   // Deep link: #history-cpu / #history-mem-7d opens the overlay on load, so a
   // view can be bookmarked or shared (and exercised by headless UI checks).
-  var hash = /^#history-(cpu|mem|net|disk)(?:-(1h|6h|24h|7d|30d))?$/.exec(location.hash);
+  // The range part is validated against the server-rendered range buttons
+  // rather than a second hardcoded list, so a new range is one server-side
+  // change; an unknown range falls back to the default.
+  var hash = /^#history-(cpu|mem|net|disk)(?:-([a-z0-9]+))?$/.exec(location.hash);
   if (hash) {
+    var known = hash[2] &&
+      rangesEl.querySelector('button[data-range="' + hash[2] + '"]');
     openFor(hash[1]);
-    show({ range: hash[2] || lastRange });
+    show({ range: known ? hash[2] : lastRange });
   }
 })();

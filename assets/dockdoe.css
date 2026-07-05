@@ -69,11 +69,20 @@ header.host .brand-name span { color: var(--accent); }
 
 .spacer { flex: 1; }
 .generated { color: var(--muted); font-size: 0.75rem; }
-/* Logout link in the header (only shown when authentication is enabled). */
+/* Logout control in the header (only shown when authentication is enabled).
+   It's a one-button POST form (GET logout was drive-by-triggerable); the
+   wrapper dissolves into the header's flex row and the button is restyled
+   to look like the link it replaced. */
+.logout-form { display: contents; }
 header.host .logout {
   color: var(--muted);
   font-size: 0.75rem;
   margin-left: 1rem;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
+  cursor: pointer;
 }
 header.host .logout:hover { color: var(--accent); }
 
