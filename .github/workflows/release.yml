@@ -6,10 +6,25 @@ on:
       - "v*.*.*"
 
 jobs:
+  # Fail fast on the classic "tagged but forgot to bump": the tag (minus its
+  # `v`) must equal the version in Cargo.toml.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Compare tag against Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^[[:space:]]*version[[:space:]]*=/{gsub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/,"");gsub(/".*$/,"");print;exit}' Cargo.toml)
+          [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag != Cargo.toml $pkg"; exit 1; }
+
   # Cross-compile a static musl binary per architecture on the (amd64) runner —
   # fast and native, no QEMU. Each build uploads its binary (for the image) and a
   # tarball (for the GitHub release).
   binaries:
+    needs: verify-version
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -71,11 +86,24 @@ jobs:
           cp artifacts/dist-amd64/*.tar.gz dist/
           cp artifacts/dist-arm64/*.tar.gz dist/
 
+      # Release notes are the version's CHANGELOG.md section — the changelog is
+      # the single curated source; auto-generated notes on a PR-less repo were
+      # just a flat commit list.
+      - name: Extract release notes from CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+              $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+              grab && /^## \[/          { exit }
+              grab                      { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > release-notes.md
+          [ -s release-notes.md ] || { echo "::error::No CHANGELOG section for [$version]"; exit 1; }
+
       - name: Publish release with binaries
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*.tar.gz
-          generate_release_notes: true
+          body_path: release-notes.md
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
