@@ -237,6 +237,13 @@ reported — a container that restarts and recovers within that window stays
 quiet. The state seen at startup is adopted as the baseline, so DockDoe doesn't
 fire a burst when it boots.
 
+One known gap: state is tracked per container *id*, and the first sighting of
+an id is adopted silently (that's what keeps startups and deployments quiet).
+A container that is *recreated* — `docker compose up` after a `down`, or an
+image update — comes back as a new id, so if the new instance is down from the
+start, no alert fires: to DockDoe it is a first sighting, not a change. A
+container that merely restarts (same id) is covered.
+
 ## Data model
 
 Two layers, mirroring a Zabbix-style approach:
