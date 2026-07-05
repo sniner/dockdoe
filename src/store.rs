@@ -202,6 +202,22 @@ impl Store {
         ] {
             add_column_if_missing(&conn, table, col, decl)?;
         }
+        // Replacing the trend indexes on a database with weeks of trend data
+        // takes a few seconds (and blocks startup, since we open before bind) —
+        // say so instead of appearing hung.
+        let old_index_present: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                WHERE type = 'index' AND name = 'container_trend_host_id')",
+                [],
+                |r| r.get(0),
+            )
+            .context("checking for legacy trend index")?;
+        if old_index_present {
+            tracing::info!(
+                "migrating trend indexes (one-time, may take a while on large databases)"
+            );
+        }
         conn.execute_batch(CREATE_INDEXES)
             .context("creating indexes")?;
         Ok(Self {
@@ -384,19 +400,7 @@ impl Store {
     ) -> Result<Vec<MetricPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT bucket_start_ms,
-                        SUM(CASE WHEN metric = 'cpu' THEN median ELSE 0 END) AS cpu,
-                        SUM(CASE WHEN metric = 'mem' THEN median ELSE 0 END) AS mem,
-                        SUM(CASE WHEN metric = 'net_rx' THEN median END) AS net_rx,
-                        SUM(CASE WHEN metric = 'net_tx' THEN median END) AS net_tx,
-                        SUM(CASE WHEN metric = 'disk_read' THEN median END) AS disk_read,
-                        SUM(CASE WHEN metric = 'disk_write' THEN median END) AS disk_write
-                 FROM container_trend
-                 WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3
-                 GROUP BY bucket_start_ms
-                 ORDER BY bucket_start_ms ASC",
-            )
+            .prepare_cached(RECENT_STACK_TRENDS_SQL)
             .context("prepare recent stack trend query")?;
         let rows = stmt
             .query_map(
@@ -414,28 +418,29 @@ impl Store {
     /// window the envelope keeps the extremes (MIN of minima, MAX of maxima)
     /// while the line averages the bucket medians — an approximation of the true
     /// median that is fine for display.
+    ///
+    /// Keyed by container *name*, not id: a recreated container (`docker
+    /// compose up` after `down`, image update) gets a new id but keeps its
+    /// name, and history should span recreations — that is why trends store
+    /// the name at all. Names are unique per host among running containers
+    /// (Docker enforces it), so merging by name is the logical-service view.
     pub fn history_container(
         &self,
         host: &str,
-        id: &str,
+        name: &str,
         since_ms: u64,
         until_ms: u64,
         group_ms: u64,
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(&format!(
-                "SELECT (bucket_start_ms / ?5) * ?5 AS bucket, {HISTORY_ENVELOPE}
-                 FROM container_trend
-                 WHERE host = ?1 AND id = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
-                 GROUP BY bucket ORDER BY bucket ASC"
-            ))
+            .prepare_cached(&history_container_sql())
             .context("prepare container history query")?;
         let rows = stmt
             .query_map(
                 rusqlite::params![
                     host,
-                    id,
+                    name,
                     to_db(since_ms),
                     to_db(until_ms),
                     to_db(group_ms.max(1))
@@ -461,17 +466,7 @@ impl Store {
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(&format!(
-                "WITH per_bucket AS (
-                     SELECT bucket_start_ms AS b, {STACK_SUM_PER_BUCKET}
-                     FROM container_trend
-                     WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
-                     GROUP BY b
-                 )
-                 SELECT (b / ?5) * ?5 AS bucket, {STACK_OUTER_ENVELOPE}
-                 FROM per_bucket
-                 GROUP BY bucket ORDER BY bucket ASC"
-            ))
+            .prepare_cached(&history_stack_sql())
             .context("prepare stack history query")?;
         let rows = stmt
             .query_map(
@@ -488,6 +483,25 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("collect stack history")?;
         Ok(rows)
+    }
+
+    /// The container name recorded in the trend table for `id`, if any. Used by
+    /// the history endpoint to resolve its URL's container id into the name the
+    /// trends are queried by when the container is no longer in the live
+    /// snapshot. No index leads with `(host, id)` anymore, so this scans within
+    /// the host — acceptable for a rare fallback with `LIMIT 1`.
+    pub fn container_name(&self, host: &str, id: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.lock();
+        let name = conn
+            .query_row(
+                "SELECT name FROM container_trend WHERE host = ?1 AND id = ?2 LIMIT 1",
+                rusqlite::params![host, id],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("resolving container name from trends")?;
+        Ok(name)
     }
 
     /// Count rows in a table — test/diagnostic helper.
@@ -615,6 +629,46 @@ const STACK_SUM_PER_BUCKET: &str = "\
     SUM(CASE WHEN metric='disk_read' THEN min END) AS disk_read_min, SUM(CASE WHEN metric='disk_read' THEN median END) AS disk_read_med, SUM(CASE WHEN metric='disk_read' THEN max END) AS disk_read_max,
     SUM(CASE WHEN metric='disk_write' THEN min END) AS disk_write_min, SUM(CASE WHEN metric='disk_write' THEN median END) AS disk_write_med, SUM(CASE WHEN metric='disk_write' THEN max END) AS disk_write_max";
 
+/// SQL of [`Store::recent_stack_trends`] — a named item (rather than inline in
+/// the method) so the query-plan guard test checks the exact query that runs.
+const RECENT_STACK_TRENDS_SQL: &str = "\
+    SELECT bucket_start_ms,
+           SUM(CASE WHEN metric = 'cpu' THEN median ELSE 0 END) AS cpu,
+           SUM(CASE WHEN metric = 'mem' THEN median ELSE 0 END) AS mem,
+           SUM(CASE WHEN metric = 'net_rx' THEN median END) AS net_rx,
+           SUM(CASE WHEN metric = 'net_tx' THEN median END) AS net_tx,
+           SUM(CASE WHEN metric = 'disk_read' THEN median END) AS disk_read,
+           SUM(CASE WHEN metric = 'disk_write' THEN median END) AS disk_write
+    FROM container_trend
+    WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3
+    GROUP BY bucket_start_ms
+    ORDER BY bucket_start_ms ASC";
+
+/// SQL of [`Store::history_container`] — see [`RECENT_STACK_TRENDS_SQL`].
+fn history_container_sql() -> String {
+    format!(
+        "SELECT (bucket_start_ms / ?5) * ?5 AS bucket, {HISTORY_ENVELOPE}
+         FROM container_trend
+         WHERE host = ?1 AND name = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
+         GROUP BY bucket ORDER BY bucket ASC"
+    )
+}
+
+/// SQL of [`Store::history_stack`] — see [`RECENT_STACK_TRENDS_SQL`].
+fn history_stack_sql() -> String {
+    format!(
+        "WITH per_bucket AS (
+             SELECT bucket_start_ms AS b, {STACK_SUM_PER_BUCKET}
+             FROM container_trend
+             WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
+             GROUP BY b
+         )
+         SELECT (b / ?5) * ?5 AS bucket, {STACK_OUTER_ENVELOPE}
+         FROM per_bucket
+         GROUP BY bucket ORDER BY bucket ASC"
+    )
+}
+
 /// The outer envelope over the summed per-bucket columns above, in the column
 /// order [`history_row_to_point`] expects.
 const STACK_OUTER_ENVELOPE: &str = "\
@@ -666,17 +720,25 @@ CREATE TABLE IF NOT EXISTS meta (
 
 /// Indexes, created after the column backfill so the host-leading ones resolve.
 ///
-/// The `host_id_ts` / `host_id` / `host_name` indexes back the per-container and
-/// per-stack history reads. The two `*_retention` indexes lead with the column
-/// the retention prunes filter on (`ts_ms` / `bucket_start_ms`) so those DELETEs
-/// can seek to the cutoff instead of scanning the whole table — without them a
-/// prune scans every row (millions, on a long-retained trend table) every time.
+/// The trend history reads filter on `host` plus `name`/`stack` and a
+/// `bucket_start_ms` range, so the time column must come directly after the
+/// equality columns — with anything else (like `metric`) in between, SQLite
+/// cannot seek the time range and scans every trend row of the container (or,
+/// for stacks, the whole host) on every chart request. The two `*_retention`
+/// indexes lead with the column the retention prunes filter on (`ts_ms` /
+/// `bucket_start_ms`) so those DELETEs can seek to the cutoff instead of
+/// scanning the whole table.
+///
+/// The DROPs migrate databases from builds whose trend indexes had `metric`
+/// before the time column (and were therefore useless for the range).
 const CREATE_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS container_sample_host_id_ts ON container_sample(host, id, ts_ms);
-CREATE INDEX IF NOT EXISTS container_trend_host_id ON container_trend(host, id, metric, bucket_start_ms);
-CREATE INDEX IF NOT EXISTS container_trend_host_name ON container_trend(host, name, metric, bucket_start_ms);
+CREATE INDEX IF NOT EXISTS container_trend_host_name_ts ON container_trend(host, name, bucket_start_ms);
+CREATE INDEX IF NOT EXISTS container_trend_host_stack_ts ON container_trend(host, stack, bucket_start_ms) WHERE stack IS NOT NULL;
 CREATE INDEX IF NOT EXISTS container_sample_retention ON container_sample(ts_ms);
 CREATE INDEX IF NOT EXISTS container_trend_retention ON container_trend(bucket_start_ms);
+DROP INDEX IF EXISTS container_trend_host_id;
+DROP INDEX IF EXISTS container_trend_host_name;
 ";
 
 #[cfg(test)]
@@ -801,6 +863,99 @@ mod tests {
             trend.contains("container_trend_retention") && !trend.contains("SCAN"),
             "trend prune should seek by index, got: {trend}"
         );
+    }
+
+    #[test]
+    fn trend_history_reads_seek_time_range_by_index() {
+        // The chart queries filter on host + name/stack + a bucket_start_ms
+        // range. With the old indexes (`metric` between the equality columns
+        // and the time column) SQLite could not seek the range and scanned the
+        // container's — for stacks, the host's — full trend retention on every
+        // chart request; that was the reported "history is slow" bug. Guard the
+        // plans of the exact production SQL so the regression can't sneak back.
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.lock();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare explain");
+            // The plan doesn't depend on the bound values, but rusqlite insists
+            // every placeholder is bound — dummies suffice.
+            let dummies = vec![rusqlite::types::Value::Integer(1); stmt.parameter_count()];
+            stmt.query_map(rusqlite::params_from_iter(dummies), |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("query plan")
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+            .join("; ")
+        };
+
+        for (what, sql, index) in [
+            (
+                "container history",
+                history_container_sql(),
+                "container_trend_host_name_ts",
+            ),
+            (
+                "stack history",
+                history_stack_sql(),
+                "container_trend_host_stack_ts",
+            ),
+            (
+                "stack seed",
+                RECENT_STACK_TRENDS_SQL.to_string(),
+                "container_trend_host_stack_ts",
+            ),
+        ] {
+            let p = plan(&sql);
+            assert!(
+                p.contains(index) && p.contains("bucket_start_ms>"),
+                "{what} should range-seek bucket_start_ms via {index}, got: {p}"
+            );
+            assert!(
+                !p.contains("SCAN container_trend"),
+                "{what} should not scan the trend table, got: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_survives_container_recreation() {
+        // `docker compose up` after `down` (or an image update) recreates a
+        // container: new id, same name. History is keyed by name exactly so the
+        // logical service keeps its past across such recreations — before this,
+        // every recreation silently cut the visible history short.
+        let store = Store::open_in_memory().unwrap();
+        let ct = |bucket: u64, id: &str| ContainerTrend {
+            bucket_start_ms: bucket,
+            bucket_secs: 60,
+            host: HOST.into(),
+            id: id.to_string(),
+            name: "web-1".to_string(),
+            stack: None,
+            metric: Metric::Cpu.as_str(),
+            min: 1.0,
+            max: 3.0,
+            median: 2.0,
+            samples: 20,
+        };
+        store
+            .insert_container_trends(&[ct(0, "old-id"), ct(60_000, "new-id")])
+            .unwrap();
+
+        let h = store
+            .history_container(HOST, "web-1", 0, u64::MAX, 60_000)
+            .unwrap();
+        assert_eq!(h.len(), 2, "history must span both incarnations");
+
+        // The web handler resolves a no-longer-running container's id to its
+        // name through the trend table.
+        assert_eq!(
+            store.container_name(HOST, "old-id").unwrap().as_deref(),
+            Some("web-1")
+        );
+        assert_eq!(store.container_name(HOST, "gone").unwrap(), None);
     }
 
     #[test]
@@ -939,7 +1094,7 @@ mod tests {
             .unwrap();
 
         let h = store
-            .history_container(HOST, "a", 0, u64::MAX, 60_000)
+            .history_container(HOST, "c-a", 0, u64::MAX, 60_000)
             .unwrap();
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].net_rx_min, Some(100.0));

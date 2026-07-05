@@ -821,6 +821,18 @@ async fn history_container(
     let Some(w) = resolve_history(&q, state.seed_window) else {
         return INVALID_RANGE.into_response();
     };
+    // Trend history is keyed by container *name* so it spans recreations (see
+    // `Store::history_container`), but the URL carries the id. Resolve it via
+    // the live snapshot; for a container that is no longer running, fall back
+    // to the name its trends were recorded under.
+    let snapshot_name = state.hosts.get(&host).and_then(|rt| {
+        current_snapshot(rt).and_then(|d| {
+            d.containers
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+        })
+    });
     let store = state.store.clone();
     let points = if w.raw {
         fetch_points(move || {
@@ -829,8 +841,15 @@ async fn history_container(
         })
         .await
     } else {
-        fetch_points(move || store.history_container(&host, &id, w.since, w.until, w.group_ms))
-            .await
+        fetch_points(move || {
+            let Some(name) =
+                snapshot_name.map_or_else(|| store.container_name(&host, &id), |n| Ok(Some(n)))?
+            else {
+                return Ok(Vec::new());
+            };
+            store.history_container(&host, &name, w.since, w.until, w.group_ms)
+        })
+        .await
     };
     Json(points).into_response()
 }
