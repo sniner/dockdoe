@@ -2078,14 +2078,20 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-/// Render how long ago a Unix-ms timestamp was, relative to now.
+/// Render how long ago a Unix-ms timestamp was, relative to now. This backs
+/// the header's staleness hint, so the far end matters most: a collector that
+/// has been stuck for days must read as "3d ago", not "4320m ago".
 fn fmt_age(unix_ms: u64) -> String {
-    let secs = now_unix_ms().saturating_sub(unix_ms) / 1000;
+    fmt_age_secs(now_unix_ms().saturating_sub(unix_ms) / 1000)
+}
+
+fn fmt_age_secs(secs: u64) -> String {
     match secs {
         0 => "just now".to_string(),
-        1 => "1s ago".to_string(),
         s if s < 60 => format!("{s}s ago"),
-        s => format!("{}m ago", s / 60),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -2242,6 +2248,19 @@ mod tests {
         assert_eq!(group_for_window(30 * 86_400_000), 1_800_000);
         // Degenerate windows never yield a zero group.
         assert_eq!(group_for_window(0), 60_000);
+    }
+
+    #[test]
+    fn fmt_age_scales_units_up_to_days() {
+        assert_eq!(fmt_age_secs(0), "just now");
+        assert_eq!(fmt_age_secs(1), "1s ago");
+        assert_eq!(fmt_age_secs(59), "59s ago");
+        assert_eq!(fmt_age_secs(60), "1m ago");
+        assert_eq!(fmt_age_secs(3_599), "59m ago");
+        // The header hint for a long-stuck collector must not read "4320m ago".
+        assert_eq!(fmt_age_secs(3_600), "1h ago");
+        assert_eq!(fmt_age_secs(86_399), "23h ago");
+        assert_eq!(fmt_age_secs(3 * 86_400), "3d ago");
     }
 
     #[test]
