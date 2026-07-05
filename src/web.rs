@@ -171,7 +171,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(stack_action).layer(middleware::from_fn(require_htmx)),
         )
         .route("/login", get(login_page).post(login_submit))
-        .route("/logout", get(logout))
+        .route("/logout", axum::routing::post(logout))
         .route("/host/{host}/ws/container/{id}/exec", get(ws_exec))
         .route("/assets/{*path}", get(asset))
         // Auth wraps everything (it allowlists /login and /assets internally);
@@ -189,8 +189,12 @@ async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -
     let Some(auth) = state.auth.as_ref() else {
         return next.run(req).await; // authentication disabled
     };
+    // /logout deliberately requires a session: combined with SameSite=Lax
+    // (which withholds the cookie on cross-site POSTs), a page elsewhere
+    // can't log the user out — its POST arrives unauthenticated and bounces
+    // to /login without touching the victim's cookie.
     let path = req.uri().path();
-    if path == "/login" || path == "/logout" || path.starts_with("/assets/") {
+    if path == "/login" || path.starts_with("/assets/") {
         return next.run(req).await;
     }
     if request_is_authenticated(auth, req.headers()) {
@@ -1670,7 +1674,19 @@ fn host_header_inner(
             span.generated { "updated " (fmt_age(d.generated_at_unix_ms)) }
         }
         @if auth_enabled {
-            a.logout href="/logout" title="Log out" { "Logout" }
+            (logout_button())
+        }
+    }
+}
+
+/// The header's logout control: a one-button POST form (styled as a link).
+/// A GET link would let any cross-site `<img src=".../logout">` end the
+/// session; a POST from elsewhere doesn't carry the SameSite=Lax cookie and
+/// is turned away by the auth middleware instead.
+fn logout_button() -> Markup {
+    html! {
+        form.logout-form method="post" action="/logout" {
+            button.logout type="submit" title="Log out" { "Logout" }
         }
     }
 }
@@ -1715,7 +1731,7 @@ fn host_index_page(hosts: &[String], auth_enabled: bool) -> Markup {
                     (brand())
                     span.spacer {}
                     @if auth_enabled {
-                        a.logout href="/logout" title="Log out" { "Logout" }
+                        (logout_button())
                     }
                 }
                 main {
