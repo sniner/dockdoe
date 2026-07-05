@@ -26,7 +26,6 @@ use bollard::query_parameters::{
     StatsOptionsBuilder,
 };
 use bollard::{API_DEFAULT_VERSION, BollardRequest, Docker};
-use futures_util::future::join_all;
 use futures_util::{Stream, StreamExt};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
@@ -630,6 +629,8 @@ impl DockerClient {
     /// Stats are only fetched for running containers; stopped ones report
     /// identity and state but no CPU/memory.
     pub async fn collect(&mut self) -> Result<Vec<ContainerMetrics>> {
+        // Cap on concurrent stats requests per cycle, see below.
+        const STATS_IN_FLIGHT: usize = 8;
         let options = ListContainersOptionsBuilder::new().all(true).build();
         let summaries = self
             .docker
@@ -637,25 +638,41 @@ impl DockerClient {
             .await
             .context("listing containers")?;
 
-        // Fetch stats for all running containers concurrently. Reborrow as a
+        // Fetch stats for all running containers concurrently, but bounded:
+        // unbounded join_all fired one HTTP request per container at once,
+        // which against a remote socket proxy with dozens of containers meant
+        // a burst of that many parallel connections every sample interval.
+        // Eight in flight keeps a cycle fast without the burst. Reborrow as a
         // shared reference so the per-container futures can each hold it.
         let this: &DockerClient = self;
-        let stat_futures = summaries.iter().filter(|s| is_running(s)).map(|s| {
-            let id = s.id.clone().unwrap_or_default();
-            async move { (id.clone(), this.fetch_stats(&id).await) }
-        });
-        let stats: HashMap<String, ContainerStatsResponse> = join_all(stat_futures)
-            .await
-            .into_iter()
-            .filter_map(|(id, res)| match res {
-                Ok(Some(stats)) => Some((id, stats)),
-                Ok(None) => None,
-                Err(err) => {
-                    debug!(%id, %err, "fetching container stats failed");
-                    None
-                }
-            })
+        // Owned id list rather than an iterator borrowing `summaries`: a
+        // borrowed iterator inside the buffered stream trips rustc's
+        // "implementation is not general enough" false positive once the
+        // enclosing future is tokio::spawn'd.
+        let running_ids: Vec<String> = summaries
+            .iter()
+            .filter(|s| is_running(s))
+            .map(|s| s.id.clone().unwrap_or_default())
             .collect();
+        let stat_futures = running_ids.into_iter().map(|id| async move {
+            let res = this.fetch_stats(&id).await;
+            (id, res)
+        });
+        let stats: HashMap<String, ContainerStatsResponse> =
+            futures_util::stream::iter(stat_futures)
+                .buffer_unordered(STATS_IN_FLIGHT)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .filter_map(|(id, res)| match res {
+                    Ok(Some(stats)) => Some((id, stats)),
+                    Ok(None) => None,
+                    Err(err) => {
+                        debug!(%id, %err, "fetching container stats failed");
+                        None
+                    }
+                })
+                .collect();
 
         // Reap prev-sample entries for containers that no longer exist so the
         // maps don't grow unbounded.
