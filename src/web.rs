@@ -1288,12 +1288,14 @@ fn shell(
                     div.history-body {
                         div.history-head {
                             span.history-title id="history-title" {}
+                            // Rendered from HISTORY_RANGES so the buttons,
+                            // the server's accepted values and the deep-link
+                            // validation (history.js checks these buttons)
+                            // stay one list.
                             div.history-ranges id="history-ranges" {
-                                button type="button" data-range="1h" { "1h" }
-                                button type="button" data-range="6h" { "6h" }
-                                button type="button" data-range="24h" { "24h" }
-                                button type="button" data-range="7d" { "7d" }
-                                button type="button" data-range="30d" { "30d" }
+                                @for (name, _) in HISTORY_RANGES {
+                                    button type="button" data-range=(name) { (name) }
+                                }
                             }
                             // Shown by history.js while a drag-selected
                             // window is displayed.
