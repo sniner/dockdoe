@@ -115,39 +115,6 @@ pub struct HistoryPoint {
     pub disk_write_max: Option<f64>,
 }
 
-impl HistoryPoint {
-    /// Lift a raw sample into the history shape: a single value is its own
-    /// minimum, median and maximum. Used for ranges inside the raw retention,
-    /// where we have full-resolution data instead of trend buckets.
-    pub fn from_raw(p: &MetricPoint) -> Self {
-        #[allow(clippy::cast_precision_loss)] // chart data; precision is moot
-        let mem = p.mem_used.map(|m| m as f64);
-        // A raw point's single value is its own min/med/max, so each envelope
-        // collapses to the point's value (`None` stays an empty envelope).
-        Self {
-            ts_ms: p.ts_ms,
-            cpu_min: Some(p.cpu_percent),
-            cpu_med: Some(p.cpu_percent),
-            cpu_max: Some(p.cpu_percent),
-            mem_min: mem,
-            mem_med: mem,
-            mem_max: mem,
-            net_rx_min: p.net_rx,
-            net_rx_med: p.net_rx,
-            net_rx_max: p.net_rx,
-            net_tx_min: p.net_tx,
-            net_tx_med: p.net_tx,
-            net_tx_max: p.net_tx,
-            disk_read_min: p.disk_read,
-            disk_read_med: p.disk_read,
-            disk_read_max: p.disk_read,
-            disk_write_min: p.disk_write,
-            disk_write_med: p.disk_write,
-            disk_write_max: p.disk_write,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -384,6 +351,44 @@ impl Store {
             .context("query recent container samples")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("collect recent container samples")?;
+        Ok(rows)
+    }
+
+    /// History between `since_ms` and `until_ms` (inclusive) served from *raw*
+    /// samples, downsampled into `group_ms` windows, oldest first. Used for
+    /// windows inside the raw retention, where full-resolution data exists. A
+    /// group smaller than the sample interval keeps every sample as its own
+    /// point (envelope collapsed to the value), so short windows stay exact;
+    /// larger groups cap the point count — without the cap, a raised
+    /// `raw_retention_secs` could turn one request into hundreds of thousands
+    /// of JSON points. Raw samples are id-keyed (unlike trend history): the raw
+    /// retention is too short for recreation continuity to matter.
+    pub fn history_container_raw(
+        &self,
+        host: &str,
+        id: &str,
+        since_ms: u64,
+        until_ms: u64,
+        group_ms: u64,
+    ) -> Result<Vec<HistoryPoint>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare_cached(RAW_HISTORY_SQL)
+            .context("prepare raw history query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    host,
+                    id,
+                    to_db(since_ms),
+                    to_db(until_ms),
+                    to_db(group_ms.max(1))
+                ],
+                history_row_to_point,
+            )
+            .context("query raw history")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect raw history")?;
         Ok(rows)
     }
 
@@ -644,6 +649,24 @@ const RECENT_STACK_TRENDS_SQL: &str = "\
     GROUP BY bucket_start_ms
     ORDER BY bucket_start_ms ASC";
 
+/// SQL of [`Store::history_container_raw`] — see [`RECENT_STACK_TRENDS_SQL`].
+/// One raw sample row carries all metrics as columns (unlike the long-format
+/// trend table), so the envelope is plain MIN/AVG/MAX per column, in the order
+/// [`history_row_to_point`] expects. The aggregates ignore NULLs and return
+/// NULL for a group with no values, matching the trend queries.
+const RAW_HISTORY_SQL: &str = "\
+    SELECT (ts_ms / ?5) * ?5 AS bucket,
+           MIN(cpu_percent), AVG(cpu_percent), MAX(cpu_percent),
+           MIN(mem_used), AVG(mem_used), MAX(mem_used),
+           MIN(net_rx), AVG(net_rx), MAX(net_rx),
+           MIN(net_tx), AVG(net_tx), MAX(net_tx),
+           MIN(disk_read), AVG(disk_read), MAX(disk_read),
+           MIN(disk_write), AVG(disk_write), MAX(disk_write)
+    FROM container_sample
+    WHERE host = ?1 AND id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4
+    GROUP BY bucket
+    ORDER BY bucket ASC";
+
 /// SQL of [`Store::history_container`] — see [`RECENT_STACK_TRENDS_SQL`].
 fn history_container_sql() -> String {
     format!(
@@ -891,31 +914,44 @@ mod tests {
             .join("; ")
         };
 
-        for (what, sql, index) in [
+        for (what, sql, index, time_col, table) in [
             (
                 "container history",
                 history_container_sql(),
                 "container_trend_host_name_ts",
+                "bucket_start_ms>",
+                "container_trend",
             ),
             (
                 "stack history",
                 history_stack_sql(),
                 "container_trend_host_stack_ts",
+                "bucket_start_ms>",
+                "container_trend",
             ),
             (
                 "stack seed",
                 RECENT_STACK_TRENDS_SQL.to_string(),
                 "container_trend_host_stack_ts",
+                "bucket_start_ms>",
+                "container_trend",
+            ),
+            (
+                "raw history",
+                RAW_HISTORY_SQL.to_string(),
+                "container_sample_host_id_ts",
+                "ts_ms>",
+                "container_sample",
             ),
         ] {
             let p = plan(&sql);
             assert!(
-                p.contains(index) && p.contains("bucket_start_ms>"),
-                "{what} should range-seek bucket_start_ms via {index}, got: {p}"
+                p.contains(index) && p.contains(time_col),
+                "{what} should range-seek {time_col} via {index}, got: {p}"
             );
             assert!(
-                !p.contains("SCAN container_trend"),
-                "{what} should not scan the trend table, got: {p}"
+                !p.contains(&format!("SCAN {table}")),
+                "{what} should not scan {table}, got: {p}"
             );
         }
     }
@@ -1163,6 +1199,38 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn raw_history_downsamples_and_respects_window() {
+        let store = Store::open_in_memory().unwrap();
+        let c = |cpu| [container_sample("a", Some(cpu))];
+        for (ts, cpu) in [(0, 10.0), (1_000, 30.0), (2_000, 20.0), (5_000, 40.0)] {
+            store.insert_samples(HOST, ts, &c(cpu)).unwrap();
+        }
+
+        // Group of 3s: samples 0/1000/2000 merge into one envelope point.
+        let h = store
+            .history_container_raw(HOST, "a", 0, u64::MAX, 3_000)
+            .unwrap();
+        assert_eq!(h.len(), 2, "4 samples in 3s groups must yield 2 points");
+        assert_eq!(h[0].cpu_min, Some(10.0));
+        assert_eq!(h[0].cpu_med, Some(20.0)); // avg(10, 30, 20)
+        assert_eq!(h[0].cpu_max, Some(30.0));
+
+        // A group below the sample spacing keeps full resolution: each sample
+        // its own point, envelope collapsed to the value.
+        let full = store
+            .history_container_raw(HOST, "a", 0, u64::MAX, 500)
+            .unwrap();
+        assert_eq!(full.len(), 4);
+        assert_eq!(full[3].cpu_min, full[3].cpu_max);
+
+        // `until` bounds the query itself (not post-filtering in Rust).
+        let bounded = store
+            .history_container_raw(HOST, "a", 1_000, 2_000, 500)
+            .unwrap();
+        assert_eq!(bounded.len(), 2);
     }
 
     #[test]

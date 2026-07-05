@@ -32,7 +32,7 @@ use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
 use crate::docker::{Action, DockerHandle, ExecSession, is_forbidden};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
-use crate::store::{HistoryPoint, MetricPoint, Store};
+use crate::store::{MetricPoint, Store};
 
 /// How often the live SSE streams poll the latest snapshot.
 const SNAPSHOT_POLL: Duration = Duration::from_secs(1);
@@ -806,6 +806,18 @@ fn group_for_window(window_ms: u64) -> u64 {
     (window_ms / TARGET_POINTS).div_ceil(60_000).max(1) * 60_000
 }
 
+/// Downsample group for the *raw* path: same point target, but not quantized
+/// to trend buckets. For windows short enough that the group stays below the
+/// sample interval this is a no-op (every sample its own group) — the raw
+/// path keeps its full resolution. For long windows it caps the response:
+/// `raw_retention_secs` is a documented knob, and without the cap raising it
+/// to days would let one request return hundreds of thousands of points,
+/// stalling the browser for minutes.
+fn raw_group_for_window(window_ms: u64) -> u64 {
+    const TARGET_POINTS: u64 = 1440;
+    (window_ms / TARGET_POINTS).max(1)
+}
+
 const INVALID_RANGE: (StatusCode, &str) = (
     StatusCode::BAD_REQUEST,
     "invalid range: pass ?range=1h|6h|24h|7d|30d or ?since_ms=&until_ms=",
@@ -835,11 +847,8 @@ async fn history_container(
     });
     let store = state.store.clone();
     let points = if w.raw {
-        fetch_points(move || {
-            let samples = store.recent_container_samples(&host, &id, w.since)?;
-            Ok(raw_history(&samples, w.until))
-        })
-        .await
+        let group = raw_group_for_window(w.until - w.since);
+        fetch_points(move || store.history_container_raw(&host, &id, w.since, w.until, group)).await
     } else {
         fetch_points(move || {
             let Some(name) =
@@ -869,16 +878,6 @@ async fn history_stack(
         fetch_points(move || store.history_stack(&host, &name, w.since, w.until, w.group_ms)).await,
     )
     .into_response()
-}
-
-/// Lift raw samples into the history shape, dropping anything past the
-/// window's upper bound (the raw queries only filter on `since`).
-fn raw_history(samples: &[MetricPoint], until_ms: u64) -> Vec<HistoryPoint> {
-    samples
-        .iter()
-        .filter(|p| p.ts_ms <= until_ms)
-        .map(HistoryPoint::from_raw)
-        .collect()
 }
 
 /// Render the dashboard from the latest snapshot. The dashboard has no charts
@@ -2243,6 +2242,25 @@ mod tests {
         assert_eq!(group_for_window(30 * 86_400_000), 1_800_000);
         // Degenerate windows never yield a zero group.
         assert_eq!(group_for_window(0), 60_000);
+    }
+
+    #[test]
+    fn raw_group_caps_points_but_keeps_short_windows_exact() {
+        // The raw path serves full-resolution samples; the group must cap what
+        // a window can return even when `raw_retention_secs` is raised to days
+        // (a 7d window at a 3s interval would otherwise be ~200k JSON points).
+        for window_ms in [3_600_000, 86_400_000, 7 * 86_400_000] {
+            let points = window_ms / raw_group_for_window(window_ms);
+            assert!(
+                points <= 1_441,
+                "{window_ms}ms window may yield {points} raw points"
+            );
+        }
+        // A short drill-down window's group stays below any realistic sample
+        // interval, so its samples pass through at full resolution.
+        assert!(raw_group_for_window(600_000) < 1_000);
+        // Degenerate windows never yield a zero group.
+        assert_eq!(raw_group_for_window(0), 1);
     }
 
     #[test]

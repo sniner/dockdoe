@@ -24,6 +24,12 @@ All notable, user-facing changes to DockDoe. The format is based on
   `docker compose up` after a `down` (or an image update) silently cut the visible history short —
   7d and 30d then showed the same truncated span. History is now keyed by container name, spanning
   recreations; older data recorded before the fix becomes visible again
+- **History responses are now capped at ~1440 points**: windows inside the raw retention used to
+  return every sample at full resolution, so raising `raw_retention_secs` to hours or days could
+  make a single chart request produce hundreds of thousands of JSON points and stall the browser.
+  Long windows are now downsampled server-side; short windows (drill-downs) keep full resolution.
+  Switching ranges or closing the overlay also aborts the previous request instead of letting
+  stale fetches pile up
 
 ## [0.7.0] — 2026-06-21
 
