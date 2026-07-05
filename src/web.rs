@@ -570,6 +570,11 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
         }
         resp
     } else {
+        // Fixed delay on failure: the comparison itself is constant-time, but
+        // attempts were unlimited and instant. Half a second caps brute force
+        // at ~2 guesses/s per connection without any rate-limit state to keep;
+        // being async, it doesn't tie up a worker thread.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         (StatusCode::UNAUTHORIZED, login_shell(true)).into_response()
     }
 }
