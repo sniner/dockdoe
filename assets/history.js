@@ -90,6 +90,7 @@
   var backStack = []; // drill-down trail, popped by double-click
   var chart = null;
   var loadSeq = 0; // ignore out-of-order fetch responses after rapid clicks
+  var loadAbort = null; // in-flight fetch, cancelled when superseded or closed
 
   // Within a day the clock alone is enough; longer windows - and windows that
   // lie further in the past - need the day to be intelligible.
@@ -249,7 +250,13 @@
       ? "?range=" + v.range
       : "?since_ms=" + v.sinceMs + "&until_ms=" + v.untilMs;
     var seq = ++loadSeq;
-    fetch(historyUrl + query)
+    // Abort the superseded fetch instead of letting it run to completion:
+    // rapid range clicks would otherwise stack requests, each occupying a
+    // browser connection (loadSeq only discards their late responses). The
+    // aborted fetch rejects into the catch below, where its stale seq drops it.
+    if (loadAbort) loadAbort.abort();
+    loadAbort = new AbortController();
+    fetch(historyUrl + query, { signal: loadAbort.signal })
       .then(function (resp) {
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         return resp.json();
@@ -320,6 +327,12 @@
   // itself (the padded content area is covered by .history-body).
   dlg.addEventListener("click", function (e) {
     if (e.target === dlg) dlg.close();
+  });
+  // Covers every way the dialog closes (button, backdrop, Escape): a fetch
+  // for a view nobody is looking at shouldn't keep a connection busy.
+  dlg.addEventListener("close", function () {
+    loadSeq++;
+    if (loadAbort) { loadAbort.abort(); loadAbort = null; }
   });
 
   window.addEventListener("resize", function () {
