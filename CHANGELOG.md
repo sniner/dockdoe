@@ -12,6 +12,25 @@ All notable, user-facing changes to DockDoe. The format is based on
   (`unix`), or default to a gentler 10 s when remote (`tcp`/`http`/`https`) — easing the load of
   polling a socket proxy over the network
 
+### Fixed
+
+- **Slow history charts on long-retained databases**: the trend indexes couldn't narrow the chart
+  queries to the requested time range, so every 24h/7d/30d request scanned the container's full
+  trend retention — and stack charts scanned *all* trend rows of the host on every load (about
+  1.5 s per request on a 30-day database, stacking up further with each click). The indexes are
+  rebuilt on first start after the update (a one-time pause of a few seconds, logged), after which
+  all history queries only touch the requested window
+- **Container history ended at the last recreation**: history was looked up by container *id*, so
+  `docker compose up` after a `down` (or an image update) silently cut the visible history short —
+  7d and 30d then showed the same truncated span. History is now keyed by container name, spanning
+  recreations; older data recorded before the fix becomes visible again
+- **History responses are now capped at ~1440 points**: windows inside the raw retention used to
+  return every sample at full resolution, so raising `raw_retention_secs` to hours or days could
+  make a single chart request produce hundreds of thousands of JSON points and stall the browser.
+  Long windows are now downsampled server-side; short windows (drill-downs) keep full resolution.
+  Switching ranges or closing the overlay also aborts the previous request instead of letting
+  stale fetches pile up
+
 ## [0.7.0] — 2026-06-21
 
 ### Breaking changes
