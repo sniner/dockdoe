@@ -1518,7 +1518,7 @@ fn stack_members_table(members: &[&ContainerMetrics], cpu_count: usize, r: &Rend
 fn container_detail_live(c: &ContainerMetrics, links: &PortLinks) -> Markup {
     html! {
         div.status-line {
-            span.badge.(state_class(c.state)) { (state_label(c.state)) }
+            span.badge.(state_name(c.state)) { (state_name(c.state)) }
             (health_marker(c.health))
             (port_pills(&c.ports, links))
         }
@@ -1861,7 +1861,7 @@ fn container_row(c: &ContainerMetrics, cpu_count: usize, r: &Render) -> Markup {
             td.name { a href=(format!("/host/{}/container/{}", r.host, c.id)) { (c.name) } }
             td.image { (short_image(&c.image)) }
             td {
-                span.badge.(state_class(c.state)) { (state_label(c.state)) }
+                span.badge.(state_name(c.state)) { (state_name(c.state)) }
                 (health_marker(c.health))
                 (port_chips(&c.ports, r.links))
             }
@@ -2050,21 +2050,9 @@ enum StackKey<'a> {
     Standalone,
 }
 
-fn state_class(state: ContainerState) -> &'static str {
-    match state {
-        ContainerState::Running => "running",
-        ContainerState::Exited => "exited",
-        ContainerState::Dead => "dead",
-        ContainerState::Paused => "paused",
-        ContainerState::Restarting => "restarting",
-        ContainerState::Stopping => "stopping",
-        ContainerState::Removing => "removing",
-        ContainerState::Created => "created",
-        ContainerState::Unknown => "unknown",
-    }
-}
-
-fn state_label(state: ContainerState) -> &'static str {
+/// A container state's name, used both as the badge's CSS class and as its
+/// visible label (they are the same word for every state).
+fn state_name(state: ContainerState) -> &'static str {
     match state {
         ContainerState::Running => "running",
         ContainerState::Exited => "exited",
