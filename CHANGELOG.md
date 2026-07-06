@@ -3,6 +3,14 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Changed
+
+- **Overview CPU disc** now defaults to the `log` scale (was `linear`), so light activity is
+  visible instead of a near-empty disc; set `--overview-cpu-scale linear` /
+  `DOCKDOE_OVERVIEW_CPU_SCALE=linear` to get the old quiet-when-idle look back
+
 ## [0.9.0] — 2026-07-06
 
 ### Added

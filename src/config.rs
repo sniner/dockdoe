@@ -481,9 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn overview_defaults_are_cpu_linear_mem_log_64g() {
+    fn overview_defaults_are_cpu_log_mem_log_64g() {
         let cfg = load(None, &default_cli()).expect("load without a file");
-        assert_eq!(cfg.overview.cpu_scale, ScaleMode::Linear);
+        assert_eq!(cfg.overview.cpu_scale, ScaleMode::Log);
         assert_eq!(cfg.overview.mem_scale, ScaleMode::Log);
         assert_eq!(cfg.overview.mem_cap, 64 << 30);
     }

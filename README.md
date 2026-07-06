@@ -91,7 +91,7 @@ also reads from an environment variable; the flag wins when both are set.
 | `--port-host`             | `DOCKDOE_PORT_HOST`            | *(unset)*        | Host the port pills link to, see below          |
 | `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
 | `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
-| `--overview-cpu-scale`    | `DOCKDOE_OVERVIEW_CPU_SCALE`   | `linear`         | Overview CPU disc scale, see below              |
+| `--overview-cpu-scale`    | `DOCKDOE_OVERVIEW_CPU_SCALE`   | `log`            | Overview CPU disc scale, see below              |
 | `--overview-mem-scale`    | `DOCKDOE_OVERVIEW_MEM_SCALE`   | `log`            | Overview memory disc scale, see below           |
 | `--overview-mem-cap`      | `DOCKDOE_OVERVIEW_MEM_CAP`     | `64G`            | Memory value at the overview disc's rim         |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
@@ -158,10 +158,10 @@ Hover names the container, a click opens its detail page.
 
 Both scales can be tuned:
 
-- **`--overview-cpu-scale`** — `linear` (default), `sqrt` or `log`. The rim is
-  100 % of one core. Linear keeps an idle fleet visually quiet — an empty disc
-  *means* all quiet; `sqrt`/`log` spread the low end at the cost of magnifying
-  idle jitter.
+- **`--overview-cpu-scale`** — `log` (default), `sqrt` or `linear`. The rim is
+  100 % of one core. The log scale spreads the low end so even light activity
+  shows; `linear` keeps an idle fleet visually quiet — an empty disc *means*
+  all quiet — at the cost of barely registering small loads.
 - **`--overview-mem-scale`** — `log` (default), `sqrt` or `linear`. On the log
   scale equal *relative* growth moves a sector equally far, so a leak looks the
   same whether it doubles 100 MiB or 4 GiB.

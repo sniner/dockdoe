@@ -119,10 +119,11 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_PORT_HOST")]
     port_host: Option<String>,
 
-    /// Radius scale of the dashboard overview's CPU disc. `linear` keeps an
-    /// idle fleet visually quiet; `sqrt`/`log` spread the low end.
+    /// Radius scale of the dashboard overview's CPU disc. `log` spreads the
+    /// low end so even light activity shows; `linear` keeps an idle fleet
+    /// visually quiet at the cost of a near-empty disc.
     #[arg(long, env = "DOCKDOE_OVERVIEW_CPU_SCALE", value_enum,
-          default_value_t = config::ScaleMode::Linear)]
+          default_value_t = config::ScaleMode::Log)]
     overview_cpu_scale: config::ScaleMode,
 
     /// Radius scale of the dashboard overview's memory disc. With `log`,
