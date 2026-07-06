@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::ContainerMetrics;
 
@@ -76,7 +76,10 @@ pub struct ContainerTrend {
 /// One raw metric point at a timestamp, used to seed the live charts on first
 /// page load and streamed live over SSE. The I/O rates are `None` until a
 /// second sample gives a delta, or when the runtime reports no such stats.
-#[derive(Debug, Clone, Serialize)]
+///
+/// Also read back by a federation hub from a node's metrics endpoints, so it
+/// is part of the additive-only payload contract (see `crate::model`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricPoint {
     pub ts_ms: u64,
     pub cpu_percent: f64,

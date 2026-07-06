@@ -10,8 +10,8 @@
 //! version is [`VERSION`], sent nowhere but compared against what nodes
 //! report so skew shows up in the logs instead of as silent weirdness.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use crate::collector::{SharedDashboard, publish};
 use crate::config::HostConfig;
 use crate::model::{HostEntry, Snapshot};
+use crate::store::MetricPoint;
 
 /// This build's version, for skew warnings against a node's reported version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,6 +40,9 @@ pub struct NodeClient {
     http: reqwest::Client,
     /// Node base URL without a trailing slash, e.g. `https://node:8080`.
     base: String,
+    /// The node-side host name this entry mirrors, set by the poll loop once
+    /// resolved. Shared across clones so the web layer sees it too.
+    node_host: Arc<OnceLock<String>>,
 }
 
 impl NodeClient {
@@ -95,7 +99,79 @@ impl NodeClient {
                 .build()
                 .context("building the HTTP client for the federated node")?,
             base,
+            node_host: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// The node-side host name this entry mirrors — `None` until the poll
+    /// loop's first successful resolution.
+    pub fn node_host(&self) -> Option<&str> {
+        self.node_host.get().map(String::as_str)
+    }
+
+    /// The node's UI page for one of its containers, for deep links (e.g. the
+    /// terminal, which is not bridged through the hub).
+    pub fn container_url(&self, id: &str) -> Option<String> {
+        let nh = self.node_host()?;
+        Some(format!("{}/host/{nh}/container/{id}", self.base))
+    }
+
+    /// Forward a GET to the node's same-shaped, host-scoped endpoint:
+    /// `api_path` is the part after `/host/{node_host}` (e.g.
+    /// `/api/container/{id}/logs`), `query` the raw query string to relay.
+    pub async fn forward_get(
+        &self,
+        api_path: &str,
+        query: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let mut url = self.host_scoped(api_path)?;
+        if let Some(q) = query.filter(|q| !q.is_empty()) {
+            url.push('?');
+            url.push_str(q);
+        }
+        self.http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("requesting {api_path} from node {}", self.base))
+    }
+
+    /// Forward a lifecycle action POST to the node. Returns the node's status
+    /// and body text — the caller maps them onto the hub's own UI responses
+    /// (fresh buttons, read-only latch, error toast).
+    pub async fn forward_action(&self, api_path: &str) -> Result<(reqwest::StatusCode, String)> {
+        let url = self.host_scoped(api_path)?;
+        let resp = self
+            .http
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("posting {api_path} to node {}", self.base))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    }
+
+    /// Chart points from the node (seed of the detail pages): its metrics
+    /// endpoints serve the same `Vec<MetricPoint>` JSON the hub would read
+    /// from its own store.
+    pub async fn metric_points(&self, api_path: &str, since_ms: u64) -> Result<Vec<MetricPoint>> {
+        let resp = self
+            .forward_get(api_path, Some(&format!("since_ms={since_ms}")))
+            .await?;
+        let resp = check_status(resp)?;
+        resp.json()
+            .await
+            .with_context(|| format!("decoding {api_path} from node {}", self.base))
+    }
+
+    /// `{base}/host/{node_host}{api_path}`, or an error while the node host is
+    /// still unresolved (node not reachable since hub start).
+    fn host_scoped(&self, api_path: &str) -> Result<String> {
+        let nh = self
+            .node_host()
+            .context("node not resolved yet (unreachable since startup)")?;
+        Ok(format!("{}/host/{nh}{api_path}", self.base))
     }
 
     /// The hosts the node monitors — `GET /api/hosts`.
@@ -176,10 +252,9 @@ pub async fn run(
     info!(host = %host, node = %client.base, interval = ?interval, "starting federation poll");
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut node_host: Option<String> = None;
     loop {
         ticker.tick().await;
-        if node_host.is_none() {
+        if client.node_host().is_none() {
             match client
                 .resolve_node_host(configured_node_host.as_deref())
                 .await
@@ -192,7 +267,9 @@ pub async fn run(
                         node_version = %entry.version,
                         "federated node resolved"
                     );
-                    node_host = Some(entry.name);
+                    // Publishes the name to every clone (the web layer's
+                    // passthrough waits on it, too).
+                    let _ = client.node_host.set(entry.name);
                 }
                 Err(e) => {
                     warn!(host = %host, error = %format!("{e:#}"), "resolving federated node failed; retrying");
@@ -200,8 +277,8 @@ pub async fn run(
                 }
             }
         }
-        let target = node_host.as_deref().expect("resolved above");
-        match client.snapshot(target).await {
+        let target = client.node_host().expect("resolved above").to_string();
+        match client.snapshot(&target).await {
             Ok(Some(snap)) => {
                 read_only.store(snap.read_only, Ordering::Relaxed);
                 publish(&shared, snap.dashboard);

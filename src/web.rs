@@ -86,7 +86,7 @@ pub struct HostRuntime {
 #[derive(Clone)]
 pub enum HostSource {
     Docker(DockerHandle),
-    Node(#[expect(dead_code, reason = "the passthrough milestone reads it")] NodeClient),
+    Node(NodeClient),
 }
 
 impl HostRuntime {
@@ -344,13 +344,38 @@ async fn container_action(
         Ok(rt) => rt,
         Err(resp) => return resp,
     };
-    let Some(action) = Action::parse(&action) else {
+    let Some(parsed) = Action::parse(&action) else {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
-    let HostSource::Docker(docker) = &rt.source else {
-        return federated_not_yet();
+    let docker = match &rt.source {
+        HostSource::Docker(docker) => docker,
+        HostSource::Node(node) => {
+            // The node applies the action; the hub renders its own buttons —
+            // the node's fragment would carry *its* host-scoped URLs.
+            return match node
+                .forward_action(&format!("/api/container/{id}/{action}"))
+                .await
+            {
+                Ok((status, _)) if status.is_success() => {
+                    tracing::info!(%host, %id, %action, "applied container action on node");
+                    action_buttons(&host, &id, rt.is_read_only()).into_response()
+                }
+                Ok((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _)) => {
+                    mark_read_only(rt, &host);
+                    action_buttons(&host, &id, true).into_response()
+                }
+                Ok((status, body)) => {
+                    tracing::warn!(%host, %id, %action, %status, "node rejected container action");
+                    (StatusCode::BAD_GATEWAY, body).into_response()
+                }
+                Err(err) => {
+                    tracing::warn!(%host, %id, %action, error = %format!("{err:#}"), "forwarding action failed");
+                    (StatusCode::BAD_GATEWAY, "node unreachable").into_response()
+                }
+            };
+        }
     };
-    match docker.apply(&id, action).await {
+    match docker.apply(&id, parsed).await {
         Ok(()) => {
             tracing::info!(%host, %id, ?action, "applied container action");
             // The next collector cycle refreshes state; echo the buttons back.
@@ -368,20 +393,38 @@ async fn container_action(
     }
 }
 
-/// Interim answer for endpoints that still need the Docker handle on a
-/// federated host; the passthrough milestone replaces these with forwards to
-/// the node.
-fn federated_not_yet() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "not available for federated hosts yet",
-    )
-        .into_response()
-}
-
-/// [`federated_not_yet`] as an HTML fragment, for the panel endpoints.
-fn federated_not_yet_fragment() -> Markup {
-    html! { span.muted { "Not available for federated hosts yet." } }
+/// Forward a GET to the federated node's endpoint of the same shape and relay
+/// status, content type and body. The node's data endpoints answer exactly
+/// what the hub's own would (JSON points, HTML log/compose fragments), so
+/// nothing needs re-rendering — except host-scoped URLs, which these payloads
+/// deliberately don't contain.
+async fn proxy_get(node: &NodeClient, api_path: &str, query: Option<&str>) -> Response {
+    match node.forward_get(api_path, query).await {
+        Ok(resp) => {
+            let status = resp.status();
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/plain; charset=utf-8")
+                .to_string();
+            match resp.bytes().await {
+                Ok(body) => (status, [(header::CONTENT_TYPE, content_type)], body).into_response(),
+                Err(err) => {
+                    tracing::warn!(%err, api_path, "reading node response failed");
+                    (StatusCode::BAD_GATEWAY, "node response failed").into_response()
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), api_path, "forwarding to node failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("node unreachable: {err:#}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Latch a host into read-only after it returned `403 Forbidden` (a socket
@@ -402,16 +445,41 @@ async fn stack_action(
         Ok(rt) => rt,
         Err(resp) => return resp,
     };
-    let Some(action) = Action::parse(&action) else {
+    let Some(parsed) = Action::parse(&action) else {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
 
-    let HostSource::Docker(docker) = &rt.source else {
-        return federated_not_yet();
+    let docker = match &rt.source {
+        HostSource::Docker(docker) => docker,
+        HostSource::Node(node) => {
+            // The node orchestrates its own stack; the hub only relays the
+            // outcome and renders its own buttons (host-scoped URLs).
+            return match node
+                .forward_action(&format!("/api/stack/{name}/{action}"))
+                .await
+            {
+                Ok((status, _)) if status.is_success() => {
+                    tracing::info!(%host, stack = %name, %action, "applied stack action on node");
+                    stack_action_buttons(&host, &name, rt.is_read_only()).into_response()
+                }
+                Ok((StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN, _)) => {
+                    mark_read_only(rt, &host);
+                    stack_action_buttons(&host, &name, true).into_response()
+                }
+                Ok((status, body)) => {
+                    tracing::warn!(%host, stack = %name, %action, %status, "node rejected stack action");
+                    (StatusCode::BAD_GATEWAY, body).into_response()
+                }
+                Err(err) => {
+                    tracing::warn!(%host, stack = %name, %action, error = %format!("{err:#}"), "forwarding stack action failed");
+                    (StatusCode::BAD_GATEWAY, "node unreachable").into_response()
+                }
+            };
+        }
     };
     // Orchestrate dependency-aware: the docker layer reads the compose
     // depends_on labels and starts/stops members in the right order.
-    match docker.stack_action(&name, action).await {
+    match docker.stack_action(&name, parsed).await {
         Ok(outcome) => {
             tracing::info!(
                 %host, stack = %name, ?action,
@@ -512,19 +580,24 @@ const LOG_TAIL_LINES: u32 = 200;
 async fn container_logs(
     State(state): State<AppState>,
     axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
-) -> Markup {
+) -> Response {
     let Some(rt) = state.hosts.get(&host) else {
-        return html! { span.muted { "Unknown host." } };
+        return html! { span.muted { "Unknown host." } }.into_response();
     };
-    let HostSource::Docker(docker) = &rt.source else {
-        return federated_not_yet_fragment();
+    let docker = match &rt.source {
+        HostSource::Docker(docker) => docker,
+        // The node renders the same fragment (log spans carry no host-scoped
+        // URLs), so it can be relayed as-is.
+        HostSource::Node(node) => {
+            return proxy_get(node, &format!("/api/container/{id}/logs"), None).await;
+        }
     };
     match docker.logs_tail(&id, LOG_TAIL_LINES).await {
-        Ok(text) if text.trim().is_empty() => html! { span.muted { "(no logs)" } },
-        Ok(text) => render_log_lines(&strip_ansi(&text)),
+        Ok(text) if text.trim().is_empty() => html! { span.muted { "(no logs)" } }.into_response(),
+        Ok(text) => render_log_lines(&strip_ansi(&text)).into_response(),
         Err(err) => {
             tracing::warn!(%host, %id, %err, "fetching logs failed");
-            html! { span.muted { "Could not read logs: " (err) } }
+            html! { span.muted { "Could not read logs: " (err) } }.into_response()
         }
     }
 }
@@ -571,22 +644,28 @@ fn split_log_timestamp(line: &str) -> Option<(&str, &str)> {
 async fn stack_compose(
     State(state): State<AppState>,
     axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
-) -> Markup {
+) -> Response {
     let Some(rt) = state.hosts.get(&host) else {
-        return html! { span.muted { "Unknown host." } };
+        return html! { span.muted { "Unknown host." } }.into_response();
     };
-    let HostSource::Docker(docker) = &rt.source else {
-        return federated_not_yet_fragment();
+    let docker = match &rt.source {
+        HostSource::Docker(docker) => docker,
+        // The node reads the file from *its* filesystem — exactly the point:
+        // the hub needs no mounts for remote stacks.
+        HostSource::Node(node) => {
+            return proxy_get(node, &format!("/api/stack/{name}/compose"), None).await;
+        }
     };
     let paths = match docker.compose_config_files(&name).await {
         Ok(paths) => paths,
         Err(err) => {
             tracing::warn!(%host, stack = %name, %err, "resolving compose files failed");
-            return html! { span.muted { "Could not determine compose file: " (err) } };
+            return html! { span.muted { "Could not determine compose file: " (err) } }
+                .into_response();
         }
     };
     if paths.is_empty() {
-        return html! { span.muted { "No compose file recorded for this stack." } };
+        return html! { span.muted { "No compose file recorded for this stack." } }.into_response();
     }
 
     let files = tokio::task::spawn_blocking(move || read_compose_files(&paths))
@@ -600,6 +679,7 @@ async fn stack_compose(
             }
         }
     }
+    .into_response()
 }
 
 /// Read each compose file from the host filesystem. Guarded to YAML paths so a
@@ -732,7 +812,13 @@ async fn ws_exec(
         return (StatusCode::NOT_FOUND, "unknown host").into_response();
     };
     let HostSource::Docker(docker) = &rt.source else {
-        return federated_not_yet();
+        // The terminal is not bridged through the hub; the detail page links
+        // to the node's own UI instead.
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "terminal is not bridged for federated hosts; open it on the node",
+        )
+            .into_response();
     };
     let cmd = q.cmd.unwrap_or_default();
     let docker = docker.clone();
@@ -865,10 +951,26 @@ async fn metrics_container(
     State(state): State<AppState>,
     axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
     Query(q): Query<SinceQuery>,
-) -> Json<Vec<MetricPoint>> {
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    if let Some(HostRuntime {
+        source: HostSource::Node(node),
+        ..
+    }) = state.hosts.get(&host)
+    {
+        // The node clamps `since_ms` to its own seed window and answers the
+        // same JSON this handler would build.
+        return proxy_get(
+            node,
+            &format!("/api/metrics/container/{id}"),
+            raw.as_deref(),
+        )
+        .await;
+    }
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
     Json(fetch_points(move || store.recent_container_samples(&host, &id, since)).await)
+        .into_response()
 }
 
 /// JSON backfill for a stack detail page's charts (trend-based, like the seed).
@@ -876,10 +978,18 @@ async fn metrics_stack(
     State(state): State<AppState>,
     axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
     Query(q): Query<SinceQuery>,
-) -> Json<Vec<MetricPoint>> {
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    if let Some(HostRuntime {
+        source: HostSource::Node(node),
+        ..
+    }) = state.hosts.get(&host)
+    {
+        return proxy_get(node, &format!("/api/metrics/stack/{name}"), raw.as_deref()).await;
+    }
     let since = clamp_since(q.since_ms, state.seed_window);
     let store = state.store.clone();
-    Json(fetch_points(move || store.recent_stack_trends(&host, &name, since)).await)
+    Json(fetch_points(move || store.recent_stack_trends(&host, &name, since)).await).into_response()
 }
 
 /// Selectable named history ranges: query value and lookback window.
@@ -964,7 +1074,22 @@ async fn history_container(
     State(state): State<AppState>,
     axum::extract::Path((host, id)): axum::extract::Path<(String, String)>,
     Query(q): Query<HistoryQuery>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
+    if let Some(HostRuntime {
+        source: HostSource::Node(node),
+        ..
+    }) = state.hosts.get(&host)
+    {
+        // History lives on the node — the whole point of decentralised
+        // storage. Ranges, drill-down windows and grouping are its business.
+        return proxy_get(
+            node,
+            &format!("/api/history/container/{id}"),
+            raw.as_deref(),
+        )
+        .await;
+    }
     let Some(w) = resolve_history(&q, state.seed_window) else {
         return INVALID_RANGE.into_response();
     };
@@ -1004,7 +1129,15 @@ async fn history_stack(
     State(state): State<AppState>,
     axum::extract::Path((host, name)): axum::extract::Path<(String, String)>,
     Query(q): Query<HistoryQuery>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
+    if let Some(HostRuntime {
+        source: HostSource::Node(node),
+        ..
+    }) = state.hosts.get(&host)
+    {
+        return proxy_get(node, &format!("/api/history/stack/{name}"), raw.as_deref()).await;
+    }
     let Some(w) = resolve_history(&q, state.seed_window) else {
         return INVALID_RANGE.into_response();
     };
@@ -1069,12 +1202,29 @@ async fn container_detail(
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     };
+    // On a federated host the terminal panel deep-links to the node's UI.
+    let node_url = match &rt.source {
+        HostSource::Node(node) => node.container_url(&id),
+        HostSource::Docker(_) => None,
+    };
 
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
-    let store = state.store.clone();
-    let (seed_host, seed_id) = (host.clone(), id.clone());
-    let seed =
-        fetch_points(move || store.recent_container_samples(&seed_host, &seed_id, since)).await;
+    let seed = match &rt.source {
+        HostSource::Docker(_) => {
+            let store = state.store.clone();
+            let (seed_host, seed_id) = (host.clone(), id.clone());
+            fetch_points(move || store.recent_container_samples(&seed_host, &seed_id, since)).await
+        }
+        // The node holds the history; seed from its backfill endpoint. An
+        // unreachable node degrades to an empty seed — live points still flow.
+        HostSource::Node(node) => node
+            .metric_points(&format!("/api/metrics/container/{id}"), since)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%host, %id, error = %format!("{err:#}"), "seeding charts from node failed");
+                Vec::new()
+            }),
+    };
 
     let live_url = format!("/host/{host}/events/container/{id}");
     let backfill_url = format!("/host/{host}/api/metrics/container/{id}");
@@ -1082,7 +1232,7 @@ async fn container_detail(
         &state,
         &host,
         snapshot.as_ref(),
-        container_detail_main(&container, &r),
+        container_detail_main(&container, &r, node_url.as_deref()),
         &seed,
         &live_url,
         &backfill_url,
@@ -1135,9 +1285,20 @@ async fn stack_detail(
     // so we seed from trends: the sum of member medians per bucket, which lines
     // up with the live aggregate (sum of current member values).
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
-    let store = state.store.clone();
-    let (seed_host, seed_name) = (host.clone(), name.clone());
-    let seed = fetch_points(move || store.recent_stack_trends(&seed_host, &seed_name, since)).await;
+    let seed = match &rt.source {
+        HostSource::Docker(_) => {
+            let store = state.store.clone();
+            let (seed_host, seed_name) = (host.clone(), name.clone());
+            fetch_points(move || store.recent_stack_trends(&seed_host, &seed_name, since)).await
+        }
+        HostSource::Node(node) => node
+            .metric_points(&format!("/api/metrics/stack/{name}"), since)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%host, stack = %name, error = %format!("{err:#}"), "seeding charts from node failed");
+                Vec::new()
+            }),
+    };
 
     // Members are non-empty here, so a snapshot exists; 1 is just a fallback.
     let cpu_count = snapshot.as_ref().map_or(1, |d| d.cpu_count);
@@ -1632,7 +1793,7 @@ fn io_chart_card(title: &str, key: &str, in_label: &str, out_label: &str) -> Mar
 }
 
 /// Body of a single-container detail page.
-fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
+fn container_detail_main(c: &ContainerMetrics, r: &Render, node_url: Option<&str>) -> Markup {
     let host = r.host;
     html! {
         section.detail-head {
@@ -1661,7 +1822,7 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
                 hx-get=(format!("/host/{host}/api/container/{}/logs", c.id))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
         }
-        (terminal_panel(c, host, r.read_only))
+        (terminal_panel(c, host, r.read_only, node_url))
     }
 }
 
@@ -1669,7 +1830,27 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
 /// so we don't spawn one on every page view) and only for running containers;
 /// `terminal.js` opens the WebSocket on "Connect". The `⛶` button toggles a
 /// fullscreen class on the panel. Stopped containers get a disabled note.
-fn terminal_panel(c: &ContainerMetrics, host: &str, read_only: bool) -> Markup {
+fn terminal_panel(
+    c: &ContainerMetrics,
+    host: &str,
+    read_only: bool,
+    node_url: Option<&str>,
+) -> Markup {
+    // On a federated host the terminal is not bridged through the hub; link
+    // to the node's own UI, which has the interactive terminal.
+    if let Some(url) = node_url {
+        return html! {
+            section.panel.terminal id="terminal" {
+                div.panel-head {
+                    h3 { "Terminal" }
+                }
+                p.empty {
+                    "The terminal runs on the node — "
+                    a href=(url) target="_blank" rel="noopener" { "open this container there ↗" }
+                }
+            }
+        };
+    }
     let interactive = c.state == ContainerState::Running && !read_only;
     html! {
         section.panel.terminal id="terminal" data-ws=(format!("/host/{host}/ws/container/{}/exec", c.id)) {
