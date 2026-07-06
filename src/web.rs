@@ -32,6 +32,7 @@ use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
 use crate::config::OverviewConfig;
 use crate::docker::{Action, DockerHandle, ExecSession, is_forbidden};
+use crate::federation::NodeClient;
 use crate::model::{
     ContainerMetrics, ContainerState, Dashboard, HealthState, HostEntry, Port, Snapshot,
 };
@@ -69,14 +70,23 @@ pub struct HostRuntime {
     /// The latest snapshot for this host — single source of truth for both the
     /// initial render and the live SSE streams.
     pub shared: SharedDashboard,
-    /// Docker handle for this host's lifecycle actions and logs.
-    pub docker: DockerHandle,
+    /// Where this host's data and actions come from.
+    pub source: HostSource,
     /// How this host's published-port pills link out.
     pub links: PortLinks,
     /// Set once a lifecycle/exec call returns `403 Forbidden` — the socket proxy
     /// is read-only. The UI then disables this host's action buttons and
-    /// terminal. Latches on; cleared only by a restart.
+    /// terminal. Latches on; cleared only by a restart. For a federated host
+    /// this mirrors what the node reports instead.
     pub read_only: Arc<AtomicBool>,
+}
+
+/// Where a host's data and actions come from: a Docker endpoint we talk to
+/// directly, or a federated DockDoe node reached over its JSON API.
+#[derive(Clone)]
+pub enum HostSource {
+    Docker(DockerHandle),
+    Node(#[expect(dead_code, reason = "the passthrough milestone reads it")] NodeClient),
 }
 
 impl HostRuntime {
@@ -337,7 +347,10 @@ async fn container_action(
     let Some(action) = Action::parse(&action) else {
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
-    match rt.docker.apply(&id, action).await {
+    let HostSource::Docker(docker) = &rt.source else {
+        return federated_not_yet();
+    };
+    match docker.apply(&id, action).await {
         Ok(()) => {
             tracing::info!(%host, %id, ?action, "applied container action");
             // The next collector cycle refreshes state; echo the buttons back.
@@ -353,6 +366,22 @@ async fn container_action(
             (StatusCode::BAD_GATEWAY, format!("action failed: {err}")).into_response()
         }
     }
+}
+
+/// Interim answer for endpoints that still need the Docker handle on a
+/// federated host; the passthrough milestone replaces these with forwards to
+/// the node.
+fn federated_not_yet() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "not available for federated hosts yet",
+    )
+        .into_response()
+}
+
+/// [`federated_not_yet`] as an HTML fragment, for the panel endpoints.
+fn federated_not_yet_fragment() -> Markup {
+    html! { span.muted { "Not available for federated hosts yet." } }
 }
 
 /// Latch a host into read-only after it returned `403 Forbidden` (a socket
@@ -377,9 +406,12 @@ async fn stack_action(
         return (StatusCode::BAD_REQUEST, "unknown action").into_response();
     };
 
+    let HostSource::Docker(docker) = &rt.source else {
+        return federated_not_yet();
+    };
     // Orchestrate dependency-aware: the docker layer reads the compose
     // depends_on labels and starts/stops members in the right order.
-    match rt.docker.stack_action(&name, action).await {
+    match docker.stack_action(&name, action).await {
         Ok(outcome) => {
             tracing::info!(
                 %host, stack = %name, ?action,
@@ -484,7 +516,10 @@ async fn container_logs(
     let Some(rt) = state.hosts.get(&host) else {
         return html! { span.muted { "Unknown host." } };
     };
-    match rt.docker.logs_tail(&id, LOG_TAIL_LINES).await {
+    let HostSource::Docker(docker) = &rt.source else {
+        return federated_not_yet_fragment();
+    };
+    match docker.logs_tail(&id, LOG_TAIL_LINES).await {
         Ok(text) if text.trim().is_empty() => html! { span.muted { "(no logs)" } },
         Ok(text) => render_log_lines(&strip_ansi(&text)),
         Err(err) => {
@@ -540,7 +575,10 @@ async fn stack_compose(
     let Some(rt) = state.hosts.get(&host) else {
         return html! { span.muted { "Unknown host." } };
     };
-    let paths = match rt.docker.compose_config_files(&name).await {
+    let HostSource::Docker(docker) = &rt.source else {
+        return federated_not_yet_fragment();
+    };
+    let paths = match docker.compose_config_files(&name).await {
         Ok(paths) => paths,
         Err(err) => {
             tracing::warn!(%host, stack = %name, %err, "resolving compose files failed");
@@ -693,8 +731,11 @@ async fn ws_exec(
     let Some(rt) = state.hosts.get(&host) else {
         return (StatusCode::NOT_FOUND, "unknown host").into_response();
     };
+    let HostSource::Docker(docker) = &rt.source else {
+        return federated_not_yet();
+    };
     let cmd = q.cmd.unwrap_or_default();
-    let docker = rt.docker.clone();
+    let docker = docker.clone();
     let read_only = Arc::clone(&rt.read_only);
     ws.on_upgrade(move |socket| exec_bridge(socket, docker, host, id, cmd, read_only))
 }

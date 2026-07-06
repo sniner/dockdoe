@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::collector::Config;
@@ -191,15 +191,15 @@ async fn main() -> Result<()> {
     for host_cfg in &cfg.hosts {
         let name = host_cfg.name.clone();
 
-        // A federated node: reached over its DockDoe API, not the Docker
-        // socket. Resolve and log it; serving it arrives with the federation
-        // collector (M3).
+        // A federated node: its own DockDoe collects on the Docker host and
+        // keeps the history; the hub only polls snapshots into the same shared
+        // slot a local collector would fill. No store writes, no notifier —
+        // the node does both itself.
         if host_cfg.is_node() {
-            probe_federated_node(host_cfg).await?;
-            warn!(
-                host = %name,
-                "federated hosts are not served yet (federation is under construction); skipping"
-            );
+            let rt = spawn_federated_host(&cfg, host_cfg)
+                .with_context(|| format!("setting up federated host {name:?}"))?;
+            hosts.insert(name.clone(), rt);
+            host_order.push(name);
             continue;
         }
 
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
             name.clone(),
             web::HostRuntime {
                 shared,
-                docker: docker_handle,
+                source: web::HostSource::Docker(docker_handle),
                 links,
                 read_only: Arc::new(AtomicBool::new(false)),
             },
@@ -296,41 +296,35 @@ fn collector_config(cfg: &config::AppConfig, host_cfg: &config::HostConfig) -> C
     }
 }
 
-/// Resolve a federated node at startup and log what it reports — which host
-/// we'll mirror, its DockDoe version, and its current container count. Only a
-/// broken *local* setup (bad token characters) is fatal; a node that's down
-/// merely warns, since the poll loop will keep retrying once it serves.
-async fn probe_federated_node(host_cfg: &config::HostConfig) -> Result<()> {
+/// Build the runtime for a federated host and spawn its poll loop. Only a
+/// broken *local* setup (bad token characters, unreadable tls_ca) is fatal —
+/// a node that's down is retried by the loop forever.
+fn spawn_federated_host(
+    cfg: &config::AppConfig,
+    host_cfg: &config::HostConfig,
+) -> Result<web::HostRuntime> {
     let name = &host_cfg.name;
     let client = federation::NodeClient::from_config(host_cfg)
         .with_context(|| format!("building the node client for host {name:?}"))?;
-    let entry = match client
-        .resolve_node_host(host_cfg.node_host.as_deref())
-        .await
-    {
-        Ok(entry) => entry,
-        Err(e) => {
-            // `:#` prints the whole context chain — a wrong token, a TLS
-            // problem and an unreachable host all need different fixes.
-            warn!(host = %name, error = %format!("{e:#}"), "federated node not reachable yet");
-            return Ok(());
-        }
-    };
-    let containers = client
-        .snapshot(&entry.name)
-        .await
-        .ok()
-        .flatten()
-        .map(|s| s.dashboard.containers.len());
-    info!(
-        host = %name,
-        node = %host_cfg.endpoint_url(),
-        node_host = %entry.name,
-        node_version = %entry.version,
-        containers = ?containers,
-        "federated node resolved"
-    );
-    Ok(())
+    let shared = Arc::new(RwLock::new(None));
+    let read_only = Arc::new(AtomicBool::new(false));
+    tokio::spawn(federation::run(
+        name.clone(),
+        client.clone(),
+        host_cfg.node_host.clone(),
+        Duration::from_secs(host_cfg.effective_interval_secs(cfg.interval_secs)),
+        Arc::clone(&shared),
+        Arc::clone(&read_only),
+    ));
+    Ok(web::HostRuntime {
+        shared,
+        source: web::HostSource::Node(client),
+        links: web::PortLinks::from_config(
+            host_cfg.public_host.as_deref(),
+            host_cfg.endpoint_url(),
+        ),
+        read_only,
+    })
 }
 
 /// Resolve the optional web-UI login. Authentication is opt-in: both

@@ -10,11 +10,14 @@
 //! version is [`VERSION`], sent nowhere but compared against what nodes
 //! report so skew shows up in the logs instead of as silent weirdness.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
+use crate::collector::{SharedDashboard, publish};
 use crate::config::HostConfig;
 use crate::model::{HostEntry, Snapshot};
 
@@ -149,6 +152,65 @@ impl NodeClient {
         resp.json()
             .await
             .with_context(|| format!("decoding {path} from node {}", self.base))
+    }
+}
+
+/// Run the federation poll loop forever for one hub host entry: fetch the
+/// node's snapshot every `interval` and publish it as this host's shared
+/// dashboard — the same slot a local collector would fill, so the dashboard,
+/// SSE streams and overview discs work unchanged.
+///
+/// The node host to mirror is (re)resolved inside the loop, so a node that is
+/// down at hub startup is simply retried. Errors keep the last snapshot, like
+/// a local collector losing its daemon: the header age shows the staleness,
+/// and the next successful poll recovers. `read_only` mirrors what the node
+/// reports each poll.
+pub async fn run(
+    host: String,
+    client: NodeClient,
+    configured_node_host: Option<String>,
+    interval: Duration,
+    shared: SharedDashboard,
+    read_only: Arc<AtomicBool>,
+) {
+    info!(host = %host, node = %client.base, interval = ?interval, "starting federation poll");
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut node_host: Option<String> = None;
+    loop {
+        ticker.tick().await;
+        if node_host.is_none() {
+            match client
+                .resolve_node_host(configured_node_host.as_deref())
+                .await
+            {
+                Ok(entry) => {
+                    info!(
+                        host = %host,
+                        node = %client.base,
+                        node_host = %entry.name,
+                        node_version = %entry.version,
+                        "federated node resolved"
+                    );
+                    node_host = Some(entry.name);
+                }
+                Err(e) => {
+                    warn!(host = %host, error = %format!("{e:#}"), "resolving federated node failed; retrying");
+                    continue;
+                }
+            }
+        }
+        let target = node_host.as_deref().expect("resolved above");
+        match client.snapshot(target).await {
+            Ok(Some(snap)) => {
+                read_only.store(snap.read_only, Ordering::Relaxed);
+                publish(&shared, snap.dashboard);
+            }
+            Ok(None) => debug!(host = %host, "node is warming up; no snapshot yet"),
+            Err(e) => {
+                warn!(host = %host, error = %format!("{e:#}"), "polling node failed; keeping last snapshot");
+            }
+        }
     }
 }
 

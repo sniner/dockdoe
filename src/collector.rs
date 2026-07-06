@@ -136,7 +136,7 @@ pub async fn run(
     }
 }
 
-fn publish(shared: &SharedDashboard, dashboard: Dashboard) {
+pub(crate) fn publish(shared: &SharedDashboard, dashboard: Dashboard) {
     match shared.write() {
         Ok(mut guard) => *guard = Some(dashboard),
         // A reader panicked while holding the lock; recover and carry on.

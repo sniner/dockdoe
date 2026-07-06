@@ -3,6 +3,17 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Federation**: a `[[host]]` entry can now point at another DockDoe instead of a Docker
+  endpoint — `dockdoe = "https://node:8080"` plus `token` (the node's `api_token`) and, when the
+  node monitors several hosts, `node_host`. The hub polls the node's snapshot API and serves the
+  host like any other: dashboard, overview discs and live updates work unchanged, while the
+  node's Docker socket and metrics history stay local to it. Requires DockDoe ≥ 0.10 on the node.
+  Logs, compose, actions and the terminal on federated hosts are not wired up yet
+
 ## [0.10.0] — 2026-07-06
 
 ### Added
