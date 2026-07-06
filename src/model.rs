@@ -1,13 +1,17 @@
 //! Serializable data model for the dashboard.
 //!
 //! These types are the single source of truth: the web layer renders them to
-//! HTML, and a future `--json` endpoint can serialize them as-is. Keep them
-//! free of presentation concerns.
+//! HTML, and the snapshot API serializes them as-is for a federation hub,
+//! which reads them back with the same types. Keep them free of presentation
+//! concerns — and keep changes ADDITIVE: the payload is a compatibility
+//! contract between DockDoe versions. New fields need `#[serde(default)]`,
+//! new enum variants come before the `#[serde(other)]` fallback, and nothing
+//! gets renamed or removed.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A full snapshot of a host's container metrics at one point in time.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dashboard {
     /// When this snapshot was collected, as Unix milliseconds.
     pub generated_at_unix_ms: u64,
@@ -18,7 +22,7 @@ pub struct Dashboard {
 }
 
 /// Per-container metrics and identity.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerMetrics {
     /// Full container ID.
     pub id: String,
@@ -56,7 +60,7 @@ pub struct ContainerMetrics {
 /// A network port a container exposes. When `public` is set the port is
 /// published to the host and reachable from outside; otherwise it is only
 /// exposed inside Docker's network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Port {
     /// Port inside the container.
     pub private: u16,
@@ -66,7 +70,7 @@ pub struct Port {
     pub proto: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerState {
     Created,
@@ -77,16 +81,135 @@ pub enum ContainerState {
     Removing,
     Dead,
     Stopping,
+    /// Also the deserialization fallback, so a hub on an older DockDoe
+    /// tolerates states a newer node may report one day.
+    #[serde(other)]
     Unknown,
 }
 
 /// Health as reported by Docker's healthcheck, if one is configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthState {
     Healthy,
     Unhealthy,
     Starting,
-    /// No healthcheck configured.
+    /// No healthcheck configured. Also the deserialization fallback, so a hub
+    /// on an older DockDoe tolerates health states a newer node may report.
+    #[serde(other)]
     None,
+}
+
+/// One monitored host, as listed by `GET /api/hosts` — enough for a federation
+/// hub to pick a host and detect version skew.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostEntry {
+    /// The host's config `name` (display name and URL slug).
+    pub name: String,
+    /// The node's DockDoe version (`CARGO_PKG_VERSION`).
+    pub version: String,
+}
+
+/// What `GET /host/{host}/api/snapshot` reports to a federation hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// The node's DockDoe version, for skew detection.
+    pub version: String,
+    /// Whether the host has latched read-only (lifecycle actions rejected).
+    #[serde(default)]
+    pub read_only: bool,
+    /// The host's current dashboard, exactly as the node renders it locally.
+    pub dashboard: Dashboard,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_snapshot() -> Snapshot {
+        Snapshot {
+            version: "0.10.0".into(),
+            read_only: true,
+            dashboard: Dashboard {
+                generated_at_unix_ms: 1_720_000_000_000,
+                cpu_count: 8,
+                containers: vec![ContainerMetrics {
+                    id: "deadbeef".into(),
+                    name: "web".into(),
+                    image: "nginx:latest".into(),
+                    state: ContainerState::Running,
+                    status: "Up 2 hours (healthy)".into(),
+                    health: HealthState::Healthy,
+                    stack: Some("blog".into()),
+                    cpu_percent: Some(12.5),
+                    mem_used: Some(64 << 20),
+                    mem_limit: None,
+                    net_rx_bps: Some(1024.0),
+                    net_tx_bps: None,
+                    disk_read_bps: None,
+                    disk_write_bps: Some(0.0),
+                    ports: vec![Port {
+                        private: 80,
+                        public: Some(8080),
+                        proto: "tcp".into(),
+                    }],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_roundtrips_through_json() {
+        let snap = sample_snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: Snapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.version, snap.version);
+        assert!(back.read_only);
+        let (a, b) = (&back.dashboard.containers[0], &snap.dashboard.containers[0]);
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.state, b.state);
+        assert_eq!(a.health, b.health);
+        assert_eq!(a.cpu_percent, b.cpu_percent);
+        assert_eq!(a.ports, b.ports);
+    }
+
+    #[test]
+    fn snapshot_tolerates_additive_changes_from_newer_nodes() {
+        // A newer node may add fields and enum variants; an older hub must
+        // shrug them off rather than fail the whole snapshot.
+        let json = r#"{
+            "version": "0.99.0",
+            "read_only": false,
+            "brand_new_field": {"nested": true},
+            "dashboard": {
+                "generated_at_unix_ms": 1,
+                "cpu_count": 2,
+                "future_field": 42,
+                "containers": [{
+                    "id": "x", "name": "n", "image": "i",
+                    "state": "hibernating",
+                    "status": "s",
+                    "health": "quantum",
+                    "stack": null,
+                    "cpu_percent": null, "mem_used": null, "mem_limit": null,
+                    "net_rx_bps": null, "net_tx_bps": null,
+                    "disk_read_bps": null, "disk_write_bps": null,
+                    "ports": []
+                }]
+            }
+        }"#;
+        let snap: Snapshot = serde_json::from_str(json).expect("tolerant deserialize");
+        let c = &snap.dashboard.containers[0];
+        assert_eq!(c.state, ContainerState::Unknown);
+        assert_eq!(c.health, HealthState::None);
+    }
+
+    #[test]
+    fn snapshot_defaults_missing_read_only() {
+        // read_only arrived with the federation API; keep it defaultable so the
+        // field could have been absent — the pattern every future field follows.
+        let json = r#"{"version":"0.10.0","dashboard":{"generated_at_unix_ms":1,"cpu_count":1,"containers":[]}}"#;
+        let snap: Snapshot = serde_json::from_str(json).expect("deserialize");
+        assert!(!snap.read_only);
+    }
 }

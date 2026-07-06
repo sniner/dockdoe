@@ -11,6 +11,11 @@ All notable, user-facing changes to DockDoe. The format is based on
   and machine clients — scripts, or a central DockDoe hub in an upcoming federation setup — can
   authenticate each request with an `Authorization: Bearer <token>` header instead of the login
   form, with the same access as a logged-in session
+- **JSON snapshot API**: `GET /api/hosts` lists the monitored hosts (name and DockDoe version),
+  and `GET /host/{host}/api/snapshot` returns a host's current dashboard — every container's
+  state, health, CPU, memory, network/disk I/O and ports — as JSON (503 while the first sample
+  is still being collected). Together with the API token this is the groundwork for federation:
+  running one DockDoe per Docker host and aggregating them on a central hub
 
 ### Changed
 

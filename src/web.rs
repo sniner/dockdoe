@@ -32,7 +32,9 @@ use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
 use crate::config::OverviewConfig;
 use crate::docker::{Action, DockerHandle, ExecSession, is_forbidden};
-use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
+use crate::model::{
+    ContainerMetrics, ContainerState, Dashboard, HealthState, HostEntry, Port, Snapshot,
+};
 use crate::store::{MetricPoint, Store};
 
 /// How often the live SSE streams poll the latest snapshot.
@@ -168,6 +170,8 @@ pub fn router(state: AppState) -> Router {
             get(history_container),
         )
         .route("/host/{host}/api/history/stack/{name}", get(history_stack))
+        .route("/api/hosts", get(api_hosts))
+        .route("/host/{host}/api/snapshot", get(api_snapshot))
         .route(
             "/host/{host}/api/container/{id}/{action}",
             axum::routing::post(container_action).layer(middleware::from_fn(require_htmx)),
@@ -409,6 +413,50 @@ fn host_rt<'a>(state: &'a AppState, host: &str) -> Result<&'a HostRuntime, Respo
         .hosts
         .get(host)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "unknown host").into_response())
+}
+
+/// This build's version, stamped into federation payloads so a hub can detect
+/// version skew against its nodes.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `GET /api/hosts` — the monitored hosts, for a federation hub to pick one
+/// and detect version skew.
+async fn api_hosts(State(state): State<AppState>) -> Json<Vec<HostEntry>> {
+    Json(
+        state
+            .host_order
+            .iter()
+            .map(|name| HostEntry {
+                name: name.clone(),
+                version: VERSION.to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// `GET /host/{host}/api/snapshot` — one host's current dashboard as JSON,
+/// for a federation hub. 503 until the first collector cycle has published.
+async fn api_snapshot(
+    State(state): State<AppState>,
+    axum::extract::Path(host): axum::extract::Path<String>,
+) -> Response {
+    let rt = match host_rt(&state, &host) {
+        Ok(rt) => rt,
+        Err(resp) => return resp,
+    };
+    let Some(dashboard) = current_snapshot(rt) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no snapshot yet (warming up)",
+        )
+            .into_response();
+    };
+    Json(Snapshot {
+        version: VERSION.to_string(),
+        read_only: rt.is_read_only(),
+        dashboard,
+    })
+    .into_response()
 }
 
 /// The landing page at `/`. With a single host it redirects straight to that
