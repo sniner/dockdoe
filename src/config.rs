@@ -93,7 +93,26 @@ pub struct HostConfig {
 
     /// Docker endpoint URL: `unix:///path/docker.sock`, `tcp://host:2375`,
     /// `http://host:2375`, or `https://host:2375` (TLS, server-auth only).
-    pub docker: String,
+    /// Exactly one of `docker` and `dockdoe` must be set.
+    #[serde(default)]
+    pub docker: Option<String>,
+
+    /// Base URL of a remote DockDoe node to federate (`http://host:8080` or
+    /// `https://host:8080`) — a DockDoe instance running on the Docker host,
+    /// queried over its JSON API instead of the Docker socket. Exactly one of
+    /// `docker` and `dockdoe` must be set.
+    #[serde(default)]
+    pub dockdoe: Option<String>,
+
+    /// Bearer token for a `dockdoe` node — the node's `api_token`. Required
+    /// when the node has one configured.
+    #[serde(default)]
+    pub token: Option<String>,
+
+    /// Which of the node's hosts to mirror (its config `name`). Unset picks
+    /// the node's only host; a multi-host node makes this mandatory.
+    #[serde(default)]
+    pub node_host: Option<String>,
 
     /// Public host/IP where this host's published container ports are reachable,
     /// used for the port-pill links. Unset falls back to the endpoint host (for
@@ -146,11 +165,27 @@ impl HostConfig {
     }
 
     /// Whether the Docker endpoint is local — a Unix socket or Windows named
-    /// pipe — as opposed to a remote `tcp`/`http`/`https` proxy.
+    /// pipe — as opposed to a remote `tcp`/`http`/`https` proxy or a
+    /// federated `dockdoe` node.
     fn is_local_endpoint(&self) -> bool {
-        let endpoint = self.docker.trim();
+        let endpoint = self.endpoint_url().trim();
         let scheme = endpoint.split_once("://").map_or(endpoint, |(s, _)| s);
         scheme.eq_ignore_ascii_case("unix") || scheme.eq_ignore_ascii_case("npipe")
+    }
+
+    /// Whether this host is a federated DockDoe node (`dockdoe = ...`) rather
+    /// than a Docker endpoint.
+    pub fn is_node(&self) -> bool {
+        self.dockdoe.is_some()
+    }
+
+    /// The configured endpoint URL, whichever kind it is. Validation
+    /// guarantees exactly one is set.
+    pub fn endpoint_url(&self) -> &str {
+        self.docker
+            .as_deref()
+            .or(self.dockdoe.as_deref())
+            .expect("validated: docker or dockdoe is set")
     }
 }
 
@@ -224,7 +259,10 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
         // from the CLI/env so the pre-config single-host behaviour is preserved.
         vec![HostConfig {
             name: "local".to_string(),
-            docker: default_docker_endpoint(),
+            docker: Some(default_docker_endpoint()),
+            dockdoe: None,
+            token: None,
+            node_host: None,
             public_host: cli.port_host.clone(),
             interval_secs: None,
             tls_ca: None,
@@ -306,8 +344,44 @@ fn validate_hosts(hosts: &[HostConfig]) -> Result<()> {
         if !seen.insert(h.name.as_str()) {
             bail!("duplicate host name {:?}", h.name);
         }
-        if h.docker.trim().is_empty() {
-            bail!("host {:?} has an empty docker endpoint", h.name);
+        match (h.docker.as_deref(), h.dockdoe.as_deref()) {
+            (Some(d), None) if d.trim().is_empty() => {
+                bail!("host {:?} has an empty docker endpoint", h.name);
+            }
+            (None, Some(n)) => {
+                let n = n.trim();
+                if !(n.starts_with("http://") || n.starts_with("https://")) {
+                    bail!(
+                        "host {:?}: dockdoe must be an http:// or https:// URL, got {n:?}",
+                        h.name
+                    );
+                }
+            }
+            (Some(_), Some(_)) => {
+                bail!(
+                    "host {:?} sets both docker and dockdoe; pick one per host",
+                    h.name
+                );
+            }
+            (None, None) => {
+                bail!(
+                    "host {:?} needs an endpoint: docker (socket/proxy) or dockdoe (federated node)",
+                    h.name
+                );
+            }
+            (Some(_), None) => {}
+        }
+        if !h.is_node() && (h.token.is_some() || h.node_host.is_some()) {
+            bail!(
+                "host {:?}: token and node_host only apply to a dockdoe endpoint",
+                h.name
+            );
+        }
+        if h.token.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            bail!(
+                "host {:?} has an empty token (unset it if none is needed)",
+                h.name
+            );
         }
         // Zero would panic in `tokio::time::interval` inside the collector,
         // mirroring the clap range guard on the global `--interval-secs`.
@@ -370,7 +444,7 @@ mod tests {
         // exercise the parse + merge through a temp file.
         assert_eq!(file.bind.as_deref(), Some("0.0.0.0:9000"));
         assert_eq!(file.host.len(), 2);
-        assert_eq!(file.host[1].docker, "https://nas.lan:2375");
+        assert_eq!(file.host[1].docker.as_deref(), Some("https://nas.lan:2375"));
         assert!(file.host[1].tls_insecure);
         // The per-host interval is parsed; an omitted one stays None.
         assert_eq!(file.host[1].interval_secs, Some(15));
@@ -380,11 +454,22 @@ mod tests {
     fn host_with(docker: &str, interval_secs: Option<u64>) -> HostConfig {
         HostConfig {
             name: "h".into(),
-            docker: docker.into(),
+            docker: Some(docker.into()),
+            dockdoe: None,
+            token: None,
+            node_host: None,
             public_host: None,
             interval_secs,
             tls_ca: None,
             tls_insecure: false,
+        }
+    }
+
+    fn node_with(dockdoe: &str) -> HostConfig {
+        HostConfig {
+            docker: None,
+            dockdoe: Some(dockdoe.into()),
+            ..host_with("", None)
         }
     }
 
@@ -416,6 +501,48 @@ mod tests {
     }
 
     #[test]
+    fn node_endpoints_validate() {
+        // A federated node is a valid host on its own, counts as remote for
+        // the interval default, and reports its endpoint URL.
+        let node = node_with("https://dockdoe1.example:8080");
+        assert!(node.is_node());
+        assert_eq!(node.endpoint_url(), "https://dockdoe1.example:8080");
+        assert_eq!(
+            node.effective_interval_secs(3),
+            REMOTE_DEFAULT_INTERVAL_SECS
+        );
+        assert!(validate_hosts(&[node]).is_ok());
+
+        // Scheme is restricted to http(s) — a node is a web API, not a socket.
+        assert!(validate_hosts(&[node_with("tcp://n:8080")]).is_err());
+
+        // Exactly one endpoint kind per host.
+        let both = HostConfig {
+            dockdoe: Some("https://n:8080".into()),
+            ..host_with("unix:///x", None)
+        };
+        assert!(validate_hosts(&[both]).is_err());
+        let neither = HostConfig {
+            docker: None,
+            ..host_with("", None)
+        };
+        assert!(validate_hosts(&[neither]).is_err());
+
+        // token/node_host make no sense on a Docker endpoint …
+        let stray = HostConfig {
+            token: Some("t".into()),
+            ..host_with("unix:///x", None)
+        };
+        assert!(validate_hosts(&[stray]).is_err());
+        // … and an empty token is a misconfiguration, not "no token".
+        let blank = HostConfig {
+            token: Some("  ".into()),
+            ..node_with("https://n:8080")
+        };
+        assert!(validate_hosts(&[blank]).is_err());
+    }
+
+    #[test]
     fn slug_validation() {
         assert!(is_valid_slug("local"));
         assert!(is_valid_slug("nas-01.lan_2"));
@@ -429,19 +556,11 @@ mod tests {
         let hosts = vec![
             HostConfig {
                 name: "dup".into(),
-                docker: "unix:///x".into(),
-                public_host: None,
-                interval_secs: None,
-                tls_ca: None,
-                tls_insecure: false,
+                ..host_with("unix:///x", None)
             },
             HostConfig {
                 name: "dup".into(),
-                docker: "tcp://y:2375".into(),
-                public_host: None,
-                interval_secs: None,
-                tls_ca: None,
-                tls_insecure: false,
+                ..host_with("tcp://y:2375", None)
             },
         ];
         assert!(validate_hosts(&hosts).is_err());
@@ -449,15 +568,7 @@ mod tests {
 
     #[test]
     fn empty_endpoint_is_rejected() {
-        let hosts = vec![HostConfig {
-            name: "x".into(),
-            docker: "   ".into(),
-            public_host: None,
-            interval_secs: None,
-            tls_ca: None,
-            tls_insecure: false,
-        }];
-        assert!(validate_hosts(&hosts).is_err());
+        assert!(validate_hosts(&[host_with("   ", None)]).is_err());
     }
 
     #[test]

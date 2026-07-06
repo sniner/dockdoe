@@ -1026,7 +1026,12 @@ fn parse_health(status: &str) -> HealthState {
 /// - `https://…` → TLS with server-certificate verification only (no client
 ///   cert); see [`tls_client_config`].
 fn connect_endpoint(cfg: &HostConfig) -> Result<Docker> {
-    let url = cfg.docker.trim();
+    // Callers branch on the endpoint kind first; a federated node never gets here.
+    let url = cfg
+        .docker
+        .as_deref()
+        .context("host has no Docker endpoint (it is a federated dockdoe node)")?
+        .trim();
     let docker = if url.starts_with("unix://") || url.starts_with('/') {
         Docker::connect_with_unix(url, CONNECT_TIMEOUT, API_DEFAULT_VERSION)
             .with_context(|| format!("connecting to Docker socket {url}"))?

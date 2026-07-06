@@ -11,6 +11,7 @@ mod auth;
 mod collector;
 mod config;
 mod docker;
+mod federation;
 mod model;
 mod notify;
 mod store;
@@ -25,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::collector::Config;
@@ -189,6 +190,19 @@ async fn main() -> Result<()> {
     let mut host_order = Vec::with_capacity(cfg.hosts.len());
     for host_cfg in &cfg.hosts {
         let name = host_cfg.name.clone();
+
+        // A federated node: reached over its DockDoe API, not the Docker
+        // socket. Resolve and log it; serving it arrives with the federation
+        // collector (M3).
+        if host_cfg.is_node() {
+            probe_federated_node(host_cfg).await?;
+            warn!(
+                host = %name,
+                "federated hosts are not served yet (federation is under construction); skipping"
+            );
+            continue;
+        }
+
         let docker = DockerClient::connect_from(host_cfg)
             .with_context(|| format!("connecting to host {name:?}"))?;
         let docker_handle = DockerHandle::connect_from(host_cfg)
@@ -198,17 +212,7 @@ async fn main() -> Result<()> {
         let cpu_count = docker.cpu_count().await;
         let shared = Arc::new(RwLock::new(None));
 
-        // Per-host sampling interval: an explicit `interval_secs` wins, else a
-        // local endpoint uses the global default and a remote one the slower
-        // remote default (polling a socket proxy over the network is costly).
-        let interval_secs = host_cfg.effective_interval_secs(cfg.interval_secs);
-        let collector_config = Config {
-            interval: Duration::from_secs(interval_secs),
-            raw_retention: Duration::from_secs(cfg.raw_retention_secs),
-            trend_bucket_secs: cfg.trend_bucket_secs,
-            trend_retention: Duration::from_secs(cfg.trend_retention_secs),
-            prune_interval: Duration::from_secs(cfg.prune_interval_secs),
-        };
+        let collector_config = collector_config(&cfg, host_cfg);
         // One notifier per host: its own state tracker, and the host's name
         // stamped onto every alert it sends.
         let notifier = cfg.apprise_url.as_ref().map(|url| {
@@ -229,7 +233,8 @@ async fn main() -> Result<()> {
             notifier,
         ));
 
-        let links = web::PortLinks::from_config(host_cfg.public_host.as_deref(), &host_cfg.docker);
+        let links =
+            web::PortLinks::from_config(host_cfg.public_host.as_deref(), host_cfg.endpoint_url());
         hosts.insert(
             name.clone(),
             web::HostRuntime {
@@ -274,6 +279,57 @@ async fn main() -> Result<()> {
             info!("shutdown signal received; exiting");
         }
     }
+    Ok(())
+}
+
+/// The collector settings for one host. The sampling interval is per host: an
+/// explicit `interval_secs` wins, else a local endpoint uses the global
+/// default and a remote one the slower remote default (polling over the
+/// network is costly); retention and trend settings are global.
+fn collector_config(cfg: &config::AppConfig, host_cfg: &config::HostConfig) -> Config {
+    Config {
+        interval: Duration::from_secs(host_cfg.effective_interval_secs(cfg.interval_secs)),
+        raw_retention: Duration::from_secs(cfg.raw_retention_secs),
+        trend_bucket_secs: cfg.trend_bucket_secs,
+        trend_retention: Duration::from_secs(cfg.trend_retention_secs),
+        prune_interval: Duration::from_secs(cfg.prune_interval_secs),
+    }
+}
+
+/// Resolve a federated node at startup and log what it reports — which host
+/// we'll mirror, its DockDoe version, and its current container count. Only a
+/// broken *local* setup (bad token characters) is fatal; a node that's down
+/// merely warns, since the poll loop will keep retrying once it serves.
+async fn probe_federated_node(host_cfg: &config::HostConfig) -> Result<()> {
+    let name = &host_cfg.name;
+    let client = federation::NodeClient::from_config(host_cfg)
+        .with_context(|| format!("building the node client for host {name:?}"))?;
+    let entry = match client
+        .resolve_node_host(host_cfg.node_host.as_deref())
+        .await
+    {
+        Ok(entry) => entry,
+        Err(e) => {
+            // `:#` prints the whole context chain — a wrong token, a TLS
+            // problem and an unreachable host all need different fixes.
+            warn!(host = %name, error = %format!("{e:#}"), "federated node not reachable yet");
+            return Ok(());
+        }
+    };
+    let containers = client
+        .snapshot(&entry.name)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.dashboard.containers.len());
+    info!(
+        host = %name,
+        node = %host_cfg.endpoint_url(),
+        node_host = %entry.name,
+        node_version = %entry.version,
+        containers = ?containers,
+        "federated node resolved"
+    );
     Ok(())
 }
 
