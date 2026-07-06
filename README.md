@@ -132,15 +132,19 @@ dockdoe = "https://nas.example:8080"   # the node's DockDoe
 token   = "…"                          # the node's api_token
 # node_host = "local"                  # which of the node's hosts to mirror;
 #                                      # only needed when the node has several
-# interval_secs = 10                   # snapshot poll interval (default 10)
+# interval_secs = 10                   # reconnect/fallback-poll pacing (default 10)
 # tls_ca / tls_insecure                # as for https docker endpoints
 ```
 
-The hub polls the node's snapshot API and serves the host like any local one:
-dashboard, overview discs, live updates, logs, the compose tab,
+The hub subscribes to the node's snapshot event stream — one hub-initiated,
+long-lived connection over which the node pushes every sample as it collects
+it — and serves the host like any local one: dashboard, overview discs, live
+updates (as live as on the node itself), logs, the compose tab,
 start/stop/restart and the container [terminal](#terminal) (bridged through
 the hub) all work. Chart history comes straight from the **node's** database,
-so it spans the node's full retention — with no gaps from hub downtime.
+so it spans the node's full retention — with no gaps from hub downtime. A
+node too old for the stream (0.10/0.11) is polled every `interval_secs`
+instead.
 
 Why this is the recommended way:
 
@@ -220,7 +224,8 @@ compose files are mounted on the hub's machine at the same path.
   global `--interval-secs` for it alone. Unset, a local (`unix`) endpoint uses
   the global interval (default `3`) while a remote one (proxy or node)
   defaults to `10` — polling over the network is costlier than reading the
-  local socket
+  local socket. For a `dockdoe` node the live data streams anyway; this only
+  paces reconnects (and the polling fallback for pre-0.12 nodes)
 - **`tls_ca`** — a PEM CA certificate to trust for an `https` endpoint
 - **`tls_insecure`** — skip TLS verification for an `https` endpoint (handy for a
   self-signed reverse proxy; prefer `tls_ca` when you can)

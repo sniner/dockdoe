@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
+use futures_util::StreamExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::collector::{SharedDashboard, publish};
@@ -53,6 +54,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// TCP/TLS connect deadline, kept shorter than [`REQUEST_TIMEOUT`] so an
 /// unreachable node fails fast.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Per-request timeout override for the snapshot event stream — long-lived by
+/// design, so the client-wide [`REQUEST_TIMEOUT`] must not apply. One day, not
+/// infinity: a periodic clean reconnect costs nothing (snapshots are deduped
+/// and the last one is kept) and clears any half-dead connection state.
+#[allow(clippy::duration_suboptimal_units)]
+const STREAM_SESSION_MAX: Duration = Duration::from_secs(24 * 3600);
+
+/// How long the event stream may stay silent before the hub declares it dead
+/// and reconnects. The node keep-alives every ~15 s, so a minute of silence
+/// means the TCP connection is gone without a FIN (node powered off, NAT
+/// dropped the mapping).
+// Same stable-toolchain trade-off as the other Duration constants.
+#[allow(clippy::duration_suboptimal_units)]
+const STREAM_STALL: Duration = Duration::from_secs(60);
 
 /// HTTP client for one federated node.
 #[derive(Clone)]
@@ -248,6 +264,19 @@ impl NodeClient {
         Ok((status, body))
     }
 
+    /// Open the node's snapshot event stream (`GET /host/{nh}/api/events`).
+    /// The response body is a long-lived SSE stream; the per-request timeout
+    /// override keeps the client-wide deadline from killing it.
+    async fn snapshot_events(&self, node_host: &str) -> Result<reqwest::Response> {
+        self.http
+            .get(format!("{}/host/{node_host}/api/events", self.base))
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .timeout(STREAM_SESSION_MAX)
+            .send()
+            .await
+            .with_context(|| format!("opening the event stream of node {}", self.base))
+    }
+
     /// Chart points from the node (seed of the detail pages): its metrics
     /// endpoints serve the same `Vec<MetricPoint>` JSON the hub would read
     /// from its own store.
@@ -327,16 +356,19 @@ impl NodeClient {
     }
 }
 
-/// Run the federation poll loop forever for one hub host entry: fetch the
-/// node's snapshot every `interval` and publish it as this host's shared
-/// dashboard — the same slot a local collector would fill, so the dashboard,
-/// SSE streams and overview discs work unchanged.
+/// Run the federation loop forever for one hub host entry, publishing the
+/// node's snapshots as this host's shared dashboard — the same slot a local
+/// collector would fill, so the dashboard, SSE streams and overview discs
+/// work unchanged.
 ///
-/// The node host to mirror is (re)resolved inside the loop, so a node that is
-/// down at hub startup is simply retried. Errors keep the last snapshot, like
-/// a local collector losing its daemon: the header age shows the staleness,
-/// and the next successful poll recovers. `read_only` mirrors what the node
-/// reports each poll.
+/// Live data preferably arrives over the node's snapshot **event stream**
+/// (one long-lived connection, every sample as the node collects it); a node
+/// without the stream endpoint (pre-0.12) is **polled** every `interval`
+/// instead. The node host to mirror is (re)resolved inside the loop, so a
+/// node that is down at hub startup is simply retried; `interval` also paces
+/// reconnects and retries. Errors keep the last snapshot, like a local
+/// collector losing its daemon: the header age shows the staleness, and the
+/// next successful fetch recovers. `read_only` mirrors what the node reports.
 pub async fn run(
     host: String,
     client: NodeClient,
@@ -345,9 +377,11 @@ pub async fn run(
     shared: SharedDashboard,
     read_only: Arc<AtomicBool>,
 ) {
-    info!(host = %host, node = %client.base, interval = ?interval, "starting federation poll");
+    info!(host = %host, node = %client.base, interval = ?interval, "starting federation");
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Assume a modern node until it answers 404 for the stream endpoint.
+    let mut streaming = true;
     loop {
         ticker.tick().await;
         if client.node_host().is_none() {
@@ -374,6 +408,19 @@ pub async fn run(
             }
         }
         let target = client.node_host().expect("resolved above").to_string();
+
+        if streaming {
+            match consume_stream(&client, &target, &host, &shared, &read_only).await {
+                StreamEnd::Unsupported => {
+                    info!(host = %host, "node has no snapshot stream (pre-0.12); polling instead");
+                    streaming = false; // fall through to the poll below
+                }
+                // The ticker paces the reconnect (immediately after a
+                // long-lived session, a full interval after a quick failure).
+                StreamEnd::Disconnected => continue,
+            }
+        }
+
         match client.snapshot(&target).await {
             Ok(Some(snap)) => {
                 read_only.store(snap.read_only, Ordering::Relaxed);
@@ -384,6 +431,111 @@ pub async fn run(
                 warn!(host = %host, error = %format!("{e:#}"), "polling node failed; keeping last snapshot");
             }
         }
+    }
+}
+
+/// Why a streaming session ended.
+enum StreamEnd {
+    /// The node doesn't have the endpoint (404) — it predates it; poll instead.
+    Unsupported,
+    /// Connection failed, went silent, or closed; worth reconnecting.
+    Disconnected,
+}
+
+/// Consume the node's snapshot event stream until it ends: publish every
+/// `snapshot` event into the shared slot and mirror `read_only`. Returns why
+/// the session ended; transient errors are logged here.
+async fn consume_stream(
+    client: &NodeClient,
+    target: &str,
+    host: &str,
+    shared: &SharedDashboard,
+    read_only: &AtomicBool,
+) -> StreamEnd {
+    let resp = match client.snapshot_events(target).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(host = %host, error = %format!("{e:#}"), "connecting to node stream failed");
+            return StreamEnd::Disconnected;
+        }
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return StreamEnd::Unsupported;
+    }
+    if !resp.status().is_success() {
+        warn!(host = %host, status = %resp.status(), "node rejected the event stream");
+        return StreamEnd::Disconnected;
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut parser = SseParser::default();
+    loop {
+        match tokio::time::timeout(STREAM_STALL, stream.next()).await {
+            Err(_) => {
+                warn!(host = %host, "node stream went silent; reconnecting");
+                return StreamEnd::Disconnected;
+            }
+            Ok(None) => {
+                debug!(host = %host, "node stream closed; reconnecting");
+                return StreamEnd::Disconnected;
+            }
+            Ok(Some(Err(e))) => {
+                warn!(host = %host, error = %format!("{e:#}"), "node stream failed; reconnecting");
+                return StreamEnd::Disconnected;
+            }
+            Ok(Some(Ok(chunk))) => {
+                for (event, data) in parser.push(&chunk) {
+                    if event != "snapshot" {
+                        continue; // future event types: additive, ignorable
+                    }
+                    match serde_json::from_str::<Snapshot>(&data) {
+                        Ok(snap) => {
+                            read_only.store(snap.read_only, Ordering::Relaxed);
+                            publish(shared, snap.dashboard);
+                        }
+                        Err(e) => warn!(host = %host, %e, "undecodable snapshot event"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Minimal incremental parser for the SSE wire format: feed it chunks, get
+/// completed `(event, data)` pairs back. Handles events split across chunks,
+/// multi-line `data:` fields (joined with `\n` per spec), `\r\n` line ends,
+/// and ignores comment lines (the keep-alives) and unknown fields.
+#[derive(Default)]
+struct SseParser {
+    buf: String,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8]) -> Vec<(String, String)> {
+        // The payload is JSON (which escapes control characters, so a raw CR
+        // can only be a line ending) and SSE field names are ASCII — safe to
+        // normalise CRLF away and decode lossily.
+        self.buf
+            .push_str(&String::from_utf8_lossy(chunk).replace('\r', ""));
+        let mut out = Vec::new();
+        // An event ends at a blank line.
+        while let Some(pos) = self.buf.find("\n\n") {
+            let block: String = self.buf.drain(..pos + 2).collect();
+            let mut event = String::from("message");
+            let mut data: Vec<&str> = Vec::new();
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim_start().to_string();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data.push(v.strip_prefix(' ').unwrap_or(v));
+                }
+                // Anything else (comments, id:, retry:) is irrelevant here.
+            }
+            if !data.is_empty() {
+                out.push((event, data.join("\n")));
+            }
+        }
+        out
     }
 }
 
@@ -443,6 +595,28 @@ mod tests {
             name: name.into(),
             version: "0.10.0".into(),
         }
+    }
+
+    #[test]
+    fn sse_parser_handles_chunking_comments_and_multiline_data() {
+        let mut p = SseParser::default();
+        // A keep-alive comment alone yields nothing.
+        assert!(p.push(b": keep-alive\n\n").is_empty());
+        // An event split across arbitrary chunk boundaries comes out whole.
+        assert!(p.push(b"event: snap").is_empty());
+        assert!(p.push(b"shot\ndata: {\"a\":").is_empty());
+        let events = p.push(b"1}\n\n");
+        assert_eq!(events, vec![("snapshot".into(), "{\"a\":1}".into())]);
+        // CRLF line endings, multi-line data (joined with \n), default event
+        // name, and two events in one chunk.
+        let events = p.push(b"data: x\r\ndata: y\r\n\r\nevent: e2\ndata: z\n\n");
+        assert_eq!(
+            events,
+            vec![("message".into(), "x\ny".into()), ("e2".into(), "z".into())]
+        );
+        // Unknown fields are ignored, remainder stays buffered.
+        assert!(p.push(b"id: 7\nretry: 100\ndata: tail").is_empty());
+        assert_eq!(p.push(b"\n\n"), vec![("message".into(), "tail".into())]);
     }
 
     #[test]

@@ -11,6 +11,11 @@ All notable, user-facing changes to DockDoe. The format is based on
   dials the node's exec WebSocket itself — authenticated with the host's `token`, which a
   browser couldn't attach — and relays the frames, so the browser only ever talks to the hub
   and no longer needs to reach (or log in to) the node
+- **Live streaming for federated hosts**: instead of polling every `interval_secs`, the hub now
+  subscribes to the node's new snapshot event stream (`GET /host/{host}/api/events`, SSE) and
+  receives every sample the moment the node collects it — a federated host is as live on the
+  hub as on the node itself, over a single connection. Nodes without the endpoint (0.10/0.11)
+  are detected and polled as before; `interval_secs` then paces reconnects and the fallback
 
 ## [0.11.0] — 2026-07-06
 

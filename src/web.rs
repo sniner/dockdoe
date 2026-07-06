@@ -182,6 +182,7 @@ pub fn router(state: AppState) -> Router {
         .route("/host/{host}/api/history/stack/{name}", get(history_stack))
         .route("/api/hosts", get(api_hosts))
         .route("/host/{host}/api/snapshot", get(api_snapshot))
+        .route("/host/{host}/api/events", get(api_events))
         .route(
             "/host/{host}/api/container/{id}/{action}",
             axum::routing::post(container_action).layer(middleware::from_fn(require_htmx)),
@@ -557,6 +558,30 @@ async fn api_snapshot(
         dashboard,
     })
     .into_response()
+}
+
+/// `GET /host/{host}/api/events` — the snapshot as a JSON SSE stream, for a
+/// federation hub: a `snapshot` event with the same payload as
+/// [`api_snapshot`], pushed the moment a fresh snapshot lands. Spares the hub
+/// polling and keeps a federated host as live as a local one.
+async fn api_events(
+    State(state): State<AppState>,
+    axum::extract::Path(host): axum::extract::Path<String>,
+) -> Response {
+    let Some(rt) = state.hosts.get(&host) else {
+        return (StatusCode::NOT_FOUND, "unknown host").into_response();
+    };
+    let read_only = Arc::clone(&rt.read_only);
+    let stream = dashboard_stream(rt.shared.clone()).map(move |dash| {
+        Event::default().event("snapshot").json_data(Snapshot {
+            version: VERSION.to_string(),
+            read_only: read_only.load(Ordering::Relaxed),
+            dashboard: (*dash).clone(),
+        })
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// The landing page at `/`. With a single host it redirects straight to that

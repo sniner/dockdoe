@@ -23,7 +23,7 @@ hmac = "0.12.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 maud = { version = "0.27.0", features = ["axum"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 rust-embed = "8.11.0"
 rustls = "0.23"
