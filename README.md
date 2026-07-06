@@ -137,11 +137,10 @@ token   = "…"                          # the node's api_token
 ```
 
 The hub polls the node's snapshot API and serves the host like any local one:
-dashboard, overview discs, live updates, logs, the compose tab and
-start/stop/restart all work. Chart history comes straight from the **node's**
-database, so it spans the node's full retention — with no gaps from hub
-downtime. The one exception is the container [terminal](#terminal), which
-links out to the node's own UI instead of being bridged through the hub.
+dashboard, overview discs, live updates, logs, the compose tab,
+start/stop/restart and the container [terminal](#terminal) (bridged through
+the hub) all work. Chart history comes straight from the **node's** database,
+so it spans the node's full retention — with no gaps from hub downtime.
 
 Why this is the recommended way:
 
@@ -309,10 +308,10 @@ location / {
 }
 ```
 
-On a [federated](#multiple-hosts) host the terminal is not bridged through the
-hub — the panel links to the container on the node's own UI instead, so your
-browser needs to reach the node (and log in there, if its UI has
-authentication).
+On a [federated](#multiple-hosts) host the terminal works too: the hub dials
+the node's exec WebSocket itself — authenticated with the host's `token`,
+which a browser couldn't attach — and relays the frames, so your browser only
+ever talks to the hub.
 
 ### Port links
 

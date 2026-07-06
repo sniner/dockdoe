@@ -811,19 +811,93 @@ async fn ws_exec(
     let Some(rt) = state.hosts.get(&host) else {
         return (StatusCode::NOT_FOUND, "unknown host").into_response();
     };
-    let HostSource::Docker(docker) = &rt.source else {
-        // The terminal is not bridged through the hub; the detail page links
-        // to the node's own UI instead.
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "terminal is not bridged for federated hosts; open it on the node",
-        )
-            .into_response();
-    };
     let cmd = q.cmd.unwrap_or_default();
-    let docker = docker.clone();
     let read_only = Arc::clone(&rt.read_only);
-    ws.on_upgrade(move |socket| exec_bridge(socket, docker, host, id, cmd, read_only))
+    match &rt.source {
+        HostSource::Docker(docker) => {
+            let docker = docker.clone();
+            ws.on_upgrade(move |socket| exec_bridge(socket, docker, host, id, cmd, read_only))
+        }
+        HostSource::Node(node) => {
+            let node = node.clone();
+            ws.on_upgrade(move |socket| {
+                federated_exec_bridge(socket, node, host, id, cmd, read_only)
+            })
+        }
+    }
+}
+
+/// Bridge the browser's terminal WebSocket to the node's exec WebSocket. The
+/// hub dials the node itself (it can attach the bearer token; a browser
+/// can't) and then just relays frames: stdin/stdout stay binary, the resize
+/// JSON stays text — the same protocol on both legs, nothing to translate.
+async fn federated_exec_bridge(
+    mut socket: WebSocket,
+    node: NodeClient,
+    host: String,
+    id: String,
+    cmd: String,
+    read_only: Arc<AtomicBool>,
+) {
+    use tokio_tungstenite::tungstenite::Message as NodeMessage;
+
+    let upstream = match node.exec_socket(&id, &cmd).await {
+        Ok(upstream) => upstream,
+        Err(err) => {
+            // The node denying the upgrade latches read-only, mirroring a
+            // socket proxy denying exec.
+            if crate::federation::ws_denied(&err) && !read_only.swap(true, Ordering::Relaxed) {
+                tracing::warn!(%host, "node denied exec; marking host read-only");
+            }
+            tracing::warn!(%host, %id, error = %format!("{err:#}"), "opening node terminal failed");
+            let msg =
+                format!("\r\n\x1b[31mfailed to reach the node's terminal: {err:#}\x1b[0m\r\n");
+            let _ = socket.send(Message::Text(msg.into())).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    let (mut node_tx, mut node_rx) = upstream.split();
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Node → browser: terminal output. Ping/pong stays leg-local (each
+    // library answers its own); a close ends the loop.
+    let to_client = async {
+        while let Some(Ok(msg)) = node_rx.next().await {
+            let out = match msg {
+                NodeMessage::Binary(bytes) => Message::Binary(bytes),
+                NodeMessage::Text(text) => Message::Text(text.as_str().into()),
+                NodeMessage::Close(_) => break,
+                _ => continue,
+            };
+            if ws_tx.send(out).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // Browser → node: stdin bytes and resize JSON, relayed unchanged.
+    let from_client = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let fwd = match msg {
+                Message::Binary(bytes) => NodeMessage::Binary(bytes),
+                Message::Text(text) => NodeMessage::Text(text.as_str().into()),
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            if node_tx.send(fwd).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // Whichever side ends first tears down the other: dropping the node half
+    // closes the upstream socket (ending the exec on the node), dropping the
+    // browser half ends the page's session.
+    tokio::select! {
+        () = to_client => {},
+        () = from_client => {},
+    }
 }
 
 /// Bridge a WebSocket to a container exec session: engine output → client
@@ -1202,12 +1276,6 @@ async fn container_detail(
         );
         return (StatusCode::NOT_FOUND, body).into_response();
     };
-    // On a federated host the terminal panel deep-links to the node's UI.
-    let node_url = match &rt.source {
-        HostSource::Node(node) => node.container_url(&id),
-        HostSource::Docker(_) => None,
-    };
-
     let since = now_unix_ms().saturating_sub(duration_ms(state.seed_window));
     let seed = match &rt.source {
         HostSource::Docker(_) => {
@@ -1232,7 +1300,7 @@ async fn container_detail(
         &state,
         &host,
         snapshot.as_ref(),
-        container_detail_main(&container, &r, node_url.as_deref()),
+        container_detail_main(&container, &r),
         &seed,
         &live_url,
         &backfill_url,
@@ -1793,7 +1861,7 @@ fn io_chart_card(title: &str, key: &str, in_label: &str, out_label: &str) -> Mar
 }
 
 /// Body of a single-container detail page.
-fn container_detail_main(c: &ContainerMetrics, r: &Render, node_url: Option<&str>) -> Markup {
+fn container_detail_main(c: &ContainerMetrics, r: &Render) -> Markup {
     let host = r.host;
     html! {
         section.detail-head {
@@ -1822,7 +1890,7 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render, node_url: Option<&str
                 hx-get=(format!("/host/{host}/api/container/{}/logs", c.id))
                 hx-trigger="load" hx-swap="innerHTML" { "Loading logs…" }
         }
-        (terminal_panel(c, host, r.read_only, node_url))
+        (terminal_panel(c, host, r.read_only))
     }
 }
 
@@ -1830,27 +1898,7 @@ fn container_detail_main(c: &ContainerMetrics, r: &Render, node_url: Option<&str
 /// so we don't spawn one on every page view) and only for running containers;
 /// `terminal.js` opens the WebSocket on "Connect". The `⛶` button toggles a
 /// fullscreen class on the panel. Stopped containers get a disabled note.
-fn terminal_panel(
-    c: &ContainerMetrics,
-    host: &str,
-    read_only: bool,
-    node_url: Option<&str>,
-) -> Markup {
-    // On a federated host the terminal is not bridged through the hub; link
-    // to the node's own UI, which has the interactive terminal.
-    if let Some(url) = node_url {
-        return html! {
-            section.panel.terminal id="terminal" {
-                div.panel-head {
-                    h3 { "Terminal" }
-                }
-                p.empty {
-                    "The terminal runs on the node — "
-                    a href=(url) target="_blank" rel="noopener" { "open this container there ↗" }
-                }
-            }
-        };
-    }
+fn terminal_panel(c: &ContainerMetrics, host: &str, read_only: bool) -> Markup {
     let interactive = c.state == ContainerState::Running && !read_only;
     html! {
         section.panel.terminal id="terminal" data-ws=(format!("/host/{host}/ws/container/{}/exec", c.id)) {

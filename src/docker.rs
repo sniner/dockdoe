@@ -1081,7 +1081,7 @@ fn connect_https(url: &str, cfg: &HostConfig) -> Result<Docker> {
 /// `webpki-root-certs`, optionally plus a private CA from `tls_ca`. `tls_insecure`
 /// swaps verification for a no-op verifier — convenient for self-signed reverse
 /// proxies, but it accepts any certificate, so prefer `tls_ca` when you can.
-fn tls_client_config(tls_ca: Option<&Path>, tls_insecure: bool) -> Result<ClientConfig> {
+pub(crate) fn tls_client_config(tls_ca: Option<&Path>, tls_insecure: bool) -> Result<ClientConfig> {
     // Pin the crypto provider explicitly rather than relying on a process-wide
     // default, which may or may not have been installed by another TLS user
     // (reqwest) depending on link order.

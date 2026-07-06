@@ -401,6 +401,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",

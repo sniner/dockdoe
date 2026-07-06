@@ -3,6 +3,15 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Terminal on federated hosts**: the container terminal now works through the hub. The hub
+  dials the node's exec WebSocket itself — authenticated with the host's `token`, which a
+  browser couldn't attach — and relays the frames, so the browser only ever talks to the hub
+  and no longer needs to reach (or log in to) the node
+
 ## [0.11.0] — 2026-07-06
 
 ### Added

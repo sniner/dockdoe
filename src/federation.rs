@@ -17,10 +17,30 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tracing::{debug, info, warn};
 
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
 use crate::collector::{SharedDashboard, publish};
 use crate::config::HostConfig;
 use crate::model::{HostEntry, Snapshot};
 use crate::store::MetricPoint;
+
+/// The byte stream under the node-side WebSocket: plain TCP or TLS.
+pub trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+/// The hub's client end of a node's exec WebSocket.
+pub type NodeWebSocket = tokio_tungstenite::WebSocketStream<Box<dyn AsyncStream>>;
+
+/// Whether an [`NodeClient::exec_socket`] error was the node *denying* the
+/// upgrade (401/403 — bad token, or the node latched read-only) rather than a
+/// transport problem.
+pub fn ws_denied(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+        Some(tokio_tungstenite::tungstenite::Error::Http(resp))
+            if matches!(resp.status().as_u16(), 401 | 403)
+    )
+}
 
 /// This build's version, for skew warnings against a node's reported version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,6 +63,13 @@ pub struct NodeClient {
     /// The node-side host name this entry mirrors, set by the poll loop once
     /// resolved. Shared across clones so the web layer sees it too.
     node_host: Arc<OnceLock<String>>,
+    /// `Authorization: Bearer …`, for the connections we dial ourselves (the
+    /// terminal WebSocket); the reqwest client carries its own copy.
+    auth_header: Option<reqwest::header::HeaderValue>,
+    /// TLS config for self-dialed connections on an `https` node, sharing the
+    /// trust model (and `tls_ca`/`tls_insecure`) with the rest of the app.
+    /// `None` for a plain-`http` node.
+    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl NodeClient {
@@ -58,13 +85,28 @@ impl NodeClient {
             .trim_end_matches('/')
             .to_string();
 
+        let auth_header = cfg
+            .token
+            .as_deref()
+            .map(|token| {
+                format!("Bearer {token}")
+                    .parse::<reqwest::header::HeaderValue>()
+                    .context("token contains characters not allowed in a header")
+            })
+            .transpose()?;
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(token) = cfg.token.as_deref() {
-            let value = format!("Bearer {token}")
-                .parse()
-                .context("token contains characters not allowed in a header")?;
-            headers.insert(reqwest::header::AUTHORIZATION, value);
+        if let Some(value) = &auth_header {
+            headers.insert(reqwest::header::AUTHORIZATION, value.clone());
         }
+
+        // For the connections we dial ourselves (the terminal WebSocket).
+        let tls = base
+            .starts_with("https://")
+            .then(|| {
+                crate::docker::tls_client_config(cfg.tls_ca.as_deref(), cfg.tls_insecure)
+                    .map(Arc::new)
+            })
+            .transpose()?;
 
         let mut builder = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -100,6 +142,8 @@ impl NodeClient {
                 .context("building the HTTP client for the federated node")?,
             base,
             node_host: Arc::new(OnceLock::new()),
+            auth_header,
+            tls,
         })
     }
 
@@ -109,11 +153,63 @@ impl NodeClient {
         self.node_host.get().map(String::as_str)
     }
 
-    /// The node's UI page for one of its containers, for deep links (e.g. the
-    /// terminal, which is not bridged through the hub).
-    pub fn container_url(&self, id: &str) -> Option<String> {
-        let nh = self.node_host()?;
-        Some(format!("{}/host/{nh}/container/{id}", self.base))
+    /// Open the node's exec WebSocket for a container — the upstream side of
+    /// the hub's terminal bridge. Dials the node ourselves (TCP, plus rustls
+    /// for an `https` node) because a browser can't attach the bearer token to
+    /// a WebSocket, but we can.
+    pub async fn exec_socket(&self, id: &str, cmd: &str) -> Result<NodeWebSocket> {
+        let nh = self
+            .node_host()
+            .context("node not resolved yet (unreachable since startup)")?;
+        let base: reqwest::Url = self
+            .base
+            .parse()
+            .with_context(|| format!("invalid node URL {}", self.base))?;
+        let host = base.host_str().context("node URL has no host")?;
+        let port = base
+            .port_or_known_default()
+            .context("node URL has no port")?;
+
+        let tcp = tokio::net::TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("connecting to node {host}:{port}"))?;
+        let stream: Box<dyn AsyncStream> = match &self.tls {
+            Some(tls) => {
+                let server = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .with_context(|| format!("invalid TLS server name {host:?}"))?;
+                Box::new(
+                    tokio_rustls::TlsConnector::from(Arc::clone(tls))
+                        .connect(server, tcp)
+                        .await
+                        .with_context(|| format!("TLS handshake with node {host}:{port}"))?,
+                )
+            }
+            None => Box::new(tcp),
+        };
+
+        let mut url = base;
+        // http→ws / https→wss; both are valid schemes, so set_scheme can't fail.
+        let scheme = if self.tls.is_some() { "wss" } else { "ws" };
+        url.set_scheme(scheme)
+            .map_err(|()| anyhow::anyhow!("cannot make a WebSocket URL from {}", self.base))?;
+        url.set_path(&format!("/host/{nh}/ws/container/{id}/exec"));
+        if !cmd.is_empty() {
+            url.query_pairs_mut().append_pair("cmd", cmd);
+        }
+
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .context("building the WebSocket handshake request")?;
+        if let Some(auth) = &self.auth_header {
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, auth.clone());
+        }
+        let (ws, _response) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .with_context(|| format!("WebSocket handshake with node {}", self.base))?;
+        Ok(ws)
     }
 
     /// Forward a GET to the node's same-shaped, host-scoped endpoint:
