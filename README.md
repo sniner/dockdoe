@@ -21,7 +21,8 @@ single row.
 Drill into a container (live CPU/memory charts, facts, logs) or a whole stack
 (aggregate charts, the compose.yml, start/stop/restart-all), and start, stop or
 restart containers right from the UI. Point it at one Docker host or
-[several](#multiple-hosts) — local socket or remote socket proxies.
+[several](#multiple-hosts) — preferably by running one DockDoe per host and
+federating them into a hub, or via remote socket proxies.
 
 ## Run
 
@@ -100,18 +101,83 @@ also reads from an environment variable; the flag wins when both are set.
 ### Multiple hosts
 
 Without a config file DockDoe monitors a single local host (the socket above).
-To watch several hosts — or a remote one — point `--config` / `DOCKDOE_CONFIG`
-at a `config.toml` whose `[[host]]` entries each describe one Docker host:
+To watch several hosts, point `--config` / `DOCKDOE_CONFIG` at a `config.toml`
+whose `[[host]]` entries each describe one Docker host. Each host gets its own
+dashboard under `/host/<name>`; `/` lists them (and redirects straight through
+when there's only one). Global options (same names as the env vars, minus the
+`DOCKDOE_` prefix) may go in the file too; anything omitted falls back to the
+flags/environment.
+
+There are two ways to reach a remote host, and they mix freely in one config:
+**federation** — run DockDoe on the host itself and aggregate it here
+(recommended) — or a **Docker socket proxy**.
+
+#### Federation: one DockDoe per host (recommended)
+
+Run a DockDoe on every Docker host — each with its local socket, its own
+database and its own web UI — and give each an `api_token`
+(see [Authentication](#authentication)). Then make one instance the hub by
+listing the others as `dockdoe` hosts:
 
 ```toml
-# Global options (same names as the env vars, minus the DOCKDOE_ prefix) may go
-# here too; anything omitted falls back to the flags/environment.
 bind = "0.0.0.0:8080"
 
 [[host]]
 name   = "local"                       # display name + URL slug, must be unique
-docker = "unix:///var/run/docker.sock" # the local socket
+docker = "unix:///var/run/docker.sock" # the hub's own local socket
 
+[[host]]
+name    = "nas"
+dockdoe = "https://nas.example:8080"   # the node's DockDoe
+token   = "…"                          # the node's api_token
+# node_host = "local"                  # which of the node's hosts to mirror;
+#                                      # only needed when the node has several
+# interval_secs = 10                   # snapshot poll interval (default 10)
+# tls_ca / tls_insecure                # as for https docker endpoints
+```
+
+The hub polls the node's snapshot API and serves the host like any local one:
+dashboard, overview discs, live updates, logs, the compose tab and
+start/stop/restart all work. Chart history comes straight from the **node's**
+database, so it spans the node's full retention — with no gaps from hub
+downtime. The one exception is the container [terminal](#terminal), which
+links out to the node's own UI instead of being bridged through the hub.
+
+Why this is the recommended way:
+
+- **The Docker socket never crosses the network.** All that's exposed is
+  DockDoe's own small, token-authenticated HTTP API — not the Docker API,
+  which is effectively root on the host.
+- **History is decentralised.** Every node keeps collecting into its own
+  database whether the hub is running or not; the hub stores nothing for it,
+  so there is nothing to sync, back-fill or lose.
+- **Every host stays usable on its own.** Each node is a full DockDoe with
+  its own UI — the hub going down takes nothing else with it.
+- **The compose tab just works** — the node reads the file from its own
+  filesystem, no mounts needed on the hub.
+
+The tradeoffs, honestly: you run and update one DockDoe per host instead of
+one proxy container, and each node holds the full Docker socket locally —
+a strictly filtered, read-only socket proxy exposes *fewer* capabilities
+(though it exposes them over the network). Notifications for a federated host
+come from the node itself — whoever collects, notifies — so configure
+[Apprise](#notifications) on the node, not on the hub.
+
+Nodes need DockDoe ≥ 0.10 (the hub side needs ≥ 0.11). The API between them
+only ever grows, so hub and nodes don't have to be updated in lockstep — but
+keep them reasonably close; the hub logs a warning on version skew. Plain
+`http://` endpoints work too, but the token then travels readable on the
+wire: fine on a trusted LAN or over Tailscale, not elsewhere.
+
+#### Docker socket proxy
+
+A socket proxy (e.g.
+[`linuxserver/socket-proxy`](https://docs.linuxserver.io/images/docker-socket-proxy/))
+is a small container that republishes the host's `/var/run/docker.sock` over
+TCP, usually filtered to a subset of the Docker API. DockDoe then talks to
+the Docker daemon through it:
+
+```toml
 [[host]]
 name          = "nas"
 docker        = "tcp://nas.lan:2375"   # a linuxserver/tecnativa socket proxy
@@ -125,29 +191,40 @@ docker = "https://dockerproxy.example:2376"  # TLS-fronted proxy
 # tls_insecure = true                   # or skip verification entirely
 ```
 
-Each host gets its own dashboard under `/host/<name>`; `/` lists them (and
-redirects straight through when there's only one). Per-host keys:
+Pick this when you'd rather not run DockDoe on the monitored host: the proxy
+is a single generic container, and it can be locked down hard — one that
+denies writes (e.g. `POST=0`) makes the host **read-only** in DockDoe, whose
+action buttons and terminal disable automatically the moment the proxy
+returns a 403.
 
-- **`docker`** — the endpoint: `unix:///path` (local socket), `tcp://host:port`
-  or `http://host:port` (a plain socket proxy, e.g.
-  [`linuxserver/socket-proxy`](https://docs.linuxserver.io/images/docker-socket-proxy/),
-  best kept on a trusted network or behind Tailscale), or `https://host:port`
-  (TLS — verified against the built-in roots, plus `tls_ca`, or `tls_insecure`)
+The tradeoffs: the Docker API travels the network — root-equivalent even when
+filtered, so keep it on a trusted network, behind TLS or Tailscale. All data
+for the host is collected and stored *by the hub*, so hub downtime leaves
+gaps in its history. And the **compose.yml** tab only works if the host's
+compose files are mounted on the hub's machine at the same path.
+
+#### Per-host keys
+
+- **`docker`** — a Docker endpoint: `unix:///path` (local socket),
+  `tcp://host:port` or `http://host:port` (a plain socket proxy), or
+  `https://host:port` (TLS — verified against the built-in roots, plus
+  `tls_ca`, or `tls_insecure`)
+- **`dockdoe`** — alternatively, a federated node's base URL (`http://` or
+  `https://`); exactly one of `docker`/`dockdoe` per host
+- **`token`** — the bearer token for a `dockdoe` node (its `api_token`)
+- **`node_host`** — which of the node's hosts this entry mirrors; defaults to
+  its only host, mandatory when the node monitors several
 - **`public_host`** — the host the published-port pills link to (see
-  [Port links](#port-links)); defaults to the endpoint's host for `tcp`/`https`
+  [Port links](#port-links)); defaults to the endpoint's host for
+  `tcp`/`https`/`dockdoe`
 - **`interval_secs`** — seconds between samples for this host, overriding the
   global `--interval-secs` for it alone. Unset, a local (`unix`) endpoint uses
-  the global interval (default `3`) while a remote (`tcp`/`http`/`https`) one
-  defaults to `10` — polling a socket proxy over the network is far costlier
-  than reading the local socket
+  the global interval (default `3`) while a remote one (proxy or node)
+  defaults to `10` — polling over the network is costlier than reading the
+  local socket
 - **`tls_ca`** — a PEM CA certificate to trust for an `https` endpoint
 - **`tls_insecure`** — skip TLS verification for an `https` endpoint (handy for a
   self-signed reverse proxy; prefer `tls_ca` when you can)
-
-Remote hosts have two limits: the **compose.yml** tab only works for a host
-whose files are on the machine DockDoe runs on, and a proxy that denies actions
-or exec (returns 403) makes that host **read-only** — its action buttons and
-terminal are disabled automatically.
 
 ### Overview discs
 
@@ -232,6 +309,11 @@ location / {
 }
 ```
 
+On a [federated](#multiple-hosts) host the terminal is not bridged through the
+hub — the panel links to the container on the node's own UI instead, so your
+browser needs to reach the node (and log in there, if its UI has
+authentication).
+
 ### Port links
 
 Each published container port shows as a pill; the published ones are links that
@@ -274,6 +356,11 @@ To avoid alert storms from flapping, a new state must persist for
 reported — a container that restarts and recovers within that window stays
 quiet. The state seen at startup is adopted as the baseline, so DockDoe doesn't
 fire a burst when it boots.
+
+Whoever collects, notifies: a [federated](#multiple-hosts) host's containers
+are watched by its node, so configure Apprise there — the hub only notifies
+for the hosts it polls directly (local socket or socket proxy), and doesn't
+double up on the node's alerts.
 
 One known gap: state is tracked per container *id*, and the first sighting of
 an id is adopted silently (that's what keeps startups and deployments quiet).
