@@ -17,6 +17,13 @@ All notable, user-facing changes to DockDoe. The format is based on
   hub as on the node itself, over a single connection. Nodes without the endpoint (0.10/0.11)
   are detected and polled as before; `interval_secs` then paces reconnects and the fallback
 
+### Fixed
+
+- **History on federated hosts could time out**: the hub cut off forwarded requests (history,
+  logs, compose, chart seeds) after the 10 seconds its snapshot API calls use — a cold 30-day
+  history query on a node with modest disks takes longer, surfacing as "Could not load
+  history". Forwarded requests now get a minute; unreachable nodes still fail fast
+
 ## [0.11.0] — 2026-07-06
 
 ### Added

@@ -55,6 +55,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// unreachable node fails fast.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Per-request timeout override for the passthrough (history, logs, compose,
+/// chart seeds): a cold 30-day history query on a node with modest disks
+/// takes several seconds — [`REQUEST_TIMEOUT`] would cut it off at 10, which
+/// the browser (the real client here) would happily have waited out. The
+/// snapshot/poll path keeps the tight timeout; a stuck *connection* still
+/// fails fast via [`CONNECT_TIMEOUT`].
+#[allow(clippy::duration_suboptimal_units)]
+const PASSTHROUGH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Per-request timeout override for the snapshot event stream — long-lived by
 /// design, so the client-wide [`REQUEST_TIMEOUT`] must not apply. One day, not
 /// infinity: a periodic clean reconnect costs nothing (snapshots are deduped
@@ -243,6 +252,7 @@ impl NodeClient {
         }
         self.http
             .get(&url)
+            .timeout(PASSTHROUGH_TIMEOUT)
             .send()
             .await
             .with_context(|| format!("requesting {api_path} from node {}", self.base))
