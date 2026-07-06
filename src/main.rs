@@ -111,6 +111,12 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_COOKIE_SECURE", default_value_t = false)]
     cookie_secure: bool,
 
+    /// Shared-secret token for machine clients (a federation hub). Presented
+    /// as `Authorization: Bearer <token>`, it grants the same access as a
+    /// login session. Unset disables token access.
+    #[arg(long, env = "DOCKDOE_API_TOKEN")]
+    api_token: Option<String>,
+
     /// Host the published container ports are reachable at, used for the port
     /// pills' links. Unset: link to the host the browser uses (right when
     /// browsing DockDoe directly on the Docker host). Set to an IP/hostname when
@@ -163,24 +169,12 @@ async fn main() -> Result<()> {
         info!(hosts = ?allowed_hosts, "Host allowlist enabled (plus localhost forms)");
     }
 
-    // Authentication is opt-in: both credentials must be set. Exactly one set is
-    // almost certainly a misconfiguration, so fail loudly rather than silently
-    // leaving the UI open. Resolved before the hosts so the session secret read
-    // happens while the store is still ours to borrow.
-    let auth = match (cfg.auth_user.clone(), cfg.auth_password.clone()) {
-        (Some(user), Some(password)) => {
-            let secret = store.session_secret().context("loading session secret")?;
-            info!(
-                secure_cookie = cfg.cookie_secure,
-                "web UI authentication enabled"
-            );
-            Some(auth::Auth::new(user, password, secret, cfg.cookie_secure))
-        }
-        (None, None) => None,
-        _ => anyhow::bail!(
-            "set both DOCKDOE_AUTH_USER and DOCKDOE_AUTH_PASSWORD to enable authentication, or neither"
-        ),
-    };
+    let auth = build_auth(&cfg, &store)?;
+
+    let api_token = cfg.api_token.clone().map(auth::ApiToken::new);
+    if api_token.is_some() {
+        info!("API token access enabled");
+    }
 
     if cfg.apprise_url.is_some() {
         info!(
@@ -256,6 +250,7 @@ async fn main() -> Result<()> {
         seed_window,
         allowed_hosts,
         auth,
+        api_token,
         overview: cfg.overview,
     });
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
@@ -280,6 +275,33 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the optional web-UI login. Authentication is opt-in: both
+/// credentials must be set. Exactly one set is almost certainly a
+/// misconfiguration, so fail loudly rather than silently leaving the UI open.
+/// Called before the hosts are connected so the session-secret read happens
+/// while the store is still ours to borrow.
+fn build_auth(cfg: &config::AppConfig, store: &Store) -> Result<Option<auth::Auth>> {
+    match (cfg.auth_user.clone(), cfg.auth_password.clone()) {
+        (Some(user), Some(password)) => {
+            let secret = store.session_secret().context("loading session secret")?;
+            info!(
+                secure_cookie = cfg.cookie_secure,
+                "web UI authentication enabled"
+            );
+            Ok(Some(auth::Auth::new(
+                user,
+                password,
+                secret,
+                cfg.cookie_secure,
+            )))
+        }
+        (None, None) => Ok(None),
+        _ => anyhow::bail!(
+            "set both DOCKDOE_AUTH_USER and DOCKDOE_AUTH_PASSWORD to enable authentication, or neither"
+        ),
+    }
 }
 
 /// Resolves when the process is asked to stop: SIGTERM or SIGINT.

@@ -132,6 +132,43 @@ impl Auth {
     }
 }
 
+/// A shared-secret token for machine clients (a federation hub), presented as
+/// `Authorization: Bearer <token>`. Grants the same access as a login session
+/// but is checked per request — no cookie, no expiry.
+#[derive(Clone)]
+pub struct ApiToken {
+    token: String,
+}
+
+impl ApiToken {
+    #[must_use]
+    pub fn new(token: String) -> Self {
+        Self { token }
+    }
+
+    /// Constant-time check of a presented token. Like [`Auth::credentials_valid`],
+    /// both sides are reduced to fixed-length HMAC tags so the comparison leaks
+    /// neither length nor content through an early exit.
+    #[must_use]
+    pub fn matches(&self, presented: &str) -> bool {
+        let expected = self.tag(&self.token);
+        let mut mac = self.hmac();
+        mac.update(presented.as_bytes());
+        mac.verify_slice(&expected).is_ok()
+    }
+
+    fn tag(&self, value: &str) -> Vec<u8> {
+        let mut mac = self.hmac();
+        mac.update(value.as_bytes());
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    fn hmac(&self) -> HmacSha256 {
+        // HMAC accepts a key of any length, so this never fails.
+        HmacSha256::new_from_slice(self.token.as_bytes()).expect("HMAC accepts any key length")
+    }
+}
+
 /// Feed `user` and `password` into a MAC with a separator, so that e.g.
 /// (`"ab"`, `"c"`) and (`"a"`, `"bc"`) produce different tags.
 fn feed_credentials(mac: &mut HmacSha256, user: &str, password: &str) {
@@ -232,6 +269,16 @@ mod tests {
         // Cleared cookie carries Max-Age=0 and keeps the same attributes.
         assert!(secure.clear_cookie().contains("Max-Age=0"));
         assert!(secure.clear_cookie().contains("; Secure"));
+    }
+
+    #[test]
+    fn api_token_matches_exactly() {
+        let t = ApiToken::new("hub-secret".into());
+        assert!(t.matches("hub-secret"));
+        assert!(!t.matches("hub-secret "));
+        assert!(!t.matches("hub-secre"));
+        assert!(!t.matches("hub-secrets"));
+        assert!(!t.matches(""));
     }
 
     #[test]

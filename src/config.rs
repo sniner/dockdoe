@@ -171,6 +171,7 @@ pub struct AppConfig {
     pub auth_user: Option<String>,
     pub auth_password: Option<String>,
     pub cookie_secure: bool,
+    pub api_token: Option<String>,
     pub log: String,
     pub overview: OverviewConfig,
     pub hosts: Vec<HostConfig>,
@@ -194,6 +195,7 @@ struct FileConfig {
     auth_user: Option<String>,
     auth_password: Option<String>,
     cookie_secure: Option<bool>,
+    api_token: Option<String>,
     log: Option<String>,
     overview_cpu_scale: Option<ScaleMode>,
     overview_mem_scale: Option<ScaleMode>,
@@ -245,6 +247,13 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
         bail!("overview mem cap must be at least 32M");
     }
 
+    // A blank token would let any `Authorization: Bearer` header through —
+    // surely a misconfiguration (an unset variable interpolated into the file).
+    let api_token = file.api_token.or_else(|| cli.api_token.clone());
+    if api_token.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        bail!("api_token must not be empty (unset it to disable token access)");
+    }
+
     Ok(AppConfig {
         bind: file.bind.unwrap_or_else(|| cli.bind.clone()),
         db_path: file.db_path.unwrap_or_else(|| cli.db_path.clone()),
@@ -263,6 +272,7 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
         auth_user: file.auth_user.or_else(|| cli.auth_user.clone()),
         auth_password: file.auth_password.or_else(|| cli.auth_password.clone()),
         cookie_secure: file.cookie_secure.unwrap_or(cli.cookie_secure),
+        api_token,
         log: file.log.unwrap_or_else(|| cli.log.clone()),
         overview: OverviewConfig {
             cpu_scale: file.overview_cpu_scale.unwrap_or(cli.overview_cpu_scale),
@@ -501,5 +511,26 @@ mod tests {
         assert_eq!(file.overview_cpu_scale, Some(ScaleMode::Sqrt));
         assert_eq!(file.overview_mem_scale, Some(ScaleMode::Linear));
         assert_eq!(file.overview_mem_cap.as_deref(), Some("256G"));
+    }
+
+    #[test]
+    fn api_token_resolves_and_rejects_blank() {
+        // Unset by default; the CLI/env value comes through.
+        assert_eq!(load(None, &default_cli()).unwrap().api_token, None);
+        let cli = Cli::try_parse_from(["dockdoe", "--api-token", "hub-secret"]).unwrap();
+        assert_eq!(
+            load(None, &cli).unwrap().api_token.as_deref(),
+            Some("hub-secret")
+        );
+
+        // The file key parses too.
+        let file = toml::from_str::<FileConfig>(r#"api_token = "s3cret""#).expect("parse");
+        assert_eq!(file.api_token.as_deref(), Some("s3cret"));
+
+        // A blank token (an unset variable interpolated in) fails loudly.
+        for blank in ["", "   "] {
+            let cli = Cli::try_parse_from(["dockdoe", "--api-token", blank]).unwrap();
+            assert!(load(None, &cli).is_err(), "blank token {blank:?} must fail");
+        }
     }
 }

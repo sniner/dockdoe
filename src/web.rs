@@ -54,6 +54,9 @@ pub struct AppState {
     pub allowed_hosts: Arc<[String]>,
     /// Login credentials and session signing. `None` leaves the UI open.
     pub auth: Option<Auth>,
+    /// Shared-secret bearer token for machine clients (a federation hub).
+    /// `None` disables token access.
+    pub api_token: Option<auth::ApiToken>,
     /// Scales and cap of the dashboard overview discs.
     pub overview: OverviewConfig,
 }
@@ -188,7 +191,22 @@ pub fn router(state: AppState) -> Router {
 /// The login page and static assets stay public (the login page needs its CSS
 /// and icon); everything else needs a valid session cookie. Unauthenticated
 /// requests get an `HX-Redirect` (for htmx) or a 303 to `/login`.
-async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+async fn require_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    // Machine clients (the federation hub) authenticate per request with a
+    // bearer token instead of a login session. Checked before the cookie path
+    // so it also works when interactive auth is off, and only when a token is
+    // configured — otherwise `Authorization` headers (say, forwarded by an
+    // auth proxy) keep being ignored as before. A presented-but-wrong token is
+    // rejected outright: bouncing an API client to the login page helps nobody.
+    if let Some(expected) = state.api_token.as_ref()
+        && let Some(presented) = bearer_token(req.headers())
+    {
+        if expected.matches(presented) {
+            req.extensions_mut().insert(BearerAuthed);
+            return next.run(req).await;
+        }
+        return (StatusCode::UNAUTHORIZED, "invalid API token").into_response();
+    }
     let Some(auth) = state.auth.as_ref() else {
         return next.run(req).await; // authentication disabled
     };
@@ -211,6 +229,21 @@ async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -
     Redirect::to("/login").into_response()
 }
 
+/// Request-extension marker: this request was authenticated by the API token.
+/// The CSRF guard keys off it — a bearer header is attached deliberately by
+/// the client, never automatically by a browser, so CSRF doesn't apply.
+#[derive(Clone, Copy)]
+struct BearerAuthed;
+
+/// The token of an `Authorization: Bearer <token>` header, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
 /// Whether the request carries a valid session cookie for `auth`.
 fn request_is_authenticated(auth: &Auth, headers: &HeaderMap) -> bool {
     headers
@@ -224,9 +257,10 @@ fn request_is_authenticated(auth: &Auth, headers: &HeaderMap) -> bool {
 /// `HX-Request: true` header htmx adds to every request it issues. A cross-site
 /// HTML form can't set custom headers, and setting one from a script makes the
 /// request preflight-checked — which fails, since we never answer CORS
-/// preflights. Same-origin htmx buttons are unaffected.
+/// preflights. Same-origin htmx buttons are unaffected. Bearer-authenticated
+/// requests (see [`BearerAuthed`]) are exempt.
 async fn require_htmx(req: Request, next: Next) -> Response {
-    if is_htmx_request(req.headers()) {
+    if req.extensions().get::<BearerAuthed>().is_some() || is_htmx_request(req.headers()) {
         next.run(req).await
     } else {
         (
@@ -2209,6 +2243,21 @@ fn duration_ms(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_token_parses_only_the_bearer_scheme() {
+        let with = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::AUTHORIZATION, value.parse().unwrap());
+            h
+        };
+        assert_eq!(bearer_token(&with("Bearer hub-secret")), Some("hub-secret"));
+        // Other schemes (e.g. Basic from an auth proxy) are not ours to judge.
+        assert_eq!(bearer_token(&with("Basic dXNlcjpwdw==")), None);
+        assert_eq!(bearer_token(&with("bearer hub-secret")), None);
+        assert_eq!(bearer_token(&with("Bearer")), None);
+        assert_eq!(bearer_token(&HeaderMap::new()), None);
+    }
 
     #[test]
     fn port_links_from_config_resolves_each_case() {

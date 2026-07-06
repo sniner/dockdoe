@@ -88,6 +88,7 @@ also reads from an environment variable; the flag wins when both are set.
 | `--auth-user`             | `DOCKDOE_AUTH_USER`            | *(unset)*        | Web UI login username, see below                |
 | `--auth-password`         | `DOCKDOE_AUTH_PASSWORD`        | *(unset)*        | Web UI login password, see below                |
 | `--cookie-secure`         | `DOCKDOE_COOKIE_SECURE`        | `false`          | Mark the session cookie `Secure` (HTTPS only)   |
+| `--api-token`             | `DOCKDOE_API_TOKEN`            | *(unset)*        | Bearer token for API clients, see below         |
 | `--port-host`             | `DOCKDOE_PORT_HOST`            | *(unset)*        | Host the port pills link to, see below          |
 | `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
 | `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
@@ -198,6 +199,15 @@ Behind a TLS-terminating reverse proxy, also set `--cookie-secure` /
 `DOCKDOE_COOKIE_SECURE=true` so the cookie is only ever sent over HTTPS. Leave it
 off for plain-http access on a trusted LAN, where it would otherwise stop the
 cookie from being sent at all.
+
+Machine clients — scripts, or another DockDoe instance acting as a central
+hub — can't use the login form. Set `--api-token` / `DOCKDOE_API_TOKEN` to a
+shared secret and such clients authenticate each request with an
+`Authorization: Bearer <token>` header instead, getting the same access as a
+logged-in session. Token requests are also exempt from the htmx CSRF check on
+the action endpoints, which only makes sense for cookies a browser attaches on
+its own. Unset (the default), token access is disabled and `Authorization`
+headers are ignored as before.
 
 ### Terminal
 

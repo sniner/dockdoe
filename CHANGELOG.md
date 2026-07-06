@@ -5,6 +5,13 @@ All notable, user-facing changes to DockDoe. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **API token access**: set `--api-token` / `DOCKDOE_API_TOKEN` (or `api_token` in `config.toml`)
+  and machine clients — scripts, or a central DockDoe hub in an upcoming federation setup — can
+  authenticate each request with an `Authorization: Bearer <token>` header instead of the login
+  form, with the same access as a logged-in session
+
 ### Changed
 
 - **Overview CPU disc** now defaults to the `log` scale (was `linear`), so light activity is
