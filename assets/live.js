@@ -383,6 +383,18 @@
     localizePortLinks(el);
   }
 
+  // Dashboard overview discs: live.js owns the page's one SSE connection, so
+  // it just hands the parsed payload over; overview.js does the rendering.
+  function onOverview(e) {
+    var p;
+    try {
+      p = JSON.parse(e.data);
+    } catch (err) {
+      return;
+    }
+    document.dispatchEvent(new CustomEvent("dockdoe:overview", { detail: p }));
+  }
+
   function onMetrics(e) {
     if (!cpuChart) return;
     var p;
@@ -409,6 +421,7 @@
     es.addEventListener("containers", onContainers);
     es.addEventListener("detail", onDetail);
     es.addEventListener("metrics", onMetrics);
+    es.addEventListener("overview", onOverview);
     // On a dropped connection the browser would reconnect on its own — but
     // that bypasses the backfill and leaves a hole in the charts (e.g. when
     // the DockDoe server restarts while the page stays open). Take over:

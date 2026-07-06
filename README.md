@@ -13,6 +13,11 @@ by compose stack. The dashboard updates live (no full reload): HTMX swaps
 server-rendered fragments over SSE, and uPlot draws live charts seeded from
 history.
 
+Two radial [overview discs](#overview-discs) at the top of the dashboard show
+the whole fleet at a glance — one sector per container, with a phosphor-style
+trail that makes runaway CPU or a memory leak stand out before you read a
+single row.
+
 Drill into a container (live CPU/memory charts, facts, logs) or a whole stack
 (aggregate charts, the compose.yml, start/stop/restart-all), and start, stop or
 restart containers right from the UI. Point it at one Docker host or
@@ -86,6 +91,9 @@ also reads from an environment variable; the flag wins when both are set.
 | `--port-host`             | `DOCKDOE_PORT_HOST`            | *(unset)*        | Host the port pills link to, see below          |
 | `--apprise-url`           | `DOCKDOE_APPRISE_URL`          | *(unset)*        | Apprise endpoint for notifications, see below    |
 | `--notify-delay-secs`     | `DOCKDOE_NOTIFY_DELAY`         | `30`             | Seconds a state must persist before notifying    |
+| `--overview-cpu-scale`    | `DOCKDOE_OVERVIEW_CPU_SCALE`   | `linear`         | Overview CPU disc scale, see below              |
+| `--overview-mem-scale`    | `DOCKDOE_OVERVIEW_MEM_SCALE`   | `log`            | Overview memory disc scale, see below           |
+| `--overview-mem-cap`      | `DOCKDOE_OVERVIEW_MEM_CAP`     | `64G`            | Memory value at the overview disc's rim         |
 | `--log`                   | `DOCKDOE_LOG`                  | `info`           | Tracing filter (e.g. `dockdoe=debug`)           |
 
 ### Multiple hosts
@@ -139,6 +147,26 @@ Remote hosts have two limits: the **compose.yml** tab only works for a host
 whose files are on the machine DockDoe runs on, and a proxy that denies actions
 or exec (returns 403) makes that host **read-only** — its action buttons and
 terminal are disabled automatically.
+
+### Overview discs
+
+The dashboard opens with two radial charts — one for CPU, one for memory. Every
+container owns a fixed sector (ordered like the table: stacks alphabetically,
+standalone last), the radius shows its current value, and the last ~24 samples
+fade out like a phosphor trace, so a climbing container drags a visible trail.
+Hover names the container, a click opens its detail page.
+
+Both scales can be tuned:
+
+- **`--overview-cpu-scale`** — `linear` (default), `sqrt` or `log`. The rim is
+  100 % of one core. Linear keeps an idle fleet visually quiet — an empty disc
+  *means* all quiet; `sqrt`/`log` spread the low end at the cost of magnifying
+  idle jitter.
+- **`--overview-mem-scale`** — `log` (default), `sqrt` or `linear`. On the log
+  scale equal *relative* growth moves a sector equally far, so a leak looks the
+  same whether it doubles 100 MiB or 4 GiB.
+- **`--overview-mem-cap`** — the memory value at the rim (default `64G`).
+  Accepts binary sizes like `512M`, `64G`, `1T`, or plain bytes.
 
 ### Request hardening
 

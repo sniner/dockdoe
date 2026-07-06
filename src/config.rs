@@ -16,6 +16,73 @@ use serde::Deserialize;
 
 use crate::Cli;
 
+/// How a metric value maps onto the radius of the dashboard overview discs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScaleMode {
+    /// Proportional: an idle fleet stays visually quiet near the centre.
+    Linear,
+    /// Square root: spreads the low end without log's jitter amplification.
+    Sqrt,
+    /// Logarithmic: equal relative change moves the radius equally far.
+    Log,
+}
+
+impl ScaleMode {
+    /// The lowercase name, embedded as a `data-*` attribute for `overview.js`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScaleMode::Linear => "linear",
+            ScaleMode::Sqrt => "sqrt",
+            ScaleMode::Log => "log",
+        }
+    }
+}
+
+// clap renders the flag's default through `Display`.
+impl std::fmt::Display for ScaleMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Parameters of the dashboard overview discs, resolved from flags/env/file.
+#[derive(Debug, Clone, Copy)]
+pub struct OverviewConfig {
+    pub cpu_scale: ScaleMode,
+    pub mem_scale: ScaleMode,
+    /// Memory value at the disc rim, in bytes.
+    pub mem_cap: u64,
+}
+
+/// The log scale's lower bound on the memory disc (values at or below it sit
+/// at the centre). The configured cap must stay clearly above it.
+pub const OVERVIEW_MEM_FLOOR: u64 = 16 * 1024 * 1024;
+
+/// Parse a byte size like `64G`, `512M` or `68719476736`. Suffixes are
+/// binary (K/M/G/T = powers of 1024, case-insensitive, optional trailing
+/// `B`/`iB`). Used as a clap value parser, hence the `String` error.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let digits = s.trim_end_matches(|c: char| !c.is_ascii_digit());
+    let value: u64 = digits.parse().map_err(|_| {
+        format!("invalid size {s:?}: expected digits with an optional K/M/G/T suffix")
+    })?;
+    let unit = s[digits.len()..].trim();
+    let shift = match unit.to_ascii_uppercase().as_str() {
+        "" | "B" => 0,
+        "K" | "KB" | "KIB" => 10,
+        "M" | "MB" | "MIB" => 20,
+        "G" | "GB" | "GIB" => 30,
+        "T" | "TB" | "TIB" => 40,
+        _ => return Err(format!("invalid size suffix {unit:?}: use K, M, G or T")),
+    };
+    if value.leading_zeros() < shift {
+        return Err(format!("size {s:?} overflows"));
+    }
+    Ok(value << shift)
+}
+
 /// A single Docker host to monitor.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +172,7 @@ pub struct AppConfig {
     pub auth_password: Option<String>,
     pub cookie_secure: bool,
     pub log: String,
+    pub overview: OverviewConfig,
     pub hosts: Vec<HostConfig>,
 }
 
@@ -127,6 +195,10 @@ struct FileConfig {
     auth_password: Option<String>,
     cookie_secure: Option<bool>,
     log: Option<String>,
+    overview_cpu_scale: Option<ScaleMode>,
+    overview_mem_scale: Option<ScaleMode>,
+    /// A size string like `"64G"` — same format as the CLI flag.
+    overview_mem_cap: Option<String>,
     #[serde(default)]
     host: Vec<HostConfig>,
 }
@@ -162,6 +234,17 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
 
     validate_hosts(&hosts)?;
 
+    let overview_mem_cap = match &file.overview_mem_cap {
+        Some(s) => parse_size(s)
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("parsing overview_mem_cap")?,
+        None => cli.overview_mem_cap,
+    };
+    // A cap at or below the log floor would collapse the memory disc's range.
+    if overview_mem_cap < 2 * OVERVIEW_MEM_FLOOR {
+        bail!("overview mem cap must be at least 32M");
+    }
+
     Ok(AppConfig {
         bind: file.bind.unwrap_or_else(|| cli.bind.clone()),
         db_path: file.db_path.unwrap_or_else(|| cli.db_path.clone()),
@@ -181,6 +264,11 @@ pub fn load(path: Option<&Path>, cli: &Cli) -> Result<AppConfig> {
         auth_password: file.auth_password.or_else(|| cli.auth_password.clone()),
         cookie_secure: file.cookie_secure.unwrap_or(cli.cookie_secure),
         log: file.log.unwrap_or_else(|| cli.log.clone()),
+        overview: OverviewConfig {
+            cpu_scale: file.overview_cpu_scale.unwrap_or(cli.overview_cpu_scale),
+            mem_scale: file.overview_mem_scale.unwrap_or(cli.overview_mem_scale),
+            mem_cap: overview_mem_cap,
+        },
         hosts,
     })
 }
@@ -366,5 +454,52 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let err = toml::from_str::<FileConfig>("nonsense_key = 1\n").unwrap_err();
         assert!(err.to_string().contains("nonsense_key"));
+    }
+
+    #[test]
+    fn parse_size_accepts_suffixes_and_bytes() {
+        assert_eq!(parse_size("68719476736"), Ok(64 << 30));
+        assert_eq!(parse_size("64G"), Ok(64 << 30));
+        assert_eq!(parse_size("64GB"), Ok(64 << 30));
+        assert_eq!(parse_size("64GiB"), Ok(64 << 30));
+        assert_eq!(parse_size("64g"), Ok(64 << 30));
+        assert_eq!(parse_size(" 512M "), Ok(512 << 20));
+        assert_eq!(parse_size("1K"), Ok(1024));
+        assert_eq!(parse_size("2T"), Ok(2 << 40));
+        assert_eq!(parse_size("0"), Ok(0));
+    }
+
+    #[test]
+    fn parse_size_rejects_garbage_and_overflow() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("G").is_err());
+        assert!(parse_size("12X").is_err());
+        assert!(parse_size("1.5G").is_err());
+        assert!(parse_size("-3M").is_err());
+        // 2^60 terabytes shift the value's bits clean out of a u64.
+        assert!(parse_size("1152921504606846976K").is_err());
+    }
+
+    #[test]
+    fn overview_defaults_are_cpu_linear_mem_log_64g() {
+        let cfg = load(None, &default_cli()).expect("load without a file");
+        assert_eq!(cfg.overview.cpu_scale, ScaleMode::Linear);
+        assert_eq!(cfg.overview.mem_scale, ScaleMode::Log);
+        assert_eq!(cfg.overview.mem_cap, 64 << 30);
+    }
+
+    #[test]
+    fn overview_file_keys_parse() {
+        let file: FileConfig = toml::from_str(
+            r#"
+            overview_cpu_scale = "sqrt"
+            overview_mem_scale = "linear"
+            overview_mem_cap = "256G"
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(file.overview_cpu_scale, Some(ScaleMode::Sqrt));
+        assert_eq!(file.overview_mem_scale, Some(ScaleMode::Linear));
+        assert_eq!(file.overview_mem_cap.as_deref(), Some("256G"));
     }
 }

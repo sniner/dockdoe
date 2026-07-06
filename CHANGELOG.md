@@ -3,6 +3,18 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Dashboard overview discs**: the dashboard opens with two radial charts (CPU and memory) that
+  show the whole fleet at a glance — one fixed sector per container (ordered like the table), the
+  radius is the current value, and the last ~24 samples fade out as a phosphor-style trail, so a
+  runaway container or a memory leak stands out before you read a single row. Hover names the
+  container, a click opens its detail page. Tunable via `--overview-cpu-scale` (`linear` default,
+  `sqrt`, `log`), `--overview-mem-scale` (`log` default) and `--overview-mem-cap` (rim value,
+  default `64G`) — or their `DOCKDOE_OVERVIEW_*` environment variables / `config.toml` keys
+
 ## [0.8.0] — 2026-07-05
 
 ### Added

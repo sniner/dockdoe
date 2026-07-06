@@ -30,6 +30,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::auth::{self, Auth};
 use crate::collector::SharedDashboard;
+use crate::config::OverviewConfig;
 use crate::docker::{Action, DockerHandle, ExecSession, is_forbidden};
 use crate::model::{ContainerMetrics, ContainerState, Dashboard, HealthState, Port};
 use crate::store::{MetricPoint, Store};
@@ -53,6 +54,8 @@ pub struct AppState {
     pub allowed_hosts: Arc<[String]>,
     /// Login credentials and session signing. `None` leaves the UI open.
     pub auth: Option<Auth>,
+    /// Scales and cap of the dashboard overview discs.
+    pub overview: OverviewConfig,
 }
 
 /// Everything the web layer needs for one monitored host.
@@ -1053,6 +1056,7 @@ async fn events_dashboard(
         futures_util::stream::iter([
             Ok::<_, Infallible>(header_event(&dash, &host, &order, auth)),
             Ok(containers_event(&dash, &r)),
+            Ok(overview_event(&dash)),
         ])
     });
     Sse::new(stream)
@@ -1167,6 +1171,58 @@ fn containers_event(dash: &Dashboard, r: &Render) -> Event {
     Event::default()
         .event("containers")
         .data(container_section(&dash.containers, dash.cpu_count, r).into_string())
+}
+
+/// One container's slice of the dashboard overview discs, serialized to JSON
+/// for both the page seed and the `overview` SSE event.
+#[derive(serde::Serialize)]
+struct OverviewEntry<'a> {
+    id: &'a str,
+    name: &'a str,
+    stack: Option<&'a str>,
+    cpu: Option<f64>,
+    mem: Option<u64>,
+}
+
+/// The overview payload: snapshot timestamp plus the container list in the
+/// same deterministic order as the container table (stacks alphabetically,
+/// standalone last, names within) so a sector keeps its angular position.
+fn overview_json(dash: &Dashboard) -> String {
+    let mut containers: Vec<&ContainerMetrics> = dash.containers.iter().collect();
+    containers.sort_by(|a, b| {
+        stack_key(a)
+            .cmp(&stack_key(b))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let entries: Vec<OverviewEntry<'_>> = containers
+        .iter()
+        .map(|c| OverviewEntry {
+            id: &c.id,
+            name: &c.name,
+            stack: c.stack.as_deref(),
+            cpu: c.cpu_percent,
+            mem: c.mem_used,
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "ts_ms": dash.generated_at_unix_ms,
+        "containers": entries,
+    });
+    // `<` can only occur inside JSON strings, so escaping it globally keeps a
+    // hostile container name from closing the inline `<script>` seed block.
+    payload.to_string().replace('<', "\\u003c")
+}
+
+fn stack_key(c: &ContainerMetrics) -> StackKey<'_> {
+    match &c.stack {
+        Some(name) => StackKey::Named(name),
+        None => StackKey::Standalone,
+    }
+}
+
+/// The `overview` event: the dashboard discs' JSON payload.
+fn overview_event(dash: &Dashboard) -> Event {
+    Event::default().event("overview").data(overview_json(dash))
 }
 
 /// Accumulates a stack's per-second I/O rates across its members. A category
@@ -1317,6 +1373,7 @@ fn shell(
                 script src="/assets/vendor/htmx.min.js" {}
                 script src="/assets/vendor/uPlot.iife.min.js" {}
                 script src="/assets/live.js" {}
+                script src="/assets/overview.js" {}
                 script src="/assets/history.js" {}
                 @if terminal {
                     script src="/assets/vendor/xterm.js" {}
@@ -1328,8 +1385,7 @@ fn shell(
     }
 }
 
-/// The dashboard body: the live container table. No charts — the host-metrics
-/// header that owned them was removed.
+/// The dashboard body: the overview discs plus the live container table.
 fn dashboard_page(
     state: &AppState,
     host: &str,
@@ -1343,6 +1399,7 @@ fn dashboard_page(
         read_only,
     };
     let main = html! {
+        (overview_section(&state.overview, host, snapshot))
         div id="containers" {
             @match snapshot {
                 Some(d) => (container_section(&d.containers, d.cpu_count, &r)),
@@ -1350,10 +1407,43 @@ fn dashboard_page(
             }
         }
     };
-    // No charts here, so no seed or backfill endpoint; the SSE stream still
-    // drives the header and the container table.
+    // No uPlot charts here, so no metric seed or backfill endpoint; the SSE
+    // stream drives the header, the container table and the overview discs.
     let live_url = format!("/host/{host}/events");
     shell(state, host, snapshot, main, &[], &live_url, "", false)
+}
+
+/// The dashboard overview: two radial "phosphor" discs (CPU + memory), one
+/// sector per container, drawn by `overview.js` on the canvases below. The
+/// section's data attributes hand the configured scales and the detail-page
+/// URL prefix to the script; the inline JSON seed lets it paint the first
+/// frame without waiting for the SSE stream.
+fn overview_section(cfg: &OverviewConfig, host: &str, snapshot: Option<&Dashboard>) -> Markup {
+    let seed = snapshot.map_or_else(|| "null".to_string(), overview_json);
+    html! {
+        section.charts.overview id="overview"
+            data-container-url=(format!("/host/{host}/container/"))
+            data-cpu-scale=(cfg.cpu_scale.as_str())
+            data-mem-scale=(cfg.mem_scale.as_str())
+            data-mem-cap=(cfg.mem_cap) {
+            div.chart-card {
+                div.chart-head {
+                    span.chart-title { "CPU" }
+                    // Filled by overview.js while hovering: "jellyfin · 5.8%".
+                    span.chart-readout id="overview-readout-cpu" {}
+                }
+                div.overview-disc { canvas id="overview-cpu" {} }
+            }
+            div.chart-card {
+                div.chart-head {
+                    span.chart-title { "Memory" }
+                    span.chart-readout id="overview-readout-mem" {}
+                }
+                div.overview-disc { canvas id="overview-mem" {} }
+            }
+            script id="overview-seed" type="application/json" { (maud::PreEscaped(seed)) }
+        }
+    }
 }
 
 /// Markup for a pair of live charts (CPU + memory). Data comes from `live.js`,
@@ -1819,11 +1909,7 @@ fn container_section(containers: &[ContainerMetrics], cpu_count: usize, r: &Rend
     // (None) sorts last; members within each stack are sorted by name.
     let mut groups: BTreeMap<StackKey<'_>, Vec<&ContainerMetrics>> = BTreeMap::new();
     for c in containers {
-        let key = match &c.stack {
-            Some(name) => StackKey::Named(name),
-            None => StackKey::Standalone,
-        };
-        groups.entry(key).or_default().push(c);
+        groups.entry(stack_key(c)).or_default().push(c);
     }
     for members in groups.values_mut() {
         members.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2450,5 +2536,52 @@ mod tests {
                 StackKey::Standalone,
             ]
         );
+    }
+
+    #[test]
+    fn overview_json_orders_and_escapes() {
+        let c = |name: &str, stack: Option<&str>| ContainerMetrics {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            image: "img".to_string(),
+            state: ContainerState::Running,
+            status: String::new(),
+            health: HealthState::None,
+            stack: stack.map(str::to_string),
+            cpu_percent: Some(1.5),
+            mem_used: Some(42),
+            mem_limit: None,
+            net_rx_bps: None,
+            net_tx_bps: None,
+            disk_read_bps: None,
+            disk_write_bps: None,
+            ports: Vec::new(),
+        };
+        let dash = Dashboard {
+            generated_at_unix_ms: 1000,
+            cpu_count: 4,
+            containers: vec![
+                c("zulu", None),
+                c("web", Some("beta")),
+                c("<evil>", Some("alpha")),
+                c("db", Some("beta")),
+            ],
+        };
+        let json = overview_json(&dash);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let names: Vec<&str> = v["containers"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| e["name"].as_str().expect("name"))
+            .collect();
+        // Stacks alphabetically, members by name, standalone last.
+        assert_eq!(names, ["<evil>", "db", "web", "zulu"]);
+        assert_eq!(v["ts_ms"], 1000);
+        assert_eq!(v["containers"][1]["cpu"], 1.5);
+        assert_eq!(v["containers"][1]["mem"], 42);
+        assert_eq!(v["containers"][1]["stack"], "beta");
+        // No raw `<` survives — the seed can't close its <script> element.
+        assert!(!json.contains('<'));
     }
 }

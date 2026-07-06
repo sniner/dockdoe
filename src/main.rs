@@ -119,6 +119,25 @@ struct Cli {
     #[arg(long, env = "DOCKDOE_PORT_HOST")]
     port_host: Option<String>,
 
+    /// Radius scale of the dashboard overview's CPU disc. `linear` keeps an
+    /// idle fleet visually quiet; `sqrt`/`log` spread the low end.
+    #[arg(long, env = "DOCKDOE_OVERVIEW_CPU_SCALE", value_enum,
+          default_value_t = config::ScaleMode::Linear)]
+    overview_cpu_scale: config::ScaleMode,
+
+    /// Radius scale of the dashboard overview's memory disc. With `log`,
+    /// equal relative growth moves a sector equally far — a leak looks the
+    /// same whether it doubles 100 MiB or 4 GiB.
+    #[arg(long, env = "DOCKDOE_OVERVIEW_MEM_SCALE", value_enum,
+          default_value_t = config::ScaleMode::Log)]
+    overview_mem_scale: config::ScaleMode,
+
+    /// Memory value at the overview disc's rim, e.g. "64G" or "512M"
+    /// (binary units; plain numbers are bytes).
+    #[arg(long, env = "DOCKDOE_OVERVIEW_MEM_CAP", default_value = "64G",
+          value_parser = config::parse_size)]
+    overview_mem_cap: u64,
+
     /// Tracing filter, e.g. "info" or "dockdoe=debug".
     #[arg(long, env = "DOCKDOE_LOG", default_value = "info")]
     log: String,
@@ -236,6 +255,7 @@ async fn main() -> Result<()> {
         seed_window,
         allowed_hosts,
         auth,
+        overview: cfg.overview,
     });
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await

@@ -339,6 +339,13 @@ a.port-pill:hover { background: rgba(79,156,249,0.3); }
   margin-left: auto;
 }
 .chart-card .u-legend { display: none; }
+/* Dashboard overview: the radial per-container discs (overview.js). */
+.overview .overview-disc {
+  display: flex;
+  justify-content: center;
+  padding: 0.4rem 0 0.5rem;
+}
+.overview .overview-disc canvas { display: block; }
 /* Dual-line chart legend: a coloured key per series — rx/read blue (the line
    colour), tx/write green — so the two lines are tellable apart at a glance. */
 .chart-card .chart-legend {
