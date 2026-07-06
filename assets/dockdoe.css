@@ -338,6 +338,12 @@ a.port-pill:hover { background: rgba(79,156,249,0.3); }
   white-space: nowrap;
   margin-left: auto;
 }
+/* An empty readout would collapse to zero height and let the card head grow
+   by ~1px when text appears on hover — a visible jump. A zero-width space
+   keeps the line box (and its baseline) permanently reserved. */
+.chart-card .chart-readout:empty::before {
+  content: "\200b";
+}
 .chart-card .u-legend { display: none; }
 /* Dashboard overview: the radial per-container discs (overview.js). */
 .overview .overview-disc {
