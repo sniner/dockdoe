@@ -3,6 +3,14 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **Downed containers on the overview discs**: an exited or dead container now shows as a
+  full-size sector drawn as a red outline with an empty interior — instantly distinguishable
+  from live measurements, which are always filled. Hovering it reads out "down"
+
 ## [0.12.0] — 2026-07-06
 
 ### Added

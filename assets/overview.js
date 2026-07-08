@@ -32,6 +32,7 @@
     label: css.getPropertyValue("--muted").trim(),
     halo: css.getPropertyValue("--panel").trim(),
     hover: css.getPropertyValue("--fg").trim(),
+    err: css.getPropertyValue("--err").trim(),
   };
 
   var list = []; // last payload's containers, in sector order
@@ -153,7 +154,8 @@
     }
     var v = latest(c.id, disc.metric);
     var name = c.stack ? c.stack + "/" + c.name : c.name;
-    disc.readout.textContent = name + " · " + (v == null ? "–" : disc.fmt(v));
+    var text = c.down ? "down" : v == null ? "–" : disc.fmt(v);
+    disc.readout.textContent = name + " · " + text;
   }
 
   function latest(id, metric) {
@@ -224,10 +226,23 @@
     ctx.stroke();
 
     // Sectors: oldest sample first, so the fresh one paints on top and
-    // anything it no longer covers remains as the fading trail.
-    ctx.fillStyle = COLOR.bar;
+    // anything it no longer covers remains as the fading trail. A downed
+    // container (exited/dead) gets a hollow full-size sector instead — red
+    // rim, panel fill — so an outage reads at a glance and can't be mistaken
+    // for a measurement (data is always a filled sector, never an outline).
     for (i = 0; i < list.length; i++) {
       var sec = layout[i];
+      if (list[i].down) {
+        sectorPath(ctx, cx, cy, r0, rim, sec.a0, sec.a1);
+        ctx.fillStyle = COLOR.halo;
+        ctx.fill();
+        ctx.strokeStyle = COLOR.err;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.lineWidth = 1;
+        continue;
+      }
+      ctx.fillStyle = COLOR.bar;
       var h = hist[list[i].id] || [];
       for (var k = 0; k < h.length; k++) {
         var alpha = Math.pow(DECAY, h.length - 1 - k);

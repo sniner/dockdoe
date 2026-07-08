@@ -1559,6 +1559,9 @@ struct OverviewEntry<'a> {
     stack: Option<&'a str>,
     cpu: Option<f64>,
     mem: Option<u64>,
+    /// Exited or dead — drawn as a red-rimmed hollow sector so an outage is
+    /// visible at a glance (mirrors the table's red state badge).
+    down: bool,
 }
 
 /// The overview payload: snapshot timestamp plus the container list in the
@@ -1579,6 +1582,7 @@ fn overview_json(dash: &Dashboard) -> String {
             stack: c.stack.as_deref(),
             cpu: c.cpu_percent,
             mem: c.mem_used,
+            down: matches!(c.state, ContainerState::Exited | ContainerState::Dead),
         })
         .collect();
     let payload = serde_json::json!({
