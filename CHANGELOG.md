@@ -3,7 +3,7 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## [0.12.1] — 2026-07-08
 
 ### Added
 
