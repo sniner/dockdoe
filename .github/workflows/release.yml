@@ -2,94 +2,129 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  # Fail fast on the classic "tagged but forgot to bump": the tag (minus its
-  # `v`) must equal the version in Cargo.toml.
   verify-version:
+    # Tag-pushes only: refuse to build a release whose git tag does not match
+    # `[package].version` in Cargo.toml. Catches the common "tagged v0.2.0 but
+    # forgot to bump Cargo.toml" mistake before any build minutes are spent.
+    name: Verify tag matches Cargo.toml version
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Compare tag against Cargo.toml version
+      - uses: actions/checkout@v7
+      - name: Compare git tag with [package].version
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pkg=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^[[:space:]]*version[[:space:]]*=/{gsub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/,"");gsub(/".*$/,"");print;exit}' Cargo.toml)
-          [ "$tag" = "$pkg" ] || { echo "::error::tag v$tag != Cargo.toml $pkg"; exit 1; }
+          echo "Git tag (stripped):  $tag"
+          echo "Cargo.toml version:  $pkg"
+          if [ "$tag" != "$pkg" ]; then
+              echo "::error::Git tag v$tag does not match [package].version $pkg — bump Cargo.toml before tagging."
+              exit 1
+          fi
+          echo "OK: tag and Cargo.toml version match."
 
-  # Cross-compile a static musl binary per architecture on the (amd64) runner —
-  # fast and native, no QEMU. Each build uploads its binary (for the image) and a
-  # tarball (for the GitHub release).
-  binaries:
+  build:
+    # One static musl binary per architecture, each built natively on a runner
+    # of that architecture — no cross toolchain, no QEMU.
+    name: Build ${{ matrix.target }}
     needs: verify-version
-    runs-on: ubuntu-latest
+    # Run when the gate passed, or when it was skipped (workflow_dispatch with no
+    # tag — useful as a manual smoke build).
+    if: ${{ always() && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
             arch: amd64
-            label: x86_64-linux-musl
+            asset_suffix: x86_64-linux-musl
           - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
             arch: arm64
-            label: aarch64-linux-musl
+            asset_suffix: aarch64-linux-musl
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Install cross
-        uses: taiki-e/install-action@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          tool: cross
+          targets: ${{ matrix.target }}
 
-      - name: Build static binary
-        run: cross build --release --target ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: Package tarball
+      - name: Install musl tools
         run: |
-          install -Dm755 target/${{ matrix.target }}/release/dockdoe dist/dockdoe
-          tar -C dist -czf dockdoe-${{ github.ref_name }}-${{ matrix.label }}.tar.gz dockdoe
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      # The release profile strips symbols (`strip = true` in Cargo.toml), so
+      # no separate strip step.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify static linkage
+        run: |
+          BIN=target/${{ matrix.target }}/release/dockdoe
+          file "$BIN"
+          # file(1) reports musl binaries as "statically linked" (classic) or
+          # "static-pie linked" (modern PIE). Accept both.
+          if ! file "$BIN" | grep -qE "static(ally|-pie)? linked"; then
+            echo "ERROR: dockdoe is not statically linked"
+            exit 1
+          fi
+          echo "OK: $(du -h "$BIN" | cut -f1) statically linked dockdoe"
+
+      - name: Stage binary with versioned name
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/dockdoe \
+             "dist/dockdoe-${GITHUB_REF_NAME}-${{ matrix.asset_suffix }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: dist-${{ matrix.arch }}
-          path: |
-            target/${{ matrix.target }}/release/dockdoe
-            dockdoe-${{ github.ref_name }}-${{ matrix.label }}.tar.gz
+          name: dockdoe-${{ matrix.asset_suffix }}
+          path: dist/dockdoe-*
+          if-no-files-found: error
+          retention-days: 7
 
-  # Attach the tarballs to the release and assemble + push the multi-arch image
-  # from the prebuilt binaries (pure COPY onto scratch — no compiler, no QEMU).
-  publish:
-    needs: binaries
+  release:
+    # Attach the binaries to the GitHub release, then assemble and push the
+    # multi-arch image from the same binaries (a pure COPY onto scratch — no
+    # compiler, no QEMU).
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Download built binaries
-        uses: actions/download-artifact@v4
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          path: dist
+          merge-multiple: true
 
-      - name: Stage image context and collect tarballs
-        run: |
-          mkdir -p binaries/amd64 binaries/arm64 data dist
-          cp artifacts/dist-amd64/target/x86_64-unknown-linux-musl/release/dockdoe binaries/amd64/dockdoe
-          cp artifacts/dist-arm64/target/aarch64-unknown-linux-musl/release/dockdoe binaries/arm64/dockdoe
-          chmod +x binaries/amd64/dockdoe binaries/arm64/dockdoe
-          cp artifacts/dist-amd64/*.tar.gz dist/
-          cp artifacts/dist-arm64/*.tar.gz dist/
+      - name: List assets
+        run: ls -la dist/
 
-      # Release notes are the version's CHANGELOG.md section — the changelog is
-      # the single curated source; auto-generated notes on a PR-less repo were
-      # just a flat commit list.
-      - name: Extract release notes from CHANGELOG
+      - name: Extract release notes from CHANGELOG.md
+        # Release notes = the CHANGELOG section for this version. Single source of
+        # truth: the curated changelog, not a separate release-commit body.
         run: |
           version="${GITHUB_REF_NAME#v}"
           awk -v ver="$version" '
@@ -97,13 +132,27 @@ jobs:
               grab && /^## \[/          { exit }
               grab                      { print }
           ' CHANGELOG.md | sed -e '/./,$!d' > release-notes.md
-          [ -s release-notes.md ] || { echo "::error::No CHANGELOG section for [$version]"; exit 1; }
+          if [ ! -s release-notes.md ]; then
+              echo "::error::No CHANGELOG.md section found for [$version] — add one before tagging."
+              exit 1
+          fi
+          echo "----- release notes -----"
+          cat release-notes.md
 
-      - name: Publish release with binaries
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*.tar.gz
-          body_path: release-notes.md
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            dist/dockdoe-*
+
+      - name: Stage image context
+        run: |
+          mkdir -p binaries/amd64 binaries/arm64 data
+          install -m755 "dist/dockdoe-${GITHUB_REF_NAME}-x86_64-linux-musl" binaries/amd64/dockdoe
+          install -m755 "dist/dockdoe-${GITHUB_REF_NAME}-aarch64-linux-musl" binaries/arm64/dockdoe
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
