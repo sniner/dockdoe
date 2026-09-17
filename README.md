@@ -383,7 +383,9 @@ Two layers, mirroring a Zabbix-style approach:
   bucket completes (not lazily as raw data ages out). Median is preferred over
   mean for robustness against spikes; `max` is kept for the worst case. Trends
   have their own, longer retention and store the container name and stack
-  alongside the id, so history survives a `docker compose down && up`.
+  alongside the id, so history survives a `docker compose down && up`. They
+  are stored one row per container and bucket, clustered by container, so a
+  30-day chart reads a few thousand adjacent rows rather than the whole table.
 
 ## How CPU% is computed
 

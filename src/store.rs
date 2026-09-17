@@ -8,16 +8,27 @@
 //! * **Trends** — min/max/median rollups per time bucket, computed by the
 //!   collector and persisted here. Trends are cheap and kept long-term.
 //!
+//! Trend rows are stored *wide* — one row per container and bucket carrying
+//! every metric's envelope — in a `WITHOUT ROWID` table whose primary key
+//! leads with `(host, name, bucket_start_ms)`. That clusters a container's
+//! history physically: a 30-day chart reads a few thousand adjacent pages
+//! instead of touching the whole table. The long format the bucketer emits
+//! (one [`ContainerTrend`] per metric) is pivoted on insert; a database from
+//! a build that stored the long format is migrated in place on open.
+//!
 //! The connection lives behind `Arc<Mutex<_>>` so the store is `Clone` and can
 //! be shared between the collector (writer) and web handlers (readers). All
 //! methods are synchronous; async callers should wrap them in
 //! `tokio::task::spawn_blocking`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::types::Value;
+use rusqlite::{Connection, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ContainerMetrics;
@@ -39,6 +50,18 @@ pub enum Metric {
 }
 
 impl Metric {
+    /// Every metric, in the column order of the wide trend row and of
+    /// [`HistoryPoint`]. The SQL builders below iterate this, so the column
+    /// lists and the row mappers cannot drift apart.
+    pub const ALL: [Metric; 6] = [
+        Metric::Cpu,
+        Metric::Mem,
+        Metric::NetRx,
+        Metric::NetTx,
+        Metric::DiskRead,
+        Metric::DiskWrite,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Metric::Cpu => "cpu",
@@ -51,7 +74,9 @@ impl Metric {
     }
 }
 
-/// A single min/max/median rollup over one time bucket for one container.
+/// A single min/max/median rollup over one time bucket for one container and
+/// one metric — the long format the bucketer emits. The store pivots a batch of
+/// these into one wide row per container and bucket (see the module docs).
 ///
 /// We store `name` and `stack` alongside the container `id` so history stays
 /// meaningful when a container is recreated (e.g. `docker compose up` after a
@@ -138,7 +163,7 @@ impl Store {
         Self::from_connection(conn)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn from_connection(mut conn: Connection) -> Result<Self> {
         // We use a single connection behind a Mutex, so all access is already
         // serialised — WAL's concurrent-reader benefit doesn't apply, and its
         // side files (`-wal`/`-shm`) only grow without paying for themselves.
@@ -147,15 +172,20 @@ impl Store {
         // earlier build, cleaning up its stale `-wal`/`-shm`.
         conn.pragma_update(None, "journal_mode", "DELETE")
             .context("setting rollback journal mode")?;
-        // Migrate in three ordered steps so a database from an earlier build can
-        // be brought up to the current schema in place. Tables come first, then
-        // columns added in later releases are backfilled, and only then the
+        // Migrate in ordered steps so a database from an earlier build can be
+        // brought up to the current schema in place. Tables come first, then
+        // columns added in later releases are backfilled, then a long-format
+        // trend table is pivoted into the wide layout, and only then the
         // indexes — several of which lead with `host`, a column the backfill
         // step adds. Creating those indexes before the column exists is exactly
         // what broke the in-place upgrade: SQLite rejects them with "no such
-        // column: host" and the whole migration (and startup) fails.
+        // column: host" and the whole migration (and startup) fails. The trend
+        // pivot likewise needs `host` in place, since it is part of the new
+        // primary key.
         conn.execute_batch(CREATE_TABLES)
             .context("creating tables")?;
+        conn.execute_batch(CREATE_TREND_TABLE)
+            .context("creating trend table")?;
         // Columns added after an earlier release: present in the CREATE above
         // for fresh databases, added here for ones created by an earlier build.
         // `host` is NOT NULL, so existing rows are backfilled with the default
@@ -172,22 +202,7 @@ impl Store {
         ] {
             add_column_if_missing(&conn, table, col, decl)?;
         }
-        // Replacing the trend indexes on a database with weeks of trend data
-        // takes a few seconds (and blocks startup, since we open before bind) —
-        // say so instead of appearing hung.
-        let old_index_present: bool = conn
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM sqlite_master
-                                WHERE type = 'index' AND name = 'container_trend_host_id')",
-                [],
-                |r| r.get(0),
-            )
-            .context("checking for legacy trend index")?;
-        if old_index_present {
-            tracing::info!(
-                "migrating trend indexes (one-time, may take a while on large databases)"
-            );
-        }
+        migrate_trend_layout(&mut conn)?;
         conn.execute_batch(CREATE_INDEXES)
             .context("creating indexes")?;
         Ok(Self {
@@ -269,35 +284,28 @@ impl Store {
         Ok(())
     }
 
-    /// Persist a batch of container trend rollups.
+    /// Persist a batch of container trend rollups, pivoted into one wide row
+    /// per container and bucket. A row that already exists — the same name in
+    /// the same bucket, e.g. a container recreated within one bucket whose two
+    /// incarnations were flushed separately — is merged rather than rejected:
+    /// the envelope keeps the extremes, the median is weighted by sample count.
     pub fn insert_container_trends(&self, trends: &[ContainerTrend]) -> Result<()> {
         if trends.is_empty() {
             return Ok(());
         }
+        let rows = pivot_trends(trends);
         let mut conn = self.lock();
         let tx = conn.transaction().context("begin trend transaction")?;
         {
             let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO container_trend
-                       (bucket_start_ms, bucket_secs, host, id, name, stack, metric, min, max, median, samples)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                )
+                .prepare_cached(&INSERT_TREND_SQL)
                 .context("prepare container trend insert")?;
-            for t in trends {
-                stmt.execute(rusqlite::params![
-                    to_db(t.bucket_start_ms),
-                    to_db(t.bucket_secs),
-                    t.host,
-                    t.id,
-                    t.name,
-                    t.stack,
-                    t.metric,
-                    t.min,
-                    t.max,
-                    t.median,
-                    t.samples,
-                ])
+            for ((host, name, bucket_start_ms), row) in rows {
+                stmt.execute(params_from_iter(row.into_values(
+                    host,
+                    name,
+                    bucket_start_ms,
+                )))
                 .context("insert container trend")?;
             }
         }
@@ -398,8 +406,7 @@ impl Store {
     /// Aggregate trend history for a whole stack at or after `since_ms`, oldest
     /// first, as chart seed points. Stacks have no raw per-stack series, so the
     /// detail page seeds from trends: per bucket we sum the member medians
-    /// (mirroring the live aggregate, which sums current member values). Trends
-    /// are stored long (one row per metric), so we pivot cpu/mem into one point.
+    /// (mirroring the live aggregate, which sums current member values).
     pub fn recent_stack_trends(
         &self,
         host: &str,
@@ -442,7 +449,7 @@ impl Store {
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(&history_container_sql())
+            .prepare_cached(&HISTORY_CONTAINER_SQL)
             .context("prepare container history query")?;
         let rows = stmt
             .query_map(
@@ -474,7 +481,7 @@ impl Store {
     ) -> Result<Vec<HistoryPoint>> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare_cached(&history_stack_sql())
+            .prepare_cached(&HISTORY_STACK_SQL)
             .context("prepare stack history query")?;
         let rows = stmt
             .query_map(
@@ -496,8 +503,9 @@ impl Store {
     /// The container name recorded in the trend table for `id`, if any. Used by
     /// the history endpoint to resolve its URL's container id into the name the
     /// trends are queried by when the container is no longer in the live
-    /// snapshot. No index leads with `(host, id)` anymore, so this scans within
-    /// the host — acceptable for a rare fallback with `LIMIT 1`.
+    /// snapshot. Nothing is keyed by `(host, id)`, so this scans the host's
+    /// rows — acceptable for a rare fallback with `LIMIT 1` over a table that
+    /// holds one row per container and bucket.
     pub fn container_name(&self, host: &str, id: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
         let conn = self.lock();
@@ -588,8 +596,8 @@ fn trend_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<MetricPoint> {
 }
 
 /// Map a downsampled history row to a [`HistoryPoint`]. All value columns are
-/// nullable: a CASE without ELSE yields NULL for the other metric's rows, and
-/// MIN/AVG/MAX ignore NULLs but return NULL when nothing matched.
+/// nullable: a metric the container has no data for is NULL in the wide row,
+/// and MIN/AVG/MAX ignore NULLs but return NULL when nothing matched.
 fn history_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryPoint> {
     Ok(HistoryPoint {
         ts_ms: from_db(r.get::<_, i64>(0)?),
@@ -614,47 +622,179 @@ fn history_row_to_point(r: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryPoint>
     })
 }
 
-/// The per-metric envelope columns for the container history query: for each
-/// metric, `MIN(min) AVG(median) MAX(max)` over the downsampling group, in the
-/// column order [`history_row_to_point`] expects. Metrics with no rows in a
-/// group (e.g. a container the runtime reports no block-I/O for) come back NULL.
-const HISTORY_ENVELOPE: &str = "\
-    MIN(CASE WHEN metric='cpu' THEN min END), AVG(CASE WHEN metric='cpu' THEN median END), MAX(CASE WHEN metric='cpu' THEN max END),
-    MIN(CASE WHEN metric='mem' THEN min END), AVG(CASE WHEN metric='mem' THEN median END), MAX(CASE WHEN metric='mem' THEN max END),
-    MIN(CASE WHEN metric='net_rx' THEN min END), AVG(CASE WHEN metric='net_rx' THEN median END), MAX(CASE WHEN metric='net_rx' THEN max END),
-    MIN(CASE WHEN metric='net_tx' THEN min END), AVG(CASE WHEN metric='net_tx' THEN median END), MAX(CASE WHEN metric='net_tx' THEN max END),
-    MIN(CASE WHEN metric='disk_read' THEN min END), AVG(CASE WHEN metric='disk_read' THEN median END), MAX(CASE WHEN metric='disk_read' THEN max END),
-    MIN(CASE WHEN metric='disk_write' THEN min END), AVG(CASE WHEN metric='disk_write' THEN median END), MAX(CASE WHEN metric='disk_write' THEN max END)";
+/// A metric's envelope inside a wide trend row.
+#[derive(Debug, Clone, Copy)]
+struct Envelope {
+    min: f64,
+    median: f64,
+    max: f64,
+    samples: u32,
+}
 
-/// Stack history sums members per bucket before downsampling. These are the
-/// per-bucket sums (the CTE body): each metric's min/median/max summed across
-/// the stack's members, aliased for the outer envelope below.
-const STACK_SUM_PER_BUCKET: &str = "\
-    SUM(CASE WHEN metric='cpu' THEN min END) AS cpu_min, SUM(CASE WHEN metric='cpu' THEN median END) AS cpu_med, SUM(CASE WHEN metric='cpu' THEN max END) AS cpu_max,
-    SUM(CASE WHEN metric='mem' THEN min END) AS mem_min, SUM(CASE WHEN metric='mem' THEN median END) AS mem_med, SUM(CASE WHEN metric='mem' THEN max END) AS mem_max,
-    SUM(CASE WHEN metric='net_rx' THEN min END) AS net_rx_min, SUM(CASE WHEN metric='net_rx' THEN median END) AS net_rx_med, SUM(CASE WHEN metric='net_rx' THEN max END) AS net_rx_max,
-    SUM(CASE WHEN metric='net_tx' THEN min END) AS net_tx_min, SUM(CASE WHEN metric='net_tx' THEN median END) AS net_tx_med, SUM(CASE WHEN metric='net_tx' THEN max END) AS net_tx_max,
-    SUM(CASE WHEN metric='disk_read' THEN min END) AS disk_read_min, SUM(CASE WHEN metric='disk_read' THEN median END) AS disk_read_med, SUM(CASE WHEN metric='disk_read' THEN max END) AS disk_read_max,
-    SUM(CASE WHEN metric='disk_write' THEN min END) AS disk_write_min, SUM(CASE WHEN metric='disk_write' THEN median END) AS disk_write_med, SUM(CASE WHEN metric='disk_write' THEN max END) AS disk_write_max";
+impl Envelope {
+    /// Fold another rollup of the same metric and bucket in: extremes are
+    /// kept, the median is weighted by sample count so a long-lived incarnation
+    /// outweighs a brief one.
+    fn merge(self, other: Envelope) -> Envelope {
+        let samples = self.samples + other.samples;
+        let weight = |e: Envelope| e.median * f64::from(e.samples);
+        Envelope {
+            min: self.min.min(other.min),
+            median: if samples == 0 {
+                self.median
+            } else {
+                (weight(self) + weight(other)) / f64::from(samples)
+            },
+            max: self.max.max(other.max),
+            samples,
+        }
+    }
+}
+
+/// One wide trend row minus its key `(host, name, bucket_start_ms)`: every
+/// metric's envelope for one container in one bucket, `None` for metrics the
+/// bucket has no data for.
+#[derive(Debug, Default)]
+struct WideTrend {
+    bucket_secs: u64,
+    id: String,
+    stack: Option<String>,
+    /// Samples behind the best-covered metric.
+    samples: u32,
+    /// Indexed like [`Metric::ALL`].
+    metrics: [Option<Envelope>; 6],
+}
+
+impl WideTrend {
+    /// The bind values for [`INSERT_TREND_SQL`], key first, then the metric
+    /// envelopes in [`Metric::ALL`] order.
+    fn into_values(self, host: String, name: String, bucket_start_ms: u64) -> Vec<Value> {
+        let mut values = vec![
+            Value::Text(host),
+            Value::Text(name),
+            Value::Integer(to_db(bucket_start_ms)),
+            Value::Integer(to_db(self.bucket_secs)),
+            Value::Text(self.id),
+            self.stack.map_or(Value::Null, Value::Text),
+            Value::Integer(i64::from(self.samples)),
+        ];
+        for envelope in self.metrics {
+            for value in [
+                envelope.map(|e| e.min),
+                envelope.map(|e| e.median),
+                envelope.map(|e| e.max),
+            ] {
+                values.push(value.map_or(Value::Null, Value::Real));
+            }
+        }
+        values
+    }
+}
+
+/// Pivot the bucketer's long rollups into wide rows, keyed and ordered by
+/// `(host, name, bucket_start_ms)` — the table's primary key, so the inserts
+/// walk the B-tree in order. Two incarnations of one name in the same bucket
+/// (recreated within a minute) merge; the row's `id` is the last one seen.
+fn pivot_trends(trends: &[ContainerTrend]) -> BTreeMap<(String, String, u64), WideTrend> {
+    let mut rows: BTreeMap<(String, String, u64), WideTrend> = BTreeMap::new();
+    for t in trends {
+        let Some(slot) = Metric::ALL.iter().position(|m| m.as_str() == t.metric) else {
+            tracing::warn!(metric = t.metric, "dropping trend row for unknown metric");
+            continue;
+        };
+        let row = rows
+            .entry((t.host.clone(), t.name.clone(), t.bucket_start_ms))
+            .or_default();
+        row.bucket_secs = t.bucket_secs;
+        row.id.clone_from(&t.id);
+        if row.stack.is_none() {
+            row.stack.clone_from(&t.stack);
+        }
+        let envelope = Envelope {
+            min: t.min,
+            median: t.median,
+            max: t.max,
+            samples: t.samples,
+        };
+        let merged = row.metrics[slot].map_or(envelope, |existing| existing.merge(envelope));
+        row.samples = row.samples.max(merged.samples);
+        row.metrics[slot] = Some(merged);
+    }
+    rows
+}
+
+/// Build a comma-joined column expression per metric, in [`Metric::ALL`]
+/// order — the order [`history_row_to_point`] and [`WideTrend`] expect. Every
+/// trend SQL below is assembled from this, so the column lists cannot drift.
+fn per_metric(f: impl Fn(&str) -> String) -> String {
+    Metric::ALL
+        .iter()
+        .map(|m| f(m.as_str()))
+        .collect::<Vec<_>>()
+        .join(",\n           ")
+}
+
+/// The wide row's metric value columns, `cpu_min, cpu_med, cpu_max, mem_min, …`.
+fn value_columns() -> String {
+    per_metric(|m| format!("{m}_min, {m}_med, {m}_max"))
+}
+
+/// The downsampling envelope over wide rows: extremes of the extremes, mean of
+/// the medians — an approximation of the true median that is fine for display.
+fn envelope_columns() -> String {
+    per_metric(|m| format!("MIN({m}_min), AVG({m}_med), MAX({m}_max)"))
+}
+
+/// SQL of [`Store::insert_container_trends`]: insert a wide row, or merge it
+/// into the row already there for that name and bucket. SQLite's scalar
+/// `min`/`max` return NULL if any argument is, hence the `coalesce` pairs; the
+/// median merge weights both sides by their sample counts. Every right-hand
+/// side sees the *stored* row, so the order of assignments does not matter.
+static INSERT_TREND_SQL: LazyLock<String> = LazyLock::new(|| {
+    let placeholders = (8..=25)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let merge = per_metric(|m| {
+        format!(
+            "{m}_min = min(coalesce({m}_min, excluded.{m}_min), coalesce(excluded.{m}_min, {m}_min)),
+           {m}_med = CASE WHEN {m}_med IS NULL THEN excluded.{m}_med
+                          WHEN excluded.{m}_med IS NULL THEN {m}_med
+                          ELSE ({m}_med * samples + excluded.{m}_med * excluded.samples)
+                               / (samples + excluded.samples) END,
+           {m}_max = max(coalesce({m}_max, excluded.{m}_max), coalesce(excluded.{m}_max, {m}_max))"
+        )
+    });
+    format!(
+        "INSERT INTO container_trend
+           (host, name, bucket_start_ms, bucket_secs, id, stack, samples,
+           {})
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {placeholders})
+         ON CONFLICT (host, name, bucket_start_ms) DO UPDATE SET
+           bucket_secs = excluded.bucket_secs,
+           id = excluded.id,
+           stack = coalesce(excluded.stack, stack),
+           {merge},
+           samples = samples + excluded.samples",
+        value_columns()
+    )
+});
 
 /// SQL of [`Store::recent_stack_trends`] — a named item (rather than inline in
 /// the method) so the query-plan guard test checks the exact query that runs.
+/// Column order follows [`trend_row_to_point`]. CPU and memory fall back to 0
+/// for a bucket without them, the I/O rates stay NULL (unknown, not zero).
 const RECENT_STACK_TRENDS_SQL: &str = "\
     SELECT bucket_start_ms,
-           SUM(CASE WHEN metric = 'cpu' THEN median ELSE 0 END) AS cpu,
-           SUM(CASE WHEN metric = 'mem' THEN median ELSE 0 END) AS mem,
-           SUM(CASE WHEN metric = 'net_rx' THEN median END) AS net_rx,
-           SUM(CASE WHEN metric = 'net_tx' THEN median END) AS net_tx,
-           SUM(CASE WHEN metric = 'disk_read' THEN median END) AS disk_read,
-           SUM(CASE WHEN metric = 'disk_write' THEN median END) AS disk_write
+           COALESCE(SUM(cpu_med), 0), COALESCE(SUM(mem_med), 0),
+           SUM(net_rx_med), SUM(net_tx_med), SUM(disk_read_med), SUM(disk_write_med)
     FROM container_trend
     WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3
     GROUP BY bucket_start_ms
     ORDER BY bucket_start_ms ASC";
 
 /// SQL of [`Store::history_container_raw`] — see [`RECENT_STACK_TRENDS_SQL`].
-/// One raw sample row carries all metrics as columns (unlike the long-format
-/// trend table), so the envelope is plain MIN/AVG/MAX per column, in the order
+/// The envelope is plain MIN/AVG/MAX per column, in the order
 /// [`history_row_to_point`] expects. The aggregates ignore NULLs and return
 /// NULL for a group with no values, matching the trend queries.
 const RAW_HISTORY_SQL: &str = "\
@@ -670,45 +810,165 @@ const RAW_HISTORY_SQL: &str = "\
     GROUP BY bucket
     ORDER BY bucket ASC";
 
-/// SQL of [`Store::history_container`] — see [`RECENT_STACK_TRENDS_SQL`].
-fn history_container_sql() -> String {
+/// SQL of [`Store::history_container`] — see [`RECENT_STACK_TRENDS_SQL`]. The
+/// primary key `(host, name, bucket_start_ms)` seeks straight to the window;
+/// with the table clustered by that key the rows come off adjacent pages.
+static HISTORY_CONTAINER_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "SELECT (bucket_start_ms / ?5) * ?5 AS bucket, {HISTORY_ENVELOPE}
+        "SELECT (bucket_start_ms / ?5) * ?5 AS bucket,
+           {}
          FROM container_trend
          WHERE host = ?1 AND name = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
-         GROUP BY bucket ORDER BY bucket ASC"
+         GROUP BY bucket ORDER BY bucket ASC",
+        envelope_columns()
     )
-}
+});
 
-/// SQL of [`Store::history_stack`] — see [`RECENT_STACK_TRENDS_SQL`].
-fn history_stack_sql() -> String {
+/// SQL of [`Store::history_stack`] — see [`RECENT_STACK_TRENDS_SQL`]. Members
+/// are summed per bucket first (mirroring the live aggregate), then the summed
+/// buckets are downsampled like the container history.
+static HISTORY_STACK_SQL: LazyLock<String> = LazyLock::new(|| {
+    let sums = per_metric(|m| {
+        format!("SUM({m}_min) AS {m}_min, SUM({m}_med) AS {m}_med, SUM({m}_max) AS {m}_max")
+    });
     format!(
         "WITH per_bucket AS (
-             SELECT bucket_start_ms AS b, {STACK_SUM_PER_BUCKET}
+             SELECT bucket_start_ms AS b,
+           {sums}
              FROM container_trend
              WHERE host = ?1 AND stack = ?2 AND bucket_start_ms >= ?3 AND bucket_start_ms <= ?4
              GROUP BY b
          )
-         SELECT (b / ?5) * ?5 AS bucket, {STACK_OUTER_ENVELOPE}
+         SELECT (b / ?5) * ?5 AS bucket,
+           {}
          FROM per_bucket
-         GROUP BY bucket ORDER BY bucket ASC"
+         GROUP BY bucket ORDER BY bucket ASC",
+        envelope_columns()
     )
-}
+});
 
-/// The outer envelope over the summed per-bucket columns above, in the column
-/// order [`history_row_to_point`] expects.
-const STACK_OUTER_ENVELOPE: &str = "\
-    MIN(cpu_min), AVG(cpu_med), MAX(cpu_max),
-    MIN(mem_min), AVG(mem_med), MAX(mem_max),
-    MIN(net_rx_min), AVG(net_rx_med), MAX(net_rx_max),
-    MIN(net_tx_min), AVG(net_tx_med), MAX(net_tx_max),
-    MIN(disk_read_min), AVG(disk_read_med), MAX(disk_read_max),
-    MIN(disk_write_min), AVG(disk_write_med), MAX(disk_write_max)";
+/// Pivot one chunk of a long-format trend table into the wide one, for
+/// [`migrate_trend_layout`]. Two incarnations of a name in one bucket (the
+/// legacy table has no uniqueness) merge like [`Envelope::merge`]: extremes
+/// kept, median weighted by samples; `id` and `stack` are whichever sorts
+/// last, which for a recreation is arbitrary but harmless.
+static LEGACY_PIVOT_SQL: LazyLock<String> = LazyLock::new(|| {
+    let pivot = per_metric(|m| {
+        format!(
+            "MIN(CASE WHEN metric = '{m}' THEN min END),
+           SUM(CASE WHEN metric = '{m}' THEN median * samples END)
+               / SUM(CASE WHEN metric = '{m}' THEN samples END),
+           MAX(CASE WHEN metric = '{m}' THEN max END)"
+        )
+    });
+    format!(
+        "INSERT INTO container_trend
+           (host, name, bucket_start_ms, bucket_secs, id, stack, samples,
+           {})
+         SELECT host, name, bucket_start_ms, MAX(bucket_secs), MAX(id), MAX(stack), MAX(samples),
+           {pivot}
+         FROM container_trend_legacy
+         WHERE bucket_start_ms >= ?1 AND bucket_start_ms < ?2
+         GROUP BY host, name, bucket_start_ms",
+        value_columns()
+    )
+});
+
+/// Width of one migration chunk: an hour of buckets at a time keeps the sort
+/// behind `GROUP BY` small enough to stay in memory on any host.
+const MIGRATION_CHUNK_MS: i64 = 3_600_000;
+
+/// Rewrite a long-format trend table (one row per container, bucket *and
+/// metric*, as stored by builds before the wide layout) into the wide,
+/// clustered table — in place, on open.
+///
+/// The long table was written time-major, so a container's rows were spread
+/// over the whole file and a 30-day chart read most of it. The pivot walks the
+/// legacy rows in time order too, an hour at a time via the retention index,
+/// so it reads the old table roughly sequentially instead of repeating that
+/// scatter once per container; the two host-keyed legacy indexes are dropped
+/// first so the planner has no reason to prefer them. Everything happens in
+/// one transaction — a crash mid-way leaves the legacy table intact and the
+/// next start migrates again. A `VACUUM` afterwards returns the freed space
+/// (the wide table is several times smaller); failing that is only a warning.
+fn migrate_trend_layout(conn: &mut Connection) -> Result<()> {
+    let legacy: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('container_trend')
+                            WHERE name = 'metric')",
+            [],
+            |r| r.get(0),
+        )
+        .context("checking trend table layout")?;
+    if !legacy {
+        return Ok(());
+    }
+    let legacy_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM container_trend", [], |r| r.get(0))
+        .context("counting legacy trend rows")?;
+    tracing::info!(
+        rows = legacy_rows,
+        "migrating trend rows to the clustered layout (one-time; may take a few minutes on a large database)"
+    );
+    let started = Instant::now();
+    let tx = conn.transaction().context("begin trend migration")?;
+    tx.execute_batch(
+        "ALTER TABLE container_trend RENAME TO container_trend_legacy;
+         DROP INDEX IF EXISTS container_trend_host_name_ts;
+         DROP INDEX IF EXISTS container_trend_host_stack_ts;
+         DROP INDEX IF EXISTS container_trend_host_id;
+         DROP INDEX IF EXISTS container_trend_host_name;
+         DROP INDEX IF EXISTS container_trend_ts;",
+    )
+    .context("renaming legacy trend table")?;
+    tx.execute_batch(CREATE_TREND_TABLE)
+        .context("creating wide trend table")?;
+    let span: (Option<i64>, Option<i64>) = tx
+        .query_row(
+            "SELECT MIN(bucket_start_ms), MAX(bucket_start_ms) FROM container_trend_legacy",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .context("reading legacy trend span")?;
+    if let (Some(first), Some(last)) = span {
+        let mut pivot = tx
+            .prepare(&LEGACY_PIVOT_SQL)
+            .context("prepare legacy trend pivot")?;
+        let mut from = first;
+        while from <= last {
+            let to = from.saturating_add(MIGRATION_CHUNK_MS);
+            pivot
+                .execute([from, to])
+                .context("pivot legacy trend chunk")?;
+            from = to;
+        }
+    }
+    tx.execute_batch("DROP TABLE container_trend_legacy")
+        .context("dropping legacy trend table")?;
+    tx.commit().context("commit trend migration")?;
+    let wide_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM container_trend", [], |r| r.get(0))
+        .context("counting migrated trend rows")?;
+    tracing::info!(
+        rows = wide_rows,
+        elapsed = ?started.elapsed(),
+        "trend layout migrated; compacting the database"
+    );
+    if let Err(err) = conn.execute_batch("VACUUM") {
+        tracing::warn!(
+            %err,
+            "compacting the database failed; it keeps its size and reuses the freed pages"
+        );
+    }
+    Ok(())
+}
 
 /// Table definitions, created first so the column backfill and index steps in
 /// [`Store::from_connection`] have something to operate on. Splitting tables
 /// from indexes is what lets an in-place upgrade add the `host` column before
-/// the host-leading indexes below reference it.
+/// the host-leading indexes below reference it. The trend table has its own
+/// statement, [`CREATE_TREND_TABLE`], because the layout migration creates it
+/// too.
 const CREATE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS container_sample (
     ts_ms       INTEGER NOT NULL,
@@ -724,47 +984,52 @@ CREATE TABLE IF NOT EXISTS container_sample (
     disk_write  REAL
 );
 
-CREATE TABLE IF NOT EXISTS container_trend (
-    bucket_start_ms INTEGER NOT NULL,
-    bucket_secs     INTEGER NOT NULL,
-    host            TEXT    NOT NULL,
-    id              TEXT    NOT NULL,
-    name            TEXT    NOT NULL,
-    stack           TEXT,
-    metric          TEXT    NOT NULL,
-    min             REAL    NOT NULL,
-    max             REAL    NOT NULL,
-    median          REAL    NOT NULL,
-    samples         INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
 ";
 
+/// The wide trend table: one row per container and bucket, every metric's
+/// envelope as columns (NULL where the bucket has no data for it). `WITHOUT
+/// ROWID` makes the primary key the table's physical order, so a container's
+/// history is contiguous on disk — the property the chart queries live on.
+/// `id` is the incarnation that wrote the row (history is keyed by name, see
+/// [`Store::history_container`]); `samples` is the count behind the
+/// best-covered metric.
+const CREATE_TREND_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS container_trend (
+    host            TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    bucket_start_ms INTEGER NOT NULL,
+    bucket_secs     INTEGER NOT NULL,
+    id              TEXT    NOT NULL,
+    stack           TEXT,
+    samples         INTEGER NOT NULL,
+    cpu_min         REAL, cpu_med        REAL, cpu_max        REAL,
+    mem_min         REAL, mem_med        REAL, mem_max        REAL,
+    net_rx_min      REAL, net_rx_med     REAL, net_rx_max     REAL,
+    net_tx_min      REAL, net_tx_med     REAL, net_tx_max     REAL,
+    disk_read_min   REAL, disk_read_med  REAL, disk_read_max  REAL,
+    disk_write_min  REAL, disk_write_med REAL, disk_write_max REAL,
+    PRIMARY KEY (host, name, bucket_start_ms)
+) WITHOUT ROWID;
+";
+
 /// Indexes, created after the column backfill so the host-leading ones resolve.
 ///
-/// The trend history reads filter on `host` plus `name`/`stack` and a
-/// `bucket_start_ms` range, so the time column must come directly after the
-/// equality columns — with anything else (like `metric`) in between, SQLite
-/// cannot seek the time range and scans every trend row of the container (or,
-/// for stacks, the whole host) on every chart request. The two `*_retention`
-/// indexes lead with the column the retention prunes filter on (`ts_ms` /
-/// `bucket_start_ms`) so those DELETEs can seek to the cutoff instead of
-/// scanning the whole table.
-///
-/// The DROPs migrate databases from builds whose trend indexes had `metric`
-/// before the time column (and were therefore useless for the range).
+/// Container history needs no index: the trend table's primary key *is*
+/// `(host, name, bucket_start_ms)`. Stack history filters on `host` + `stack`
+/// plus the same time range, so its index must put the time column directly
+/// after the equality columns — with anything in between, SQLite cannot seek
+/// the range. The two `*_retention` indexes lead with the column the retention
+/// prunes filter on (`ts_ms` / `bucket_start_ms`) so those DELETEs can seek to
+/// the cutoff instead of scanning the whole table.
 const CREATE_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS container_sample_host_id_ts ON container_sample(host, id, ts_ms);
-CREATE INDEX IF NOT EXISTS container_trend_host_name_ts ON container_trend(host, name, bucket_start_ms);
-CREATE INDEX IF NOT EXISTS container_trend_host_stack_ts ON container_trend(host, stack, bucket_start_ms) WHERE stack IS NOT NULL;
+CREATE INDEX IF NOT EXISTS container_trend_stack_ts ON container_trend(host, stack, bucket_start_ms) WHERE stack IS NOT NULL;
 CREATE INDEX IF NOT EXISTS container_sample_retention ON container_sample(ts_ms);
 CREATE INDEX IF NOT EXISTS container_trend_retention ON container_trend(bucket_start_ms);
-DROP INDEX IF EXISTS container_trend_host_id;
-DROP INDEX IF EXISTS container_trend_host_name;
 ";
 
 #[cfg(test)]
@@ -832,12 +1097,44 @@ mod tests {
                  min REAL NOT NULL, max REAL NOT NULL, median REAL NOT NULL, samples INTEGER NOT NULL);
              CREATE INDEX container_trend_ts ON container_trend(id, metric, bucket_start_ms);
              CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-             INSERT INTO container_sample (ts_ms, id, name) VALUES (1000, 'abc', 'c1');",
+             INSERT INTO container_sample (ts_ms, id, name) VALUES (1000, 'abc', 'c1');
+             INSERT INTO container_trend
+                 (bucket_start_ms, bucket_secs, id, name, stack, metric, min, max, median, samples)
+             VALUES
+                 -- one bucket of `web`, two incarnations (recreated mid-minute)
+                 (0, 60, 'old', 'web', 'shop', 'cpu', 1.0, 3.0, 2.0, 10),
+                 (0, 60, 'new', 'web', 'shop', 'cpu', 0.5, 5.0, 4.0, 30),
+                 (0, 60, 'new', 'web', 'shop', 'mem', 100.0, 100.0, 100.0, 30),
+                 -- a later bucket, so the chunked pivot spans a range
+                 (7200000, 60, 'new', 'web', 'shop', 'cpu', 2.0, 2.0, 2.0, 20);",
         )
         .unwrap();
 
         // Opening must succeed — this is the upgrade that used to abort startup.
         let store = Store::from_connection(conn).unwrap();
+
+        // The long-format trend rows were pivoted into wide ones: one row per
+        // name and bucket, the two incarnations merged (extremes kept, median
+        // weighted by samples: (2·10 + 4·30) / 40 = 3.5), the memory metric
+        // sitting in the same row, and the stack index usable.
+        assert_eq!(store.count("container_trend").unwrap(), 2);
+        let h = store
+            .history_container("local", "web", 0, u64::MAX, 60_000)
+            .unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].cpu_min, Some(0.5));
+        assert_eq!(h[0].cpu_med, Some(3.5));
+        assert_eq!(h[0].cpu_max, Some(5.0));
+        assert_eq!(h[0].mem_med, Some(100.0));
+        assert_eq!(h[1].ts_ms, 7_200_000);
+        assert_eq!(h[1].mem_med, None);
+        let s = store
+            .history_stack("local", "shop", 0, u64::MAX, 60_000)
+            .unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].cpu_max, Some(5.0));
+        // Opening the migrated database again is a no-op.
+        assert_eq!(store.count("container_trend").unwrap(), 2);
 
         // The existing row is backfilled with the synthesised single-host name,
         // so pre-multi-host data stays attributed to the host that produced it.
@@ -894,11 +1191,13 @@ mod tests {
     #[test]
     fn trend_history_reads_seek_time_range_by_index() {
         // The chart queries filter on host + name/stack + a bucket_start_ms
-        // range. With the old indexes (`metric` between the equality columns
-        // and the time column) SQLite could not seek the range and scanned the
-        // container's — for stacks, the host's — full trend retention on every
-        // chart request; that was the reported "history is slow" bug. Guard the
-        // plans of the exact production SQL so the regression can't sneak back.
+        // range. Container history must seek the primary key (that is what
+        // clusters the rows), stack history its own index with the time column
+        // right after the equality columns — with anything in between SQLite
+        // cannot seek the range and scans the container's — for stacks, the
+        // host's — full trend retention on every chart request; that was the
+        // first "history is slow" bug. Guard the plans of the exact production
+        // SQL so the regression can't sneak back.
         let store = Store::open_in_memory().unwrap();
         let conn = store.lock();
         let plan = |sql: &str| -> String {
@@ -920,22 +1219,22 @@ mod tests {
         for (what, sql, index, time_col, table) in [
             (
                 "container history",
-                history_container_sql(),
-                "container_trend_host_name_ts",
+                HISTORY_CONTAINER_SQL.clone(),
+                "PRIMARY KEY",
                 "bucket_start_ms>",
                 "container_trend",
             ),
             (
                 "stack history",
-                history_stack_sql(),
-                "container_trend_host_stack_ts",
+                HISTORY_STACK_SQL.clone(),
+                "container_trend_stack_ts",
                 "bucket_start_ms>",
                 "container_trend",
             ),
             (
                 "stack seed",
                 RECENT_STACK_TRENDS_SQL.to_string(),
-                "container_trend_host_stack_ts",
+                "container_trend_stack_ts",
                 "bucket_start_ms>",
                 "container_trend",
             ),
@@ -1040,6 +1339,69 @@ mod tests {
             }])
             .unwrap();
         assert_eq!(store.count("container_trend").unwrap(), 1);
+    }
+
+    #[test]
+    fn insert_pivots_metrics_into_one_row_and_merges_incarnations() {
+        // One container's metrics for one bucket land in a single wide row.
+        // A second incarnation of the same name in the same bucket — whether
+        // in the same batch or a later one — merges into that row instead of
+        // failing the primary key: extremes kept, median weighted by samples.
+        let store = Store::open_in_memory().unwrap();
+        let ct = |id: &str, metric: Metric, min: f64, median: f64, max: f64, samples: u32| {
+            ContainerTrend {
+                bucket_start_ms: 60_000,
+                bucket_secs: 60,
+                host: HOST.into(),
+                id: id.to_string(),
+                name: "web".to_string(),
+                stack: Some("shop".to_string()),
+                metric: metric.as_str(),
+                min,
+                max,
+                median,
+                samples,
+            }
+        };
+        store
+            .insert_container_trends(&[
+                ct("a", Metric::Cpu, 1.0, 2.0, 3.0, 10),
+                ct("a", Metric::Mem, 100.0, 100.0, 100.0, 10),
+                // same batch, second incarnation
+                ct("b", Metric::Cpu, 0.5, 4.0, 5.0, 30),
+            ])
+            .unwrap();
+        assert_eq!(store.count("container_trend").unwrap(), 1);
+        let h = store
+            .history_container(HOST, "web", 0, u64::MAX, 60_000)
+            .unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].cpu_min, Some(0.5));
+        assert_eq!(h[0].cpu_med, Some(3.5)); // (2·10 + 4·30) / 40
+        assert_eq!(h[0].cpu_max, Some(5.0));
+        assert_eq!(h[0].mem_med, Some(100.0));
+        assert_eq!(h[0].net_rx_med, None);
+
+        // A later batch for the same name and bucket merges via the upsert.
+        store
+            .insert_container_trends(&[
+                ct("c", Metric::Cpu, 6.0, 6.0, 6.0, 40),
+                ct("c", Metric::NetRx, 1.0, 1.0, 1.0, 40),
+            ])
+            .unwrap();
+        assert_eq!(store.count("container_trend").unwrap(), 1);
+        let h = store
+            .history_container(HOST, "web", 0, u64::MAX, 60_000)
+            .unwrap();
+        assert_eq!(h[0].cpu_min, Some(0.5));
+        assert_eq!(h[0].cpu_med, Some(4.75)); // (3.5·40 + 6·40) / 80
+        assert_eq!(h[0].cpu_max, Some(6.0));
+        assert_eq!(h[0].mem_med, Some(100.0)); // untouched by a batch without mem
+        assert_eq!(h[0].net_rx_med, Some(1.0)); // filled in by the later batch
+        assert_eq!(
+            store.container_name(HOST, "c").unwrap().as_deref(),
+            Some("web")
+        );
     }
 
     #[test]

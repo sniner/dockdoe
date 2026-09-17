@@ -3,6 +3,27 @@
 All notable, user-facing changes to DockDoe. The format is based on
 [Keep a Changelog](https://keepachangelog.com).
 
+## [0.13.0] — 2026-09-18
+
+### Changed
+
+- **Trend storage layout**: trend rollups are now stored one row per container and bucket,
+  physically clustered by container, instead of one row per metric interleaved with every other
+  container's. An existing database is migrated in place on the first start — one transaction,
+  logged with the row count and elapsed time, followed by a compaction; a 30-day database shrinks
+  to roughly a third of its size. Until that finishes the UI is not reachable, as with the
+  earlier index migration. A downgrade to 0.12 does not read the new layout
+- **Release assets** are now plain static binaries (`dockdoe-vX.Y.Z-x86_64-linux-musl`,
+  `dockdoe-vX.Y.Z-aarch64-linux-musl`) instead of tarballs, built natively per architecture
+
+### Fixed
+
+- **7-day and 30-day history charts took up to a minute** on a host whose database outgrows
+  the operating system's page cache: a chart query had to visit nearly every page of the trend
+  table, because one container's rows were spread across all of it. With the clustered layout
+  a 30-day container chart reads about one percent of the pages it used to, a stack chart about
+  five percent; the 24-hour view benefits the same way
+
 ## [0.12.1] — 2026-07-08
 
 ### Added
